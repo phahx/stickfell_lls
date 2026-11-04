@@ -16,6 +16,8 @@ export interface Manifest { app: string; build: number; commit: string; message?
 interface Stored { manifest: string; signature: string; uploadedAt: string }
 
 export const MaxExeBytes = 200 * 1024 * 1024;
+/** How many builds a channel's history (the launcher's patch notes) keeps. */
+export const HistoryKept = 50;
 
 /** A channel: the ID its manifests carry, the file it serves, and its own signing key. */
 export interface Channel { name: string; app: string; file: string; keyEnv: string; keyFile: string }
@@ -53,6 +55,7 @@ export class Updates {
   private get folder() { return join(this.directory, this.channel.name); }
   private get exe() { return join(this.folder, this.channel.file); }
   private get meta() { return join(this.folder, 'latest.json'); }
+  private get past() { return join(this.folder, 'history.json'); }
 
   private async stored(): Promise<Stored | null> {
     try { return JSON.parse(await readFile(this.meta, 'utf8')) as Stored; } catch { return null; }
@@ -77,9 +80,22 @@ export class Updates {
     await mkdir(this.folder, { recursive: true });
     await writeFile(`${this.exe}.tmp`, body);
     await rename(`${this.exe}.tmp`, this.exe);
-    await writeFile(`${this.meta}.tmp`, JSON.stringify({ manifest: manifestB64, signature: signatureB64, uploadedAt: new Date().toISOString() } satisfies Stored));
+    const stored: Stored = { manifest: manifestB64, signature: signatureB64, uploadedAt: new Date().toISOString() };
+    const history = [stored, ...(await this.history())];
+    await writeFile(`${this.meta}.tmp`, JSON.stringify(stored));
     await rename(`${this.meta}.tmp`, this.meta);
+    await writeFile(`${this.past}.tmp`, JSON.stringify(history.slice(0, HistoryKept)));
+    await rename(`${this.past}.tmp`, this.past);
     return m;
+  }
+
+  /** Every build kept, newest first, each with its signed manifest (the launcher's patch notes). A server from
+   * before the history was kept starts it from the latest build. */
+  async history(): Promise<Stored[]> {
+    try { return JSON.parse(await readFile(this.past, 'utf8')) as Stored[]; } catch {
+      const s = await this.stored();
+      return s ? [s] : [];
+    }
   }
 
   /** The latest build's signed manifest (the launcher checks the signature itself). */

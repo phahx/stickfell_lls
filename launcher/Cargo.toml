@@ -20,6 +20,7 @@ sha2 = "0.10"
 p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 ureq = "3"
 arboard = { version = "3", default-features = false }
+png.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory"] }

@@ -72,6 +72,10 @@ test('channels: only builds signed with that channel\'s own key, matching and ne
     const old = build('stickfell-game', 1, exe, game.privateKey);
     await assert.rejects(updates.upload(exe, old.manifest, old.signature), /isn't newer/);
     assert.equal((await updates.upload(exe, v3.manifest, v3.signature)).build, 3);
+
+    // the history (patch notes) keeps every build, newest first, each still signed
+    const builds = (await updates.history()).map(h => readSigned(h.manifest, h.signature, pem(game.publicKey), 'stickfell-game').build);
+    assert.deepEqual(builds, [3, 2]);
   } finally {
     delete process.env.STICKFELL_GAME_PUBLIC_KEY;
     delete process.env.STICKFELL_LAUNCHER_PUBLIC_KEY;

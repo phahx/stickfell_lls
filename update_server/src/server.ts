@@ -41,6 +41,7 @@ const refusals: Record<string, [number, string]> = {
  * The update service the launcher checks: GitHub Actions uploads each signed build with the upload key; anyone may
  * see which build is the latest (so the launcher can say there's an update); downloading it needs a tester key.
  *   GET  /v1/<launcher|game>/latest     the signed manifest
+ *   GET  /v1/<launcher|game>/history    every kept build's signed manifest, newest first (patch notes)
  *   GET  /v1/<launcher|game>/download   the exe (tester key)
  *   PUT  /v1/<launcher|game>/upload     a signed build (upload key)
  *   GET  /v1/license                    whether a tester key works
@@ -77,7 +78,7 @@ export function createUpdateService(updates: Record<ChannelName, Updates>, licen
       if (req.method !== 'GET') return send(res, 405, { error: 'Use GET' }, { allow: 'GET' });
       return await checkKey() ? send(res, 200, { valid: true }) : undefined;
     }
-    const route = /^\/v1\/([a-z]+)\/(latest|download|upload)$/.exec(path);
+    const route = /^\/v1\/([a-z]+)\/(latest|history|download|upload)$/.exec(path);
     const channel = route && Object.hasOwn(updates, route[1]) ? updates[route[1] as ChannelName] : undefined;
     if (!route || !channel) return send(res, 404, { error: 'Not found' });
     if (route[2] === 'upload') {
@@ -92,6 +93,7 @@ export function createUpdateService(updates: Record<ChannelName, Updates>, licen
     }
     if (req.method !== 'GET') return send(res, 405, { error: 'Use GET' }, { allow: 'GET' });
     if (route[2] === 'latest') return send(res, 200, await channel.latest());
+    if (route[2] === 'history') return send(res, 200, { builds: await channel.history() });
     if (await checkKey()) await channel.download(res);
   });
 }

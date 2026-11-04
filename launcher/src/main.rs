@@ -1,56 +1,120 @@
 //! Stickfell's launcher (players run it as Stickfell.exe). It keeps itself and the game up to date from the update
 //! service, then starts the game: the first time it asks for a tester key (kept encrypted for this Windows account),
-//! updates itself if there's a newer launcher, then installs or updates the game in game/ beside it, and shows the
-//! build's notes and a Play button. Offline, it plays the build that's installed.
+//! updates itself if there's a newer launcher, then installs or updates the game in game/ beside it. It looks like a
+//! game launcher: its own title bar (Play and Patch notes tabs), the key art, what's new, and a Play button docked
+//! bottom right that shows the update's progress. Offline, it plays the build that's installed.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod art;
 mod secret;
+mod ui;
 mod update;
+mod view;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use stickfell_app::{AppConfig, Game, Input, KeyCode, Mouse};
-use stickfell_render::{Color, Font, Frame, Vec2};
-use update::{Channel, Problem};
+use stickfell_app::{AppConfig, CursorIcon, Game, Input, KeyCode, Mouse, WindowAction};
+use stickfell_render::{Frame, Vec2};
+use update::{Channel, Manifest, Problem};
+
+/// How long a note under the Play button stays up (s).
+const NOTICE_SECS: f32 = 5.0;
 
 /// Where things stand (the update work runs on its own thread and moves this along).
 #[derive(Clone, Debug, PartialEq)]
-enum Stage {
+pub enum Stage {
     /// Waiting for a tester key (and why the last one didn't work).
     Key { error: Option<String> },
-    Busy { what: String, progress: Option<f32> },
-    Ready { build: Option<u32>, notes: Option<String>, warning: Option<String> },
+    Busy { what: String, progress: Option<Progress> },
+    /// The game can start: the installed build, any warning, and whether the service was out of reach.
+    Ready { build: Option<u32>, warning: Option<String>, offline: bool },
     Failed { message: String, can_play: bool },
     /// Closing: the new launcher or the game has started.
     Done,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Action {
-    Paste,
-    Submit,
-    Play,
-    Retry,
-    ChangeKey,
+/// A download under way: bytes so far, of the total, and bytes a second.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Progress {
+    pub done: u64,
+    pub total: u64,
+    pub speed: f64,
 }
 
-struct Launcher {
-    stage: Arc<Mutex<Stage>>,
+/// What the update thread and the window share.
+#[derive(Default)]
+pub struct Shared {
+    pub stage: Option<Stage>,
+    /// Every published build, newest first (None until it's fetched; empty if it couldn't be).
+    pub history: Option<Vec<Manifest>>,
+    /// The installed build's manifest (its notes, for What's new).
+    pub installed: Option<Manifest>,
+    /// A short note under the Play button (e.g. after checking the game files), and when it was posted.
+    pub notice: Option<(String, Instant)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Tab {
+    Play,
+    Notes,
+}
+
+/// Where the options menu opened from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Menu {
+    Dock,
+    Account,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Action {
+    Tab(Tab),
+    Play,
+    Options(Menu),
+    OpenFolder,
+    CheckFiles,
+    ChangeKey,
+    Paste,
+    Activate,
+    KeyField,
+    Retry,
+    Minimize,
+    Close,
+    Build(usize),
+}
+
+impl Action {
+    fn in_menu(self) -> bool {
+        matches!(self, Action::OpenFolder | Action::CheckFiles | Action::ChangeKey)
+    }
+}
+
+pub struct Launcher {
+    shared: Arc<Mutex<Shared>>,
     dir: PathBuf,
     /// The tester key being typed, and the one in use.
     typed: String,
     key: Option<String>,
+    tab: Tab,
+    menu: Option<Menu>,
+    /// The build shown on the Patch notes tab (index into the history).
+    selected: usize,
+    art: art::KeyArt,
     mouse: Vec2,
-    buttons: Vec<(Vec2, Vec2, Action)>,
+    view: ui::View,
+    hits: Vec<ui::Hit<Action>>,
+    window: Option<WindowAction>,
+    cursor: CursorIcon,
     quit: bool,
 }
 
 impl Launcher {
     fn new(dir: PathBuf) -> Self {
         let key = secret::load();
-        let stage = Arc::new(Mutex::new(Stage::Busy { what: "Checking for updates".into(), progress: None }));
-        let mut l = Self { stage, dir, typed: String::new(), key: key.clone(), mouse: Vec2::ZERO, buttons: Vec::new(), quit: false };
+        let mut l = Self::with(dir, Stage::Busy { what: "Checking for updates".into(), progress: None });
+        l.shared.lock().unwrap().installed = update::load_notes(&l.dir);
         match key {
             Some(k) => l.start(k, false),
             None => l.set(Stage::Key { error: None }),
@@ -58,21 +122,46 @@ impl Launcher {
         l
     }
 
+    fn with(dir: PathBuf, stage: Stage) -> Self {
+        let shared = Arc::new(Mutex::new(Shared { stage: Some(stage), ..Default::default() }));
+        Self {
+            shared,
+            dir,
+            typed: String::new(),
+            key: None,
+            tab: Tab::Play,
+            menu: None,
+            selected: 0,
+            art: art::KeyArt::load(),
+            mouse: Vec2::ZERO,
+            view: ui::View::default(),
+            hits: Vec::new(),
+            window: None,
+            cursor: CursorIcon::Default,
+            quit: false,
+        }
+    }
+
     fn set(&self, s: Stage) {
-        *self.stage.lock().unwrap() = s;
+        self.shared.lock().unwrap().stage = Some(s);
     }
 
     fn stage(&self) -> Stage {
-        self.stage.lock().unwrap().clone()
+        self.shared.lock().unwrap().stage.clone().unwrap_or(Stage::Done)
+    }
+
+    fn notice(&self, text: &str) {
+        self.shared.lock().unwrap().notice = Some((text.into(), Instant::now()));
     }
 
     /// Runs the checks on their own thread (checking the key first when it's a new one).
     fn start(&mut self, key: String, new_key: bool) {
         self.key = Some(key.clone());
-        let (stage, dir) = (self.stage.clone(), self.dir.clone());
-        let set = move |s: Stage| *stage.lock().unwrap() = s;
-        set(Stage::Busy { what: if new_key { "Checking your tester key".into() } else { "Checking for updates".into() }, progress: None });
+        let (shared, dir) = (self.shared.clone(), self.dir.clone());
+        let what = if new_key { "Checking your tester key" } else { "Checking for updates" };
+        self.set(Stage::Busy { what: what.into(), progress: None });
         std::thread::spawn(move || {
+            let set = |s: Stage| shared.lock().unwrap().stage = Some(s);
             if new_key {
                 match update::check_key(&key) {
                     Ok(()) => {
@@ -84,32 +173,46 @@ impl Launcher {
                     Err(p) => return set(Stage::Key { error: Some(p.to_string()) }),
                 }
             }
-            update_all(&dir, &key, &set);
+            update_all(&dir, &key, &shared);
+            let history = update::history(Channel::Game).unwrap_or_default();
+            shared.lock().unwrap().history = Some(history);
         });
     }
 
+    fn can_play(&self) -> bool {
+        matches!(self.stage(), Stage::Ready { .. } | Stage::Failed { can_play: true, .. })
+    }
+
     fn act(&mut self, a: Action) {
+        if a.in_menu() {
+            self.menu = None;
+        }
         match a {
+            Action::Tab(t) => self.tab = t,
+            Action::Build(i) => self.selected = i,
+            Action::Options(m) => self.menu = if self.menu == Some(m) { None } else { Some(m) },
             Action::Paste => {
                 if let Ok(text) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
                     self.typed = clean_key(&text);
                 }
             }
-            Action::Submit => {
+            Action::KeyField => {}
+            Action::Activate => {
                 let key = clean_key(&self.typed);
                 if key.len() >= 20 {
                     self.start(key, true);
                 } else {
-                    self.set(Stage::Key { error: Some("That's too short for a tester key (STICK-XXXXX-XXXXX-XXXXX-XXXXX).".into()) });
+                    self.set(Stage::Key { error: Some("That key is too short. Tester keys look like STICK-XXXXX-XXXXX-XXXXX-XXXXX.".into()) });
                 }
             }
-            Action::Play => {
+            Action::Play if self.can_play() => {
                 let exe = update::game_exe(&self.dir);
                 match std::process::Command::new(&exe).current_dir(exe.parent().unwrap_or(&self.dir)).spawn() {
                     Ok(_) => self.quit = true,
                     Err(e) => self.set(Stage::Failed { message: format!("The game wouldn't start ({e})."), can_play: false }),
                 }
             }
+            Action::Play => {}
             Action::Retry => match self.key.clone() {
                 Some(k) => self.start(k, false),
                 None => self.set(Stage::Key { error: None }),
@@ -118,26 +221,63 @@ impl Launcher {
                 secret::forget();
                 self.key = None;
                 self.typed.clear();
+                self.tab = Tab::Play;
                 self.set(Stage::Key { error: None });
             }
+            Action::OpenFolder => {
+                let folder = self.dir.join("game");
+                let _ = std::fs::create_dir_all(&folder);
+                if let Err(e) = std::process::Command::new("explorer").arg(&folder).spawn() {
+                    self.notice(&format!("Couldn't open the folder ({e})."));
+                }
+            }
+            Action::CheckFiles => self.check_files(),
+            Action::Minimize => self.window = Some(WindowAction::Minimize),
+            Action::Close => self.quit = true,
         }
     }
 
-    fn button(&mut self, frame: &mut Frame, at: Vec2, w: f32, label: &str, action: Action, k: f32, main: bool) {
-        let h = 44.0 * k;
-        let min = Vec2::new(at.x - w * 0.5, at.y);
-        let size = Vec2::new(w, h);
-        let hover = (self.mouse - min).cmpge(Vec2::ZERO).all() && (self.mouse - min - size).cmple(Vec2::ZERO).all();
-        let bg = match (hover, main) {
-            (true, _) => Color::hex(0xff5a61),
-            (false, true) => Color::hex(0xe8484f),
-            (false, false) => Color::hex(0x1c1f27).alpha(0.92),
-        };
-        frame.ui_rect(min, size, 6.0 * k, bg);
-        let scale = 2.4 * k;
-        let tw = Frame::text_width(label, scale);
-        frame.ui_text(Vec2::new(at.x - tw * 0.5, at.y + (h - 7.0 * scale) * 0.5), scale, label, Color::WHITE);
-        self.buttons.push((min, size, action));
+    /// Checks the installed game against the latest signed build, and puts it right if it doesn't match.
+    fn check_files(&mut self) {
+        let Some(key) = self.key.clone() else { return };
+        if !self.can_play() {
+            return;
+        }
+        let (shared, dir, before) = (self.shared.clone(), self.dir.clone(), self.stage());
+        self.set(Stage::Busy { what: "Checking the game files".into(), progress: None });
+        std::thread::spawn(move || {
+            let note = |s: &Arc<Mutex<Shared>>, stage: Stage, text: &str| {
+                let mut sh = s.lock().unwrap();
+                sh.stage = Some(stage);
+                sh.notice = Some((text.into(), Instant::now()));
+            };
+            match update::latest(Channel::Game) {
+                Ok(Some(m)) if update::game_is(&dir, &m) => note(&shared, before, "The game files are fine."),
+                Ok(Some(m)) => {
+                    let what = "Repairing the game files".to_owned();
+                    let set = |s: Stage| shared.lock().unwrap().stage = Some(s);
+                    match update::download(Channel::Game, &key, &m, progress_for(&what, &set)).and_then(|b| update::install_game(&dir, &b, m.build)) {
+                        Ok(()) => {
+                            update::save_notes(&dir, &m);
+                            shared.lock().unwrap().installed = Some(m.clone());
+                            note(&shared, Stage::Ready { build: Some(m.build), warning: None, offline: false }, "Repaired the game files.");
+                        }
+                        Err(p) => note(&shared, before, &format!("Couldn't repair the game files: {p}")),
+                    }
+                }
+                Ok(None) => note(&shared, before, "There's no published build to check against."),
+                Err(_) => note(&shared, before, "The game files can't be checked without the update service."),
+            }
+        });
+    }
+}
+
+/// A download's progress reporter: bytes so far, the total and the speed, as a Busy stage.
+fn progress_for<'a>(what: &'a str, set: &'a dyn Fn(Stage)) -> impl FnMut(u64, u64) + 'a {
+    let started = Instant::now();
+    move |done, total| {
+        let secs = started.elapsed().as_secs_f64().max(0.05);
+        set(Stage::Busy { what: what.to_owned(), progress: Some(Progress { done, total, speed: done as f64 / secs }) });
     }
 }
 
@@ -147,18 +287,19 @@ fn clean_key(text: &str) -> String {
 }
 
 /// The whole check: the launcher first (it restarts itself if it updated), then the game.
-fn update_all(dir: &std::path::Path, key: &str, set: &dyn Fn(Stage)) {
+fn update_all(dir: &std::path::Path, key: &str, shared: &Arc<Mutex<Shared>>) {
+    let set = |s: Stage| shared.lock().unwrap().stage = Some(s);
     let installed = update::installed_build(dir);
-    let offline = |why: &str| match installed {
-        Some(b) => Stage::Ready { build: Some(b), notes: None, warning: Some(format!("{why} Playing the installed build.")) },
-        None => Stage::Failed { message: format!("{why} The game isn't installed yet, so it needs the update service once."), can_play: false },
+    let offline = || match installed {
+        Some(b) => Stage::Ready { build: Some(b), warning: None, offline: true },
+        None => Stage::Failed { message: "The update service can't be reached, and the game needs it once to install.".into(), can_play: false },
     };
     let mut warning = None;
     match update::latest(Channel::Launcher) {
         Ok(Some(m)) if update::launcher_build() > 0 && m.build > update::launcher_build() => {
             let what = format!("Updating the launcher to build {}", m.build);
-            set(Stage::Busy { what: what.clone(), progress: Some(0.0) });
-            let got = update::download(Channel::Launcher, key, &m, |a, b| set(Stage::Busy { what: what.clone(), progress: Some(a as f32 / b as f32) }));
+            set(Stage::Busy { what: what.clone(), progress: Some(Progress { done: 0, total: m.size, speed: 0.0 }) });
+            let got = update::download(Channel::Launcher, key, &m, progress_for(&what, &set));
             match got.and_then(|bytes| {
                 let exe = std::env::current_exe().map_err(|e| Problem::Other(e.to_string()))?;
                 update::swap(&exe, &bytes)?;
@@ -169,24 +310,34 @@ fn update_all(dir: &std::path::Path, key: &str, set: &dyn Fn(Stage)) {
                 Err(p) => warning = Some(format!("The launcher couldn't update itself: {p}")),
             }
         }
-        Err(Problem::Offline(_)) => return set(offline("The update service couldn't be reached.")),
+        Err(Problem::Offline(_)) => return set(offline()),
         Err(p) => warning = Some(p.to_string()),
         _ => {}
     }
+    let installed_now = |m: &Manifest| {
+        update::save_notes(dir, m);
+        shared.lock().unwrap().installed = Some(m.clone());
+    };
     match update::latest(Channel::Game) {
-        Err(Problem::Offline(_)) => set(offline("The update service couldn't be reached.")),
+        Err(Problem::Offline(_)) => set(offline()),
         Err(p) => set(Stage::Failed { message: p.to_string(), can_play: installed.is_some() }),
         Ok(None) => set(match installed {
-            Some(b) => Stage::Ready { build: Some(b), notes: None, warning },
+            Some(b) => Stage::Ready { build: Some(b), warning, offline: false },
             None => Stage::Failed { message: "No build of the game has been published yet.".into(), can_play: false },
         }),
-        Ok(Some(m)) if update::game_is(dir, &m) => set(Stage::Ready { build: Some(m.build), notes: m.message.clone(), warning }),
+        Ok(Some(m)) if update::game_is(dir, &m) => {
+            installed_now(&m);
+            set(Stage::Ready { build: Some(m.build), warning, offline: false });
+        }
         Ok(Some(m)) => {
-            let what = if installed.is_some() { format!("Updating the game to build {}", m.build) } else { format!("Installing build {}", m.build) };
-            set(Stage::Busy { what: what.clone(), progress: Some(0.0) });
-            let got = update::download(Channel::Game, key, &m, |a, b| set(Stage::Busy { what: what.clone(), progress: Some(a as f32 / b as f32) }));
+            let what = if installed.is_some() { format!("Updating to build {}", m.build) } else { format!("Installing build {}", m.build) };
+            set(Stage::Busy { what: what.clone(), progress: Some(Progress { done: 0, total: m.size, speed: 0.0 }) });
+            let got = update::download(Channel::Game, key, &m, progress_for(&what, &set));
             match got.and_then(|bytes| update::install_game(dir, &bytes, m.build)) {
-                Ok(()) => set(Stage::Ready { build: Some(m.build), notes: m.message.clone(), warning }),
+                Ok(()) => {
+                    installed_now(&m);
+                    set(Stage::Ready { build: Some(m.build), warning, offline: false });
+                }
                 Err(Problem::Key(error)) => set(Stage::Key { error: Some(error) }),
                 Err(p) => set(Stage::Failed { message: p.to_string(), can_play: installed.is_some() }),
             }
@@ -194,34 +345,31 @@ fn update_all(dir: &std::path::Path, key: &str, set: &dyn Fn(Stage)) {
     }
 }
 
-/// Splits text into lines that fit `width` (by words).
-fn wrap(text: &str, scale: f32, width: f32) -> Vec<String> {
-    let mut lines = Vec::new();
-    for para in text.lines() {
-        let mut line = String::new();
-        for word in para.split_whitespace() {
-            let next = if line.is_empty() { word.to_owned() } else { format!("{line} {word}") };
-            if Frame::text_width(&next, scale) > width && !line.is_empty() {
-                lines.push(std::mem::replace(&mut line, word.to_owned()));
-            } else {
-                line = next;
-            }
-        }
-        lines.push(line);
-    }
-    lines
-}
-
 impl Game for Launcher {
     fn tick(&mut self, input: &Input) {
         self.mouse = input.mouse;
-        let clicked = input.mouse_pressed(Mouse::Left).then(|| {
-            self.buttons.iter().find(|(min, size, _)| (input.mouse - *min).cmpge(Vec2::ZERO).all() && (input.mouse - *min - *size).cmple(Vec2::ZERO).all()).map(|b| b.2)
-        });
-        if let Some(Some(a)) = clicked {
-            return self.act(a);
+        let stage = self.stage();
+        if input.mouse_pressed(Mouse::Left) {
+            let at = self.view.to_design(input.mouse);
+            let hit = self.hits.iter().rev().find(|h| h.contains(at)).map(|h| h.action);
+            if self.menu.is_some() {
+                match hit {
+                    Some(a) if a.in_menu() => self.act(a),
+                    Some(a @ Action::Options(_)) => self.act(a),
+                    _ => self.menu = None,
+                }
+                return;
+            }
+            match hit {
+                Some(a) => return self.act(a),
+                None if at.y < 48.0 => self.window = Some(WindowAction::Drag),
+                None => {}
+            }
         }
-        if let Stage::Key { .. } = self.stage() {
+        if input.pressed(KeyCode::Escape) {
+            self.menu = None;
+        }
+        if let Stage::Key { .. } = stage {
             let ctrl = input.down(KeyCode::ControlLeft) || input.down(KeyCode::ControlRight);
             if ctrl && input.pressed(KeyCode::KeyV) {
                 return self.act(Action::Paste);
@@ -233,91 +381,65 @@ impl Game for Launcher {
                 self.typed = clean_key(&format!("{}{}", self.typed, input.text));
             }
             if input.pressed(KeyCode::Enter) || input.pressed(KeyCode::NumpadEnter) {
-                self.act(Action::Submit);
+                self.act(Action::Activate);
             }
-        } else if let Stage::Ready { .. } = self.stage() {
-            if input.pressed(KeyCode::Enter) {
-                self.act(Action::Play);
-            }
-        }
-        if input.pressed(KeyCode::Escape) {
-            self.quit = true;
+        } else if (input.pressed(KeyCode::Enter) || input.pressed(KeyCode::NumpadEnter)) && self.menu.is_none() && self.tab == Tab::Play {
+            self.act(Action::Play);
         }
     }
 
     fn draw(&mut self, frame: &mut Frame, screen: Vec2, _alpha: f32, _dt: f32) {
-        self.buttons.clear();
-        frame.clear = Color::hex(0x10121a);
-        let k = (screen.y / 540.0).clamp(0.6, 3.0);
-        let cx = screen.x * 0.5;
-        let centred = |frame: &mut Frame, font: Font, y: f32, scale: f32, text: &str, color: Color| {
-            let w = Frame::text_width_in(font, text, scale);
-            frame.ui_text_in(font, Vec2::new(cx - w * 0.5, y), scale, text, color);
+        let (stage, history, installed, notice) = {
+            let mut sh = self.shared.lock().unwrap();
+            if sh.notice.as_ref().is_some_and(|(_, t)| t.elapsed().as_secs_f32() > NOTICE_SECS) {
+                sh.notice = None;
+            }
+            (sh.stage.clone().unwrap_or(Stage::Done), sh.history.clone(), sh.installed.clone(), sh.notice.clone().map(|n| n.0))
         };
-        centred(frame, Font::Title, 46.0 * k, 9.0 * k, "STICKFELL", Color::hex(0xe8484f));
-        centred(frame, Font::Title, 128.0 * k, 2.6 * k, "LAST LIMB STANDING", Color::hex(0xc8ccd6));
-        let grey = Color::hex(0x9aa0ad);
-        let y = 200.0 * k;
-        match self.stage() {
-            Stage::Key { error } => {
-                centred(frame, Font::Body, y, 2.4 * k, "Enter your tester key", Color::WHITE);
-                let (bw, bh) = (420.0 * k, 46.0 * k);
-                frame.ui_rect(Vec2::new(cx - bw * 0.5, y + 40.0 * k), Vec2::new(bw, bh), 6.0 * k, Color::hex(0x1c1f27));
-                let shown = if self.typed.is_empty() { "STICK-XXXXX-XXXXX-XXXXX-XXXXX".to_owned() } else { format!("{}_", self.typed) };
-                let tc = if self.typed.is_empty() { Color::hex(0x5a5f6b) } else { Color::WHITE };
-                centred(frame, Font::Body, y + 40.0 * k + (bh - 7.0 * 2.4 * k) * 0.5, 2.4 * k, &shown, tc);
-                if let Some(e) = error {
-                    for (i, line) in wrap(&e, 1.9 * k, 560.0 * k).iter().enumerate() {
-                        centred(frame, Font::Body, y + 100.0 * k + i as f32 * 20.0 * k, 1.9 * k, line, Color::hex(0xff7070));
-                    }
-                }
-                self.button(frame, Vec2::new(cx - 110.0 * k, y + 160.0 * k), 200.0 * k, "Paste", Action::Paste, k, false);
-                self.button(frame, Vec2::new(cx + 110.0 * k, y + 160.0 * k), 200.0 * k, "Continue", Action::Submit, k, true);
-            }
-            Stage::Busy { what, progress } => {
-                centred(frame, Font::Body, y + 40.0 * k, 2.4 * k, &format!("{what}…"), Color::WHITE);
-                if let Some(p) = progress {
-                    let (bw, bh) = (420.0 * k, 10.0 * k);
-                    let at = Vec2::new(cx - bw * 0.5, y + 90.0 * k);
-                    frame.ui_rect(at, Vec2::new(bw, bh), 5.0 * k, Color::hex(0x1c1f27));
-                    frame.ui_rect(at, Vec2::new((bw * p.clamp(0.0, 1.0)).max(bh), bh), 5.0 * k, Color::hex(0xe8484f));
-                    centred(frame, Font::Body, y + 110.0 * k, 1.9 * k, &format!("{:.0}%", p * 100.0), grey);
-                }
-            }
-            Stage::Ready { build, notes, warning } => {
-                let title = build.map_or("Ready".to_owned(), |b| format!("Build {b}"));
-                centred(frame, Font::Body, y, 2.6 * k, &title, Color::WHITE);
-                let mut ly = y + 38.0 * k;
-                for text in [warning.as_deref().map(|w| (w, Color::hex(0xffc060))), notes.as_deref().map(|n| (n, grey))].into_iter().flatten() {
-                    for line in wrap(text.0, 1.9 * k, 600.0 * k).iter().take(5) {
-                        centred(frame, Font::Body, ly, 1.9 * k, line, text.1);
-                        ly += 20.0 * k;
-                    }
-                    ly += 8.0 * k;
-                }
-                self.button(frame, Vec2::new(cx, 400.0 * k), 260.0 * k, "Play", Action::Play, k, true);
-                self.button(frame, Vec2::new(cx, 456.0 * k), 160.0 * k, "Change key", Action::ChangeKey, k * 0.8, false);
-            }
-            Stage::Failed { message, can_play } => {
-                for (i, line) in wrap(&message, 2.0 * k, 600.0 * k).iter().take(4).enumerate() {
-                    centred(frame, Font::Body, y + i as f32 * 22.0 * k, 2.0 * k, line, Color::hex(0xff7070));
-                }
-                self.button(frame, Vec2::new(cx - (if can_play { 110.0 } else { 0.0 }) * k, 400.0 * k), 200.0 * k, "Retry", Action::Retry, k, !can_play);
-                if can_play {
-                    self.button(frame, Vec2::new(cx + 110.0 * k, 400.0 * k), 200.0 * k, "Play anyway", Action::Play, k, true);
-                }
-            }
-            Stage::Done => self.quit = true,
+        if stage == Stage::Done {
+            self.quit = true;
         }
-        let build = match update::launcher_build() {
-            0 => "Launcher (built on a PC)".to_owned(),
-            n => format!("Launcher build {n}"),
+        if let Stage::Key { .. } = stage {
+            self.menu = None;
+        }
+        let art = self.art.get();
+        if let Some(a) = &art {
+            frame.sprite_atlas = Some(a.clone());
+        }
+        let mut ui = ui::Ui::new(frame, screen, self.mouse);
+        let state = view::State {
+            stage: &stage,
+            history: history.as_deref(),
+            installed: installed.as_ref(),
+            notice: notice.as_deref(),
+            tab: self.tab,
+            menu: self.menu,
+            selected: self.selected,
+            typed: &self.typed,
+            key: self.key.as_deref(),
+            art: art.is_some(),
+            time: ui.frame.time,
         };
-        frame.ui_text(Vec2::new(12.0 * k, screen.y - 24.0 * k), 1.6 * k, &build, Color::hex(0x5a5f6b));
+        view::draw(&mut ui, &state);
+        self.cursor = match ui.hits.iter().rev().find(|h| h.contains(ui.mouse)) {
+            Some(h) if h.text => CursorIcon::Text,
+            Some(h) if !matches!(h.action, Action::Play) || self.can_play() => CursorIcon::Pointer,
+            _ => CursorIcon::Default,
+        };
+        self.view = ui.view;
+        self.hits = ui.hits;
     }
 
     fn wants_exit(&self) -> bool {
         self.quit
+    }
+
+    fn cursor_icon(&self) -> CursorIcon {
+        self.cursor
+    }
+
+    fn window_action(&mut self) -> Option<WindowAction> {
+        self.window.take()
     }
 }
 
@@ -334,9 +456,10 @@ fn main() -> std::process::ExitCode {
     };
     let cfg = AppConfig {
         title: "Stickfell".into(),
-        size: (960, 540),
+        size: (1280, 720),
         window_icon: Some(include_bytes!("../../game/assets/icon/window-32.png")),
         taskbar_icon: Some(include_bytes!("../../game/assets/icon/window-64.png")),
+        decorations: false,
         ..Default::default()
     };
     match stickfell_app::run(cfg, Launcher::new(dir)) {
@@ -352,20 +475,68 @@ fn main() -> std::process::ExitCode {
 mod shots {
     use super::*;
 
+    fn manifest(build: u32, message: &str) -> Manifest {
+        serde_json::from_value(serde_json::json!({
+            "app": "stickfell-game", "build": build, "commit": "78f3545", "message": message,
+            "sha256": "0".repeat(64), "size": 15_200_000u64, "builtAt": "2026-11-04T12:00:00Z"
+        }))
+        .unwrap()
+    }
+
     /// Renders each screen: `SHOT_DIR=<dir> cargo test -p stickfell_launcher -- --ignored screens`
     #[test]
     #[ignore]
     fn screens() {
         let dir = std::env::var("SHOT_DIR").unwrap_or_else(|_| ".".into());
-        let stages = [
-            ("key", Stage::Key { error: Some("That tester key isn't valid for Stickfell. Check it, or ask for a new one.".into()) }),
-            ("busy", Stage::Busy { what: "Installing build 12".into(), progress: Some(0.42) }),
-            ("ready", Stage::Ready { build: Some(12), notes: Some("Thrown knives stick in, the grapple leaves rope to spare, and gunshots no longer mute the sound.".into()), warning: None }),
-            ("offline", Stage::Failed { message: "The update service couldn't be reached. The game isn't installed yet, so it needs the update service once.".into(), can_play: false }),
+        let notes2 = "New: shoulder throw. Grab someone, turn your back on them and press Q to haul them over your shoulder. Softer, more natural shadows, and contact shadows where things meet the walls. A loading screen at startup, and the game no longer freezes for several seconds when it opens.";
+        let history = vec![manifest(2, notes2), manifest(1, "First tester build of Stickfell: Last Limb Standing.")];
+        let busy = Stage::Busy { what: "Updating to build 3".into(), progress: Some(Progress { done: 6_400_000, total: 15_200_000, speed: 3_100_000.0 }) };
+        let ready = Stage::Ready { build: Some(2), warning: None, offline: false };
+        let screens: [(&str, Stage, Tab, Option<Menu>); 7] = [
+            ("1-ready", ready.clone(), Tab::Play, None),
+            ("2-updating", busy, Tab::Play, None),
+            ("3-key", Stage::Key { error: Some("That key is too short. Tester keys look like STICK-XXXXX-XXXXX-XXXXX-XXXXX.".into()) }, Tab::Play, None),
+            ("4-notes", ready.clone(), Tab::Notes, None),
+            ("5-offline", Stage::Ready { build: Some(2), warning: None, offline: true }, Tab::Play, None),
+            ("6-menu", ready.clone(), Tab::Play, Some(Menu::Dock)),
+            ("7-checking", Stage::Busy { what: "Checking for updates".into(), progress: None }, Tab::Play, None),
         ];
-        for (name, stage) in stages {
-            let mut l = Launcher { stage: Arc::new(Mutex::new(stage)), dir: PathBuf::new(), typed: "STICK-R2T5M-8Q0MV".into(), key: None, mouse: Vec2::ZERO, buttons: Vec::new(), quit: false };
-            stickfell_app::capture_headless(&mut l, 0, (960, 540), format!("{dir}/launcher_{name}.png").as_ref()).unwrap();
+        for (name, stage, tab, menu) in screens {
+            let mut l = Launcher::with(PathBuf::new(), stage);
+            l.key = Some("STICK-AB12C-DE34F-GH56J-9QX2".into());
+            l.typed = "STICK-R2T5M-8Q0MV".into();
+            l.tab = tab;
+            l.menu = menu;
+            {
+                let mut sh = l.shared.lock().unwrap();
+                sh.history = Some(history.clone());
+                sh.installed = Some(history[0].clone());
+            }
+            for _ in 0..200 {
+                if l.art.get().is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            stickfell_app::capture_headless(&mut l, 0, (1280, 720), format!("{dir}/launcher_{name}.png").as_ref()).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    /// The whole check against the real service with this PC's saved key, installing into a scratch folder:
+    /// `STICKFELL_LIVE_DIR=<dir> cargo test -p stickfell_launcher -- --ignored live_check --nocapture`
+    #[test]
+    #[ignore]
+    fn live_check() {
+        let dir = PathBuf::from(std::env::var("STICKFELL_LIVE_DIR").expect("STICKFELL_LIVE_DIR"));
+        let key = secret::load().expect("no saved tester key on this PC");
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        update_all(&dir, &key, &shared);
+        eprintln!("stage: {:?}", shared.lock().unwrap().stage);
+        eprintln!("history: {:?}", update::history(Channel::Game).map(|h| h.iter().map(|m| m.build).collect::<Vec<_>>()));
     }
 }

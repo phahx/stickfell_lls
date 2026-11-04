@@ -52,7 +52,7 @@ impl Channel {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
     app: String,
@@ -62,6 +62,20 @@ pub struct Manifest {
     pub message: Option<String>,
     pub sha256: String,
     pub size: u64,
+    /// When it was built (RFC 3339), for patch notes.
+    #[serde(default)]
+    pub built_at: Option<String>,
+}
+
+impl Manifest {
+    /// The day it was built, written out ("4 November 2026"), if known.
+    pub fn date(&self) -> Option<String> {
+        const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+        let d = self.built_at.as_deref()?.get(..10)?;
+        let mut parts = d.split('-').map(|p| p.parse::<u32>().ok());
+        let (y, m, day) = (parts.next()??, parts.next()??, parts.next()??);
+        Some(format!("{day} {} {y}", MONTHS.get(m.checked_sub(1)? as usize)?))
+    }
 }
 
 /// What went wrong, as the launcher says it.
@@ -168,6 +182,18 @@ pub fn latest(channel: Channel) -> Result<Option<Manifest>> {
     verify(j["manifest"].as_str().unwrap_or_default(), j["signature"].as_str().unwrap_or_default(), channel).map(Some)
 }
 
+/// Every build the service kept for the channel, newest first (patch notes): only those whose signature checks out.
+pub fn history(channel: Channel) -> Result<Vec<Manifest>> {
+    let mut res = get(&format!("/v1/{}/history", channel.name()), None)?;
+    if !res.status().is_success() {
+        return Err(refusal(res));
+    }
+    let text = res.body_mut().with_config().limit(4 * 1024 * 1024).read_to_string().map_err(|e| Problem::Offline(e.to_string()))?;
+    let j: serde_json::Value = serde_json::from_str(&text).map_err(|_| Problem::Other("The update service sent something odd.".into()))?;
+    let builds = j["builds"].as_array().cloned().unwrap_or_default();
+    Ok(builds.iter().filter_map(|b| verify(b["manifest"].as_str()?, b["signature"].as_str()?, channel).ok()).collect())
+}
+
 /// Downloads a channel's build (it must match `m`, already verified), reporting progress (bytes so far, total).
 pub fn download(channel: Channel, key: &str, m: &Manifest, mut progress: impl FnMut(u64, u64)) -> Result<Vec<u8>> {
     let mut res = get(&format!("/v1/{}/download", channel.name()), Some(key))?;
@@ -221,6 +247,18 @@ pub fn game_is(dir: &Path, m: &Manifest) -> bool {
 /// The installed game's build, as the launcher noted it (None: not installed, or not by the launcher).
 pub fn installed_build(dir: &Path) -> Option<u32> {
     game_exe(dir).exists().then(|| std::fs::read_to_string(dir.join("game").join("build.txt")).ok()?.trim().parse().ok()).flatten()
+}
+
+/// Keeps the installed build's manifest beside it (its patch notes, shown offline too).
+pub fn save_notes(dir: &Path, m: &Manifest) {
+    if let Ok(text) = serde_json::to_string(m) {
+        let _ = std::fs::write(dir.join("game").join("notes.json"), text);
+    }
+}
+
+/// The installed build's manifest, as [`save_notes`] kept it.
+pub fn load_notes(dir: &Path) -> Option<Manifest> {
+    serde_json::from_str(&std::fs::read_to_string(dir.join("game").join("notes.json")).ok()?).ok()
 }
 
 /// Puts a verified game build in place (written beside it first, then swapped in, so a failed write never leaves a

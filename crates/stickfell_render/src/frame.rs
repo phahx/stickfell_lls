@@ -151,6 +151,8 @@ pub(crate) const KIND_GLYPH: f32 = 3.0;
 /// A textured quad: `b` is its atlas rect's corner, `params.zw` its size (texels).
 pub(crate) const KIND_SPRITE: f32 = 4.0;
 pub(crate) const KIND_RING_CORNERS: f32 = 5.0;
+/// A rounded box whose edge fades out over `params.w` pixels (UI shadows).
+pub(crate) const KIND_SOFT_BOX: f32 = 6.0;
 
 /// An RGBA image (sRGB, straight alpha) that [`Frame::sprite`] draws from,
 /// with its mip chain (level 0 first, each half the size of the last).
@@ -334,6 +336,56 @@ impl Frame {
             rot: [1.0, 0.0],
             color: color.to_array(),
             params: [KIND_BOX, 0.0, corner.min(half.x).min(half.y), 0.0],
+        });
+    }
+
+    /// A rectangle that fades in from transparent at its top, reaching
+    /// `color` at `solid_from` (0..1) of the way down (e.g. a scrim under text
+    /// over a picture).
+    pub fn ui_rect_fade(&mut self, min: Vec2, size: Vec2, color: Color, solid_from: f32) {
+        self.ui_rect(min, size, 0.0, color);
+        if let Some(s) = self.ui.last_mut() {
+            s.params[3] = solid_from.clamp(0.001, 1.0);
+        }
+    }
+
+    /// A soft shadow: a rounded box whose edge fades out over `blur` pixels.
+    pub fn ui_shadow(&mut self, min: Vec2, size: Vec2, corner: f32, blur: f32, color: Color) {
+        let half = size * 0.5;
+        self.ui.push(ShapeInstance {
+            a: (min + half).into(),
+            b: (min + half).into(),
+            size: half.into(),
+            rot: [1.0, 0.0],
+            color: color.to_array(),
+            params: [KIND_SOFT_BOX, 0.0, corner.min(half.x).min(half.y), blur.max(1.0)],
+        });
+    }
+
+    /// A line from `a` to `b`, `width` pixels thick with round ends (icons).
+    pub fn ui_line(&mut self, a: Vec2, b: Vec2, width: f32, color: Color) {
+        self.ui.push(ShapeInstance {
+            a: a.into(),
+            b: b.into(),
+            size: [width * 0.5, 0.0],
+            rot: [1.0, 0.0],
+            color: color.to_array(),
+            params: [KIND_CAPSULE, 0.0, 0.0, 0.0],
+        });
+    }
+
+    /// A picture from the sprite atlas (`uv` = x, y, width, height in
+    /// texels), filling `size` pixels from `min`.
+    pub fn ui_sprite(&mut self, min: Vec2, size: Vec2, uv: [f32; 4], tint: Color) {
+        let half = size * 0.5;
+        self.ui.push(ShapeInstance {
+            a: (min + half).into(),
+            // (screen y runs down: start from the picture's bottom edge)
+            b: [uv[0], uv[1] + uv[3]],
+            size: half.into(),
+            rot: [1.0, 0.0],
+            color: tint.to_array(),
+            params: [KIND_SPRITE, 0.0, uv[2], -uv[3]],
         });
     }
 

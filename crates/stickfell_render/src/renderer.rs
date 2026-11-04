@@ -132,6 +132,10 @@ pub struct Renderer {
     ui_cam_bg: wgpu::BindGroup,
     ui_pipe: wgpu::RenderPipeline,
     font_bg: wgpu::BindGroup,
+    /// For remaking `font_bg` when the sprite atlas changes.
+    font_bgl: wgpu::BindGroupLayout,
+    font_view: wgpu::TextureView,
+    font_samp: wgpu::Sampler,
     sprite_bgl: wgpu::BindGroupLayout,
     sprite_samp: wgpu::Sampler,
     sprite_bg: wgpu::BindGroup,
@@ -164,8 +168,8 @@ pub struct Renderer {
     shadow_rows: u32,
 }
 
-/// Uploads a sprite atlas (with its mips) and binds it for the scene pass.
-fn sprite_bind_group(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, atlas: &crate::SpriteAtlas) -> wgpu::BindGroup {
+/// Uploads a sprite atlas (with its mips).
+fn upload_atlas(device: &wgpu::Device, queue: &wgpu::Queue, atlas: &crate::SpriteAtlas) -> wgpu::TextureView {
     let levels = atlas.mips.len().max(1) as u32;
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("sprite atlas"),
@@ -188,13 +192,31 @@ fn sprite_bind_group(device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
     }
-    let view = tex.create_view(&Default::default());
+    tex.create_view(&Default::default())
+}
+
+/// The scene pass's sprites: the atlas and its sampler.
+fn sprite_bind_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, view: &wgpu::TextureView) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("sprites"),
         layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(view) },
             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(sampler) },
+        ],
+    })
+}
+
+/// The UI's textures: the font atlas, and the sprite atlas (for pictures).
+fn ui_bind_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, font: (&wgpu::TextureView, &wgpu::Sampler), sprites: (&wgpu::TextureView, &wgpu::Sampler)) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("ui"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(font.0) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(font.1) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(sprites.0) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(sprites.1) },
         ],
     })
 }
@@ -618,7 +640,8 @@ impl Renderer {
             ..Default::default()
         });
         let blank = crate::SpriteAtlas { width: 1, height: 1, mips: vec![vec![255; 4]] };
-        let sprite_bg = sprite_bind_group(device, queue, &sprite_bgl, &sprite_samp, &blank);
+        let blank_view = upload_atlas(device, queue, &blank);
+        let sprite_bg = sprite_bind_group(device, &sprite_bgl, &sprite_samp, &blank_view);
 
         let blend_target = |format| {
             Some(wgpu::ColorTargetState {
@@ -630,10 +653,26 @@ impl Renderer {
         let tri = wgpu::PrimitiveState::default();
 
 
-        // the UI also reads the font atlas
+        // the UI also reads the font atlas, and the sprite atlas for pictures
         let font_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("font bgl"),
+            label: Some("ui bgl"),
             entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -679,14 +718,7 @@ impl Renderer {
             ..Default::default()
         });
         let font_view = font_tex.create_view(&Default::default());
-        let font_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("font"),
-            layout: &font_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&font_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&font_samp) },
-            ],
-        });
+        let font_bg = ui_bind_group(device, &font_bgl, (&font_view, &font_samp), (&blank_view, &sprite_samp));
         let ui_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ui layout"),
             bind_group_layouts: &[Some(&cam_bgl), Some(&font_bgl)],
@@ -937,6 +969,9 @@ impl Renderer {
             ui_cam_bg,
             ui_pipe,
             font_bg,
+            font_bgl,
+            font_view,
+            font_samp,
             sprite_bgl,
             sprite_samp,
             sprite_bg,
@@ -1173,7 +1208,9 @@ impl Renderer {
     pub fn render(&mut self, frame: &Frame, target: &wgpu::TextureView, width: u32, height: u32) {
         if let Some(atlas) = &frame.sprite_atlas {
             if !self.sprite_atlas.as_ref().is_some_and(|a| std::sync::Arc::ptr_eq(a, atlas)) {
-                self.sprite_bg = sprite_bind_group(&self.device, &self.queue, &self.sprite_bgl, &self.sprite_samp, atlas);
+                let view = upload_atlas(&self.device, &self.queue, atlas);
+                self.sprite_bg = sprite_bind_group(&self.device, &self.sprite_bgl, &self.sprite_samp, &view);
+                self.font_bg = ui_bind_group(&self.device, &self.font_bgl, (&self.font_view, &self.font_samp), (&view, &self.sprite_samp));
                 self.sprite_atlas = Some(atlas.clone());
             }
         }

@@ -9,7 +9,7 @@ struct Camera {
 // UI only: the font's signed-distance-field atlas (0.5 = glyph edge).
 @group(1) @binding(0) var font_tex: texture_2d<f32>;
 @group(1) @binding(1) var font_samp: sampler;
-// Scene only: the sprite atlas (mipmapped, sRGB).
+// The sprite atlas (mipmapped, sRGB): the scene's sprites, the UI's pictures.
 @group(1) @binding(2) var sprite_tex: texture_2d<f32>;
 @group(1) @binding(3) var sprite_samp: sampler;
 
@@ -66,6 +66,10 @@ fn vs_shape(@builtin(vertex_index) vi: u32, s: ShapeIn) -> ShapeOut {
     } else if kind == 4u {
         // sprite: an oriented quad, its edges come from the texture's alpha
         let l = c * s.size;
+        w = s.a + s.rot * l.x + vec2<f32>(-s.rot.y, s.rot.x) * l.y;
+    } else if kind == 6u {
+        // soft box: out past its edge by the fade
+        let l = c * (s.size + vec2<f32>(s.params.w + aa));
         w = s.a + s.rot * l.x + vec2<f32>(-s.rot.y, s.rot.x) * l.y;
     } else {
         let l = c * (s.size + vec2<f32>(aa));
@@ -148,20 +152,42 @@ fn fs_scene(o: ShapeOut) -> SceneOut {
 
 @fragment
 fn fs_ui(o: ShapeOut) -> @location(0) vec4<f32> {
-    // the glyph lookup runs for every shape, since derivatives and texture
-    // sampling must be in uniform control flow; only glyphs use it
+    // the glyph and picture lookups run for every shape, since derivatives
+    // and texture sampling must be in uniform control flow; only glyphs and
+    // pictures use them
     let local = (o.world - o.a) / max(o.size, vec2<f32>(1e-6)) * 0.5 + vec2<f32>(0.5);
     let texel = o.b + local * o.rot;
     let v = textureSampleLevel(font_tex, font_samp, texel / vec2<f32>(textureDimensions(font_tex)), 0.0).r;
     let texels_per_px = max(0.5 * (fwidth(texel).x + fwidth(texel).y), 1e-4);
-    if u32(o.params.x + 0.5) == 3u {
+    let pic_texel = o.b + vec2<f32>(local.x, 1.0 - local.y) * o.params.zw;
+    let pw = fwidth(pic_texel);
+    let lod = max(log2(max(max(abs(pw.x), abs(pw.y)), 1e-6)), 0.0);
+    let pic = textureSampleLevel(sprite_tex, sprite_samp, pic_texel / vec2<f32>(textureDimensions(sprite_tex, 0)), lod);
+    let kind = u32(o.params.x + 0.5);
+    if kind == 3u {
         let dist = (v - 0.5) * 2.0 * o.params.z;
         let cov = clamp(dist / texels_per_px + 0.5, 0.0, 1.0);
         if cov <= 0.0 { discard; }
         return vec4<f32>(o.color.rgb, o.color.a * cov);
     }
+    if kind == 4u {
+        let a = pic.a * o.color.a;
+        if a <= 0.004 { discard; }
+        return vec4<f32>(pic.rgb * o.color.rgb, a);
+    }
     let d = sdf(o);
-    let cov = clamp(0.5 - d / cam.params.x, 0.0, 1.0);
+    var cov = clamp(0.5 - d / cam.params.x, 0.0, 1.0);
+    if kind == 6u {
+        let t = clamp(0.5 - d / o.params.w, 0.0, 1.0);
+        cov = t * t * (3.0 - 2.0 * t);
+    }
     if cov <= 0.0 { discard; }
-    return vec4<f32>(o.color.rgb, o.color.a * cov);
+    var a = o.color.a * cov;
+    // a box fading in from its top (params.w: where it's solid from)
+    if kind == 2u && o.params.w > 0.0 {
+        let down = clamp((o.world.y - (o.a.y - o.size.y)) / max(2.0 * o.size.y, 1e-4), 0.0, 1.0);
+        let f = clamp(down / o.params.w, 0.0, 1.0);
+        a = a * f * f * (3.0 - 2.0 * f);
+    }
+    return vec4<f32>(o.color.rgb, a);
 }

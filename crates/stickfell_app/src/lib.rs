@@ -17,9 +17,10 @@ use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::PhysicalKey;
-use winit::window::{CursorGrabMode, CursorIcon, CustomCursor, Window, WindowId};
+use winit::window::{CursorGrabMode, CustomCursor, Window, WindowId};
 
 pub use winit::keyboard::KeyCode;
+pub use winit::window::CursorIcon;
 
 /// Mouse buttons tracked by [`Input`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +61,11 @@ impl Input {
     }
     pub fn mouse_pressed(&self, b: Mouse) -> bool {
         self.mouse_pressed[b as usize]
+    }
+    /// Forgets the mouse buttons being held (the system kept their release,
+    /// e.g. after dragging the window).
+    fn release_mouse(&mut self) {
+        self.mouse_held = [false; 3];
     }
     fn clear_edges(&mut self) {
         self.pressed.clear();
@@ -102,6 +108,24 @@ pub trait Game: 'static {
     fn cursor_captured(&self) -> bool {
         false
     }
+    /// The mouse pointer's shape while it's shown (e.g. a hand over buttons).
+    fn cursor_icon(&self) -> CursorIcon {
+        CursorIcon::Default
+    }
+    /// Something to do to the window this frame, for a game that draws its
+    /// own title bar (see `AppConfig::decorations`).
+    fn window_action(&mut self) -> Option<WindowAction> {
+        None
+    }
+}
+
+/// What a game with its own title bar can ask of the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowAction {
+    /// Move the window with the mouse (the left button is down on the
+    /// game's title bar).
+    Drag,
+    Minimize,
 }
 
 #[derive(Clone, Debug)]
@@ -113,11 +137,15 @@ pub struct AppConfig {
     pub window_icon: Option<&'static [u8]>,
     /// PNG for the taskbar icon on Windows (bigger, e.g. 64 px).
     pub taskbar_icon: Option<&'static [u8]>,
+    /// The system's title bar and border. Without them the window is a fixed
+    /// `size` in logical pixels (shrunk to fit small screens), centred, and
+    /// the game draws its own title bar (see `Game::window_action`).
+    pub decorations: bool,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        Self { title: "Stickfell".into(), size: (1280, 720), tick_hz: 60.0, window_icon: None, taskbar_icon: None }
+        Self { title: "Stickfell".into(), size: (1280, 720), tick_hz: 60.0, window_icon: None, taskbar_icon: None, decorations: true }
     }
 }
 
@@ -163,6 +191,8 @@ struct Runner<G: Game> {
     focused: bool,
     /// An invisible cursor image, used to hide the pointer.
     blank_cursor: Option<CustomCursor>,
+    /// The pointer shape last set.
+    cursor_icon: CursorIcon,
     /// Recent cursor moves (when, where), for `Frame::mouse_trail`.
     trail: VecDeque<(Instant, Vec2)>,
     /// STICKFELL_PROFILE=1: (frames, acquire, render, present, game) seconds, reported every 3 s.
@@ -175,13 +205,34 @@ fn pick_srgb(formats: &[wgpu::TextureFormat]) -> wgpu::TextureFormat {
 
 impl<G: Game> Runner<G> {
     fn init_gfx(&mut self, el: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
-        let attrs = Window::default_attributes()
+        let mut attrs = Window::default_attributes()
             .with_title(self.cfg.title.clone())
             .with_inner_size(PhysicalSize::new(self.cfg.size.0, self.cfg.size.1))
             .with_window_icon(self.cfg.window_icon.and_then(load_icon))
             // (shown once there's a first frame in it: a window that's up
             // but not drawing yet looks frozen)
             .with_visible(false);
+        if !self.cfg.decorations {
+            // a fixed size in logical pixels, no bigger than most of the
+            // screen (same shape), in the middle of it
+            let (w, h) = (self.cfg.size.0 as f64, self.cfg.size.1 as f64);
+            let mut size = PhysicalSize::new(w, h);
+            let mut pos = None;
+            if let Some(m) = el.primary_monitor() {
+                let (scale, area) = (m.scale_factor(), m.size());
+                let fit = (area.width as f64 * 0.85 / (w * scale)).min(area.height as f64 * 0.85 / (h * scale)).min(1.0);
+                size = PhysicalSize::new(w * scale * fit, h * scale * fit);
+                let at = m.position();
+                pos = Some(winit::dpi::PhysicalPosition::new(
+                    at.x as f64 + (area.width as f64 - size.width) * 0.5,
+                    at.y as f64 + (area.height as f64 - size.height) * 0.5,
+                ));
+            }
+            attrs = attrs.with_decorations(false).with_resizable(false).with_inner_size(size);
+            if let Some(p) = pos {
+                attrs = attrs.with_position(p);
+            }
+        }
         #[cfg(windows)]
         let attrs = {
             use winit::platform::windows::WindowAttributesExtWindows;
@@ -252,13 +303,19 @@ impl<G: Game> Runner<G> {
         if let Some(gfx) = &self.gfx {
             self.input.screen = Vec2::new(gfx.config.width as f32, gfx.config.height as f32);
             let want = self.game.cursor_visible();
+            let icon = self.game.cursor_icon();
+            if want && self.cursor_shown && icon != self.cursor_icon {
+                gfx.window.set_cursor(icon);
+                self.cursor_icon = icon;
+            }
             if want != self.cursor_shown {
                 // Hidden = a fully transparent cursor image, not
                 // `set_cursor_visible(false)`: on Windows winit pins a hidden,
                 // confined cursor to the middle of the window, and the
                 // pointer has to keep moving (the game draws its own).
                 if want {
-                    gfx.window.set_cursor(CursorIcon::Default);
+                    gfx.window.set_cursor(icon);
+                    self.cursor_icon = icon;
                 } else {
                     let blank = self.blank_cursor.get_or_insert_with(|| {
                         let src = CustomCursor::from_rgba(vec![0u8; 4], 1, 1, 0, 0).expect("1x1 cursor");
@@ -288,6 +345,16 @@ impl<G: Game> Runner<G> {
         if self.game.wants_exit() {
             el.exit();
             return;
+        }
+        if let (Some(a), Some(gfx)) = (self.game.window_action(), &self.gfx) {
+            match a {
+                WindowAction::Drag => {
+                    let _ = gfx.window.drag_window();
+                    // (the system keeps the button's release while it moves the window)
+                    self.input.release_mouse();
+                }
+                WindowAction::Minimize => gfx.window.set_minimized(true),
+            }
         }
         let Some(gfx) = self.gfx.as_mut() else { return };
         let (w, h) = (gfx.config.width, gfx.config.height);
@@ -462,6 +529,7 @@ pub fn run<G: Game>(cfg: AppConfig, game: G) -> Result<(), Box<dyn Error>> {
         cursor_grabbed: false,
         focused: true,
         blank_cursor: None,
+        cursor_icon: CursorIcon::Default,
         trail: VecDeque::new(),
         profile: std::env::var_os("STICKFELL_PROFILE").map(|_| (now, 0, 0.0, 0.0, 0.0, 0.0)),
     };
