@@ -604,28 +604,15 @@ struct Clip {
     data: &'static [f32],
 }
 
-pub struct Audio {
-    /// The open output (kept alive for as long as the game plays sound).
-    _sink: MixerDeviceSink,
-    /// Every sound plays into this, and it goes out through a limiter: a
-    /// pile-up of loud hits never goes over full scale (which some drivers
-    /// answer by muting everything for a few seconds).
-    bus: rodio::mixer::Mixer,
+/// Every sound effect and voice line, decoded (the slow part of starting
+/// audio, so it can happen on another thread while the game loads).
+pub struct Sounds {
     clips: Vec<Vec<Clip>>,
     voices: Voices,
-    /// Cheap random numbers for picking variants and pitch (not game state).
-    seed: u32,
-    /// How many of each kind started this frame (stops pile-ups).
-    this_frame: [u8; ALL.len()],
-    pub volume: f32,
 }
 
-impl Audio {
-    /// Opens the default output device and decodes every sound. `None` if
-    /// there's no usable device.
-    pub fn new() -> Option<Self> {
-        let mut sink = DeviceSinkBuilder::open_default_sink().map_err(|e| eprintln!("[audio] no output: {e}")).ok()?;
-        sink.log_on_drop(false);
+impl Sounds {
+    pub fn decode() -> Self {
         let mut clips = Vec::new();
         for kind in ALL {
             let mut list = Vec::new();
@@ -647,9 +634,43 @@ impl Audio {
             }
             clips.push(list);
         }
+        Self { clips, voices: Voices::load() }
+    }
+}
+
+pub struct Audio {
+    /// The open output (kept alive for as long as the game plays sound).
+    _sink: MixerDeviceSink,
+    /// Every sound plays into this, and it goes out through a limiter: a
+    /// pile-up of loud hits never goes over full scale (which some drivers
+    /// answer by muting everything for a few seconds).
+    bus: rodio::mixer::Mixer,
+    clips: Vec<Vec<Clip>>,
+    voices: Voices,
+    /// Cheap random numbers for picking variants and pitch (not game state).
+    seed: u32,
+    /// How many of each kind started this frame (stops pile-ups).
+    this_frame: [u8; ALL.len()],
+    pub volume: f32,
+}
+
+impl Audio {
+    /// Opens the default output device and decodes every sound. `None` if
+    /// there's no usable device.
+    pub fn new() -> Option<Self> {
+        Self::open(Sounds::decode())
+    }
+
+    /// Opens the default output device to play `sounds` (decoded already,
+    /// e.g. on another thread while the game loads). `None` if there's no
+    /// usable device.
+    pub fn open(sounds: Sounds) -> Option<Self> {
+        let mut sink = DeviceSinkBuilder::open_default_sink().map_err(|e| eprintln!("[audio] no output: {e}")).ok()?;
+        sink.log_on_drop(false);
         let (bus, mixed) = limited_bus(sink.config().channel_count(), sink.config().sample_rate());
         sink.mixer().add(mixed);
-        Some(Self { _sink: sink, bus, clips, voices: Voices::load(), seed: 0x9E37_79B9, this_frame: [0; ALL.len()], volume: MASTER_VOLUME })
+        let Sounds { clips, voices } = sounds;
+        Some(Self { _sink: sink, bus, clips, voices, seed: 0x9E37_79B9, this_frame: [0; ALL.len()], volume: MASTER_VOLUME })
     }
 
     fn rand(&mut self) -> u32 {

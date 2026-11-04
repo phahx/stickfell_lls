@@ -93,15 +93,27 @@ pub struct Light {
     /// Cosine of the spot half-angle; -1 = omnidirectional.
     pub cone: f32,
     pub shadows: bool,
+    /// How big the glowing part is (radius, m): the bigger, the softer its
+    /// shadows' edges, which widen with distance from whatever casts them.
+    pub size: f32,
 }
 
 impl Light {
     pub fn point(pos: Vec2, radius: f32, color: Color) -> Self {
-        Self { pos, radius, color, dir: Vec2::NEG_Y, cone: -1.0, shadows: true }
+        Self { pos, radius, color, dir: Vec2::NEG_Y, cone: -1.0, shadows: true, size: Self::SIZE }
     }
 
     pub fn spot(pos: Vec2, radius: f32, color: Color, dir: Vec2, half_angle: f32) -> Self {
-        Self { pos, radius, color, dir: dir.normalize_or_zero(), cone: half_angle.cos(), shadows: true }
+        Self { pos, radius, color, dir: dir.normalize_or_zero(), cone: half_angle.cos(), shadows: true, size: Self::SIZE }
+    }
+
+    /// A bulb-sized source.
+    pub const SIZE: f32 = 0.12;
+
+    /// Sets how big the glowing part is (see [`Light::size`]).
+    pub fn size(mut self, size: f32) -> Self {
+        self.size = size.max(0.0);
+        self
     }
 
     pub fn no_shadows(mut self) -> Self {
@@ -117,6 +129,18 @@ pub enum Occluder {
     Box { center: Vec2, half: Vec2, rot: Vec2 },
     Segment { a: Vec2, b: Vec2 },
     Circle { center: Vec2, radius: f32 },
+}
+
+/// A level's solid boxes, for lighting worked out once per level (baked):
+/// soft contact shadows on the wall around and between them. Keep it in an
+/// `Arc` that lasts: the renderer remembers bakes by that pointer.
+#[derive(Clone, Debug, Default)]
+pub struct StaticScene {
+    /// The area to bake (anything outside stays unshadowed).
+    pub min: Vec2,
+    pub max: Vec2,
+    /// Boxes as (centre, half size, rotation (cos, sin)).
+    pub boxes: Vec<(Vec2, Vec2, Vec2)>,
 }
 
 pub(crate) const KIND_CIRCLE: f32 = 0.0;
@@ -172,6 +196,12 @@ pub struct Frame {
     /// The image sprites come from. It's uploaded when a different one is
     /// set and stays between frames.
     pub sprite_atlas: Option<Arc<SpriteAtlas>>,
+    /// The level being shown, for its baked contact shadows (baked the first
+    /// time it's seen, so show each level once while loading).
+    pub statics: Option<Arc<StaticScene>>,
+    /// Whether the renderer's shaders are compiled yet (set by the app before
+    /// the game draws; until then only the UI is drawn, e.g. a loading screen).
+    pub shaders_ready: bool,
 }
 
 impl Default for Frame {
@@ -194,6 +224,8 @@ impl Frame {
             lights: Vec::new(),
             occluders: Vec::new(),
             sprite_atlas: None,
+            statics: None,
+            shaders_ready: true,
         }
     }
 

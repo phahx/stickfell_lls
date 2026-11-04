@@ -151,6 +151,9 @@ pub const HEAVE_FRAMES: u8 = 14;
 /// Frames of the flip over someone grabbed by the head in mid-air (one full
 /// turn).
 pub const FLIP_FRAMES: u8 = 30;
+/// Frames of a shoulder throw (Q with your back to whoever you're holding):
+/// up over your shoulder and slammed down in front of you.
+pub const SHOULDER_FRAMES: u8 = 28;
 
 /// One joint limit: the three particles (pivot in the middle), the two body
 /// parts it needs, the allowed bend away from straight in radians for a
@@ -382,12 +385,20 @@ pub struct Fighter {
     /// and who threw).
     pub flying: u8,
     pub flung_by: u8,
+    /// Damage owed for being slammed down (a shoulder throw), dealt when the
+    /// body first touches the level.
+    pub slam: f32,
     /// Weight being dragged along (a held body); set by the sim each frame.
     pub carry: f32,
     /// Flipping over someone grabbed by the head in mid-air: frames left,
     /// and which way (+1 forward to the right, -1 to the left).
     pub flip: u8,
     pub flip_dir: i8,
+    /// Throwing whoever you hold over your shoulder: frames left, and which
+    /// way they land (+1 to the right). Their path is planned in `flip_pose`,
+    /// `flip_path` and `flip_turn` (a flip and a shoulder throw never overlap).
+    pub shoulder: u8,
+    pub shoulder_dir: i8,
     /// Already dived for a grab on this jump (one lunge per time in the air).
     pub dove: bool,
     /// That dive was made with Shift (not the right mouse button).
@@ -667,9 +678,12 @@ impl Fighter {
             grab_cd: 0,
             flying: 0,
             flung_by: 0,
+            slam: 0.0,
             carry: 0.0,
             flip: 0,
             flip_dir: 0,
+            shoulder: 0,
+            shoulder_dir: 0,
             dove: false,
             dove_shift: false,
             ghost: 0,
@@ -742,6 +756,21 @@ impl Fighter {
         w.drives[self.drive_b as usize].enabled = false;
     }
 
+    /// How far through a shoulder throw (0 to 1, after this frame), eased to
+    /// speed up into the slam.
+    pub fn shoulder_t(&self) -> f32 {
+        let u = 1.0 - (self.shoulder.max(1) - 1) as f32 / SHOULDER_FRAMES as f32;
+        u * u * (1.5 - 0.5 * u)
+    }
+
+    /// The throwing hand during a shoulder throw (from the shoulder, before
+    /// arm length): back over the shoulder, up over the head, down in front.
+    fn shoulder_hand(&self) -> Vec2 {
+        let (f, t) = (self.facing, self.shoulder_t());
+        let [a, b, c] = [Vec2::new(-f * 0.4, 0.45), Vec2::new(f * 0.05, 0.85), Vec2::new(f * 0.6, -0.35)];
+        a * (1.0 - t) * (1.0 - t) + b * 2.0 * t * (1.0 - t) + c * t * t
+    }
+
     /// Knock down for at least `frames`.
     pub fn knock_down(&mut self, frames: u16) {
         self.down = self.down.max(frames);
@@ -750,6 +779,7 @@ impl Fighter {
         self.heave = 0;
         self.kick = 0;
         self.flip = 0;
+        self.shoulder = 0;
     }
 
     /// Hanging by the neck: both hands claw at the rope above the head and
@@ -986,6 +1016,8 @@ impl Fighter {
             self.swing = 0;
         } else if self.flip > 0 {
             self.facing = self.flip_dir as f32;
+        } else if self.shoulder > 0 {
+            self.facing = self.shoulder_dir as f32;
         } else if self.script.is_none() && self.swing == 0 && strength > 0.2 && self.aim.x.abs() > 0.15 {
             // (a finisher keeps you facing your victim, whatever the mouse does)
             self.facing = self.aim.x.signum();
@@ -1043,6 +1075,11 @@ impl Fighter {
             }
         } else if self.flip > 0 {
             // the flip carries you; no running mid-air somersault
+        } else if self.shoulder > 0 {
+            // planted for the throw
+            for id in self.particle_ids() {
+                w.particles[id as usize].vel.x *= 0.8;
+            }
         } else if !lunging && (strength > 0.15 || !self.grounded) {
             let haul = 1.0 / (1.0 + self.carry * 0.045);
             let speed = if crouch { RUN_SPEED * CROUCH_SPEED } else { RUN_SPEED } * haul;
@@ -1108,7 +1145,7 @@ impl Fighter {
             let wall_jump = wall.is_some() && self.wall_jumps < WALL_JUMPS;
             // a jump in mid-air: once, until you land (not while jump is
             // letting go of a rope or heaving up off a blade)
-            let free = !self.grabbing && !self.hang_blade && self.flip == 0 && self.held_by.is_none();
+            let free = !self.grabbing && !self.hang_blade && self.flip == 0 && self.shoulder == 0 && self.held_by.is_none();
             if self.pressed(JUMP) && self.jump_cd == 0 && !wall_jump && !self.air_jumped && free {
                 for id in self.particle_ids() {
                     let p = &mut w.particles[id as usize];
@@ -1163,7 +1200,7 @@ impl Fighter {
         // ---- kicks (bare feet) ----
         // crouch + click: a low sweep; click in mid-air: a flying dropkick
         let free = self.weapon.is_none() && self.script.is_none() && self.locked.is_none() && self.stagger == 0;
-        if free && self.pressed(ATTACK) && self.kick == 0 && self.swing == 0 && self.heave == 0 && strength > 0.4 {
+        if free && self.pressed(ATTACK) && self.kick == 0 && self.swing == 0 && self.heave == 0 && self.shoulder == 0 && strength > 0.4 {
             if crouch && !sliding && self.legs_left() == 2 {
                 self.kick = KICK_LOW_FRAMES;
                 self.kick_kind = KICK_LOW;
@@ -1315,7 +1352,7 @@ impl Fighter {
         // fists: click again as a punch lands to throw the other hand (one-two)
         let combo = fists && self.swing_t().is_some_and(|t| t >= 0.55) && self.arm_b_ok() && !self.grabbing;
         let ready = self.swing == 0 || combo;
-        if (swing_click || stab) && ready && self.stagger == 0 && self.heave == 0 && self.arm_a_ok() && !self.arm_pinned() && strength > 0.4 {
+        if (swing_click || stab) && ready && self.stagger == 0 && self.heave == 0 && self.shoulder == 0 && self.arm_a_ok() && !self.arm_pinned() && strength > 0.4 {
             self.swing_len = if fists { PUNCH_FRAMES } else { SWING_FRAMES };
             self.swing = self.swing_len;
             self.swing_thrust = (thrust || fists || stab) && !self.skewering;
@@ -1444,11 +1481,12 @@ impl Fighter {
             // back over the shoulder, then hurls them along the aim
             let k = 1700.0 * strength.max(0.35);
             let at = match self.heave {
+                _ if self.shoulder > 0 => self.shoulder_hand() * ak,
                 0 => dmath::dir(aim_ang) * self.aim.length().clamp(0.3 * ak, full),
                 h if h > HEAVE_FRAMES / 3 => Vec2::new(-f * 0.45, 0.4) * ak,
                 _ => self.aim_dir() * full,
             };
-            let snap = if self.heave > 0 && self.heave <= HEAVE_FRAMES / 3 { 0.08 } else { 0.04 };
+            let snap = if self.shoulder > 0 || (self.heave > 0 && self.heave <= HEAVE_FRAMES / 3) { 0.08 } else { 0.04 };
             self.set_drive(w, self.drive_b, at, k, 2.0, snap, 1.0);
             self.relax(w, S_UPPER_B);
             self.relax(w, S_FORE_B);

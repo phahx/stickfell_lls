@@ -20,6 +20,7 @@ mod draw;
 mod fighter;
 mod input;
 mod level;
+mod loading;
 mod sfx;
 mod sim;
 mod voice;
@@ -222,6 +223,10 @@ struct App {
     /// Sound output (None when headless or there's no audio device).
     audio: Option<audio::Audio>,
     muted: bool,
+    /// The loading screen, until everything's ready (windowed runs only).
+    loading: Option<Box<loading::Loading>>,
+    /// Fading in from the loading screen (seconds left).
+    fade: f32,
 }
 
 impl App {
@@ -243,6 +248,8 @@ impl App {
             confirm: None,
             audio: None,
             muted: false,
+            loading: None,
+            fade: 0.0,
         }
     }
 
@@ -354,6 +361,10 @@ impl Game for App {
         self.mouse = input.mouse;
         if input.screen.x > 0.0 {
             self.screen_size = input.screen;
+        }
+        // (nothing runs until it's all loaded)
+        if self.loading.is_some() {
+            return;
         }
         if input.pressed(KeyCode::F1) {
             self.show_help = !self.show_help;
@@ -527,6 +538,16 @@ impl Game for App {
     }
 
     fn draw(&mut self, frame: &mut Frame, screen: Vec2, alpha: f32, dt: f32) {
+        if let Some(l) = &mut self.loading {
+            if l.draw(frame, screen, dt, &self.levels, &mut self.audio) {
+                self.loading = None;
+                self.fade = loading::FADE;
+                if let Some(a) = &mut self.audio {
+                    a.volume = if self.muted { 0.0 } else { audio::MASTER_VOLUME };
+                }
+            }
+            return;
+        }
         // the crosshair and button hovers follow the cursor every frame, not
         // just every tick
         self.mouse = frame.mouse;
@@ -656,6 +677,10 @@ impl Game for App {
             self.button(frame, cx, y + 128.0 * k, bw, "Stay", Action::ConfirmNo, k, true);
             text_c(frame, screen, y + 192.0 * k, 1.8 * k, "Enter confirms - Esc goes back", Color::hex(0x8a90a0));
         }
+        if self.fade > 0.0 {
+            frame.ui_rect(Vec2::ZERO, screen, 0.0, Color::hex(0x10121a).alpha(self.fade / loading::FADE));
+            self.fade = (self.fade - dt).max(0.0);
+        }
     }
 
     fn wants_exit(&self) -> bool {
@@ -719,6 +744,7 @@ struct Args {
     screenshot: Option<String>,
     /// Render benchmark: frames to time.
     bench: Option<u32>,
+    time_startup: bool,
     size: (u32, u32),
     ticks: u32,
     verify: Option<u32>,
@@ -729,6 +755,7 @@ struct Args {
     autostart: Option<usize>,
     bot: bool,
     menu_shot: bool,
+    loading_shot: bool,
 }
 
 /// Relay address from `relay.txt` next to the exe (first line that isn't
@@ -756,6 +783,7 @@ fn parse_args() -> Result<Args, String> {
         delay: 2,
         screenshot: None,
         bench: None,
+        time_startup: false,
         size: (1280, 720),
         ticks: 600,
         verify: None,
@@ -766,6 +794,7 @@ fn parse_args() -> Result<Args, String> {
         autostart: None,
         bot: false,
         menu_shot: false,
+        loading_shot: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -783,6 +812,7 @@ fn parse_args() -> Result<Args, String> {
             "--delay" => a.delay = num(val("--delay")?)? as i32,
             "--screenshot" => a.screenshot = Some(val("--screenshot")?),
             "--bench-render" => a.bench = Some(num(val("--bench-render")?)?),
+            "--time-startup" => a.time_startup = true,
             "--size" => {
                 let v = val("--size")?;
                 let (w, h) = v.split_once('x').ok_or(format!("bad --size {v} (want WxH)"))?;
@@ -796,6 +826,7 @@ fn parse_args() -> Result<Args, String> {
             "--autostart" => a.autostart = Some(num(val("--autostart")?)? as usize),
             "--bot" => a.bot = true,
             "--menu" => a.menu_shot = true,
+            "--loading" => a.loading_shot = true,
             "-h" | "--help" => {
                 let doc: Vec<&str> = include_str!("main.rs").lines().take_while(|l| l.starts_with("//!")).map(|l| l.trim_start_matches("//!")).collect();
                 println!("{}", doc.join("\n"));
@@ -847,10 +878,30 @@ fn main() -> ExitCode {
         if let Some(code) = &args.join {
             app.screen = Screen::Menu { code: code.to_uppercase(), entering: true, error: None };
         }
+        if args.loading_shot {
+            app.loading = Some(Box::new(loading::Loading::start()));
+        }
         return match stickfell_app::capture_headless(&mut app, args.ticks, (1280, 720), path.as_ref()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("stickfell: screenshot failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if args.time_startup {
+        let t = std::time::Instant::now();
+        let sound = audio::Audio::new();
+        println!("audio {:.1} ms ({})", t.elapsed().as_secs_f64() * 1e3, if sound.is_some() { "device open" } else { "no device" });
+        drop(sound);
+        let t = std::time::Instant::now();
+        let mut app = App::new(menu(None), args.relay.clone());
+        println!("game state {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        return match stickfell_app::time_startup(&mut app, args.size, 8) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("stickfell: startup timing failed: {e}");
                 ExitCode::FAILURE
             }
         };
@@ -892,7 +943,7 @@ fn main() -> ExitCode {
     }
 
     let mut app = App::new(menu(None), args.relay.clone());
-    app.audio = audio::Audio::new();
+    app.loading = Some(Box::new(loading::Loading::start()));
     app.autostart = args.autostart;
     app.bot_local = args.bot;
     if args.host {

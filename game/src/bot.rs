@@ -57,13 +57,15 @@ pub fn bot_input(s: &GameState, me: usize) -> u32 {
             return encode(if tick % 45 == 0 { ATTACK } else { 0 }, up);
         }
     }
-    // holding someone: haul them about for a moment, then heave them away
+    // holding someone: haul them about for a moment, then heave them away, or
+    // (every other hold) turn your back on them and throw them over your shoulder
     if let Some(v) = f.hold {
         let them = s.fighters[v as usize].pos(w, PELVIS);
         let away = if them.x >= my.x { 1.0 } else { -1.0 };
         let wait = 10 + (me as u16 * 7) % 15;
-        let throw = f.hold_t >= wait && f.heave == 0 && tick % 4 == 0;
-        let aim = Vec2::new(away * 0.55, 0.35);
+        let over = (me + v as usize) % 2 == 1 && f.hold_t + 4 >= wait;
+        let throw = f.hold_t >= wait && f.heave == 0 && f.shoulder == 0 && tick % 4 == 0;
+        let aim = Vec2::new(if over { -away } else { away } * 0.55, 0.35);
         return encode(GRAB | if throw { THROW } else { 0 }, aim);
     }
     let mut bits = 0u16;

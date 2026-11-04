@@ -1671,7 +1671,7 @@ fn severed_limbs_can_be_picked_up_and_swung() {
 #[test]
 fn bots_brawl_bare_handed() {
     // no weapons around: bots have to use fists, feet and grabs
-    let (mut grabs, mut throws, mut kicks, mut punches, mut escapes) = (0, 0, 0, 0, 0);
+    let (mut grabs, mut throws, mut kicks, mut punches, mut escapes, mut shoulders) = (0, 0, 0, 0, 0, 0);
     for level in 0..3 {
         let mut s = GameState::new(4, level, 70 + level as u32);
         s.next_drop = u32::MAX;
@@ -1682,9 +1682,10 @@ fn bots_brawl_bare_handed() {
         }
         for _ in 0..3600 {
             let inputs: Vec<u32> = (0..4).map(|p| crate::bot::bot_input(&s, p)).collect();
-            let before: Vec<(Option<u8>, u8, u8)> = s.fighters.iter().map(|f| (f.hold, f.kick, f.flying)).collect();
+            let before: Vec<(Option<u8>, u8, u8, u8)> = s.fighters.iter().map(|f| (f.hold, f.kick, f.flying, f.shoulder)).collect();
             s.step(&inputs);
-            for (f, (hold, kick, flying)) in s.fighters.iter().zip(before) {
+            for (f, (hold, kick, flying, shoulder)) in s.fighters.iter().zip(before) {
+                shoulders += (shoulder == 0 && f.shoulder > 0) as u32;
                 grabs += (hold.is_none() && f.hold.is_some()) as u32;
                 throws += (flying == 0 && f.flying >= 45) as u32;
                 // (the cooldown has already ticked once by the end of the frame)
@@ -1700,7 +1701,7 @@ fn bots_brawl_bare_handed() {
             }
         }
     }
-    eprintln!("bots (3 min, bare hands): {punches} punches, {kicks} kicks, {grabs} grabs, {throws} throws, {escapes} escapes");
+    eprintln!("bots (3 min, bare hands): {punches} punches, {kicks} kicks, {grabs} grabs, {throws} throws ({shoulders} over the shoulder), {escapes} escapes");
     // (throws are the rarest: 3 to 8 a run across seeds, so the bar is just
     // that they happen)
     assert!(punches > 25 && kicks > 5 && grabs > 5 && throws >= 2, "bots should use the whole moveset");
@@ -3183,4 +3184,113 @@ fn thrown_knives_stick_in_where_they_land() {
     }
     eprintln!("thrown knives: {stuck_n} of {throws} stuck in");
     assert!(stuck_n * 3 >= throws * 2, "thrown knives should stick in ({stuck_n} of {throws})");
+}
+
+/// Grab them, turn your back on them, Q: returns the state each frame of the
+/// throw and after (fighter 0 starts on the left, so they land on the left).
+fn shoulder_throw_input(s: &GameState, k: u32) -> u32 {
+    let neck = s.fighters[1].pos(&s.world, NECK) - s.fighters[0].pos(&s.world, NECK);
+    let (b, aim) = match k {
+        _ if s.fighters[0].hold.is_none() && k < 30 => (GRAB, neck),
+        _ if s.fighters[0].shoulder == 0 && s.fighters[0].facing > 0.0 && k < 60 => (GRAB, Vec2::new(-0.6, 0.35)),
+        _ if s.fighters[0].shoulder == 0 && s.fighters[1].down == 0 && k < 60 => (GRAB | THROW, Vec2::new(-0.6, 0.35)),
+        _ => (GRAB, Vec2::new(-0.6, 0.35)),
+    };
+    input::encode(b, aim)
+}
+
+#[test]
+fn shoulder_throw_hauls_them_over_and_slams_them_down() {
+    let mut s = pair(0.9);
+    let me0 = s.fighters[0].pos(&s.world, PELVIS);
+    let (mut started, mut over, mut peak) = (false, false, f32::MIN);
+    for k in 0..150u32 {
+        let b = shoulder_throw_input(&s, k);
+        s.step(&[b, input::encode(0, Vec2::new(-0.6, 0.0))]);
+        let (me, them) = (&s.fighters[0], &s.fighters[1]);
+        started |= me.shoulder > 0;
+        let (neck, their) = (me.pos(&s.world, NECK), them.pos(&s.world, PELVIS));
+        if me.shoulder > 0 || started && !over {
+            peak = peak.max(their.y - neck.y);
+            over |= (their.x - neck.x).abs() < 0.3 && their.y > neck.y + 0.4;
+        }
+        assert!(me.down == 0, "the thrower should stay on their feet (frame {k})");
+    }
+    let (me, them) = (&s.fighters[0], &s.fighters[1]);
+    let (my, their) = (me.pos(&s.world, PELVIS), them.pos(&s.world, PELVIS));
+    let torso = them.pos(&s.world, NECK) - their;
+    eprintln!(
+        "shoulder throw: peak {peak:.2} m over my neck, landed {:.2} m in front, torso ({:.2},{:.2}), hp {:.0}, I moved {:.2}",
+        my.x - their.x, torso.x, torso.y, them.health, (my - me0).length()
+    );
+    assert!(started, "Q with your back to them should start a shoulder throw");
+    assert!(over && peak > 0.5, "they should go up over your head ({peak:.2} m)");
+    assert!(their.x < my.x - 0.4, "they should land in front of you, on the far side");
+    assert!(them.health < MAX_HP - 8.0, "the slam should hurt ({:.0})", them.health);
+    assert!(me.hold.is_none(), "you let go at the end");
+    assert!((my - me0).length() < 1.0, "the thrower stays planted");
+}
+
+#[test]
+fn facing_them_q_still_heaves_them_away() {
+    let mut s = pair(0.9);
+    grab_them(&mut s);
+    step2(&mut s, GRAB | THROW, Vec2::new(0.6, 0.35), 0);
+    assert_eq!(s.fighters[0].shoulder, 0, "with them in front it's the normal throw");
+    assert!(s.fighters[0].heave > 0);
+}
+
+#[test]
+fn shoulder_throws_are_deterministic_under_rollback() {
+    let mut st = stickfell_net::SyncTestSession::new(pair(0.9), 8);
+    let mut threw = false;
+    for k in 0..150u32 {
+        let b = shoulder_throw_input(&st.game, k);
+        st.advance(&[b, input::encode(0, Vec2::new(-0.6, 0.0))]).unwrap();
+        threw |= st.game.fighters[0].shoulder > 0;
+    }
+    assert!(threw, "the shoulder throw should happen under rollback too");
+}
+
+#[test]
+#[ignore]
+fn screenshot_shoulder_throw() {
+    let dir = std::env::var("SHOT_DIR").unwrap_or_else(|_| ".".into());
+    let mut s = pair(0.9);
+    let (mut n, mut after) = (0, 0);
+    for k in 0..150u32 {
+        let b = shoulder_throw_input(&s, k);
+        s.step(&[b, input::encode(0, Vec2::new(-0.6, 0.0))]);
+        let shot = if s.fighters[0].shoulder > 0 {
+            n += 1;
+            [1, 8, 14, 20, 26].contains(&n)
+        } else if n > 0 {
+            after += 1;
+            [3, 30].contains(&after)
+        } else {
+            false
+        };
+        if shot {
+            let name = if after > 0 { format!("after_{after}") } else { format!("{n:02}") };
+            let mut sp = crate::Spectate { game: s.clone(), follow: 0, cam: Vec2::ZERO, levels: crate::level::levels() };
+            stickfell_app::capture_headless(&mut sp, 0, (900, 560), format!("{dir}/shoulder_{name}.png").as_ref()).unwrap();
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn trace_shoulder_throw() {
+    let mut s = pair(0.9);
+    let mut t = 0;
+    for k in 0..150u32 {
+        let b = shoulder_throw_input(&s, k);
+        s.step(&[b, input::encode(0, Vec2::new(-0.6, 0.0))]);
+        if s.fighters[0].shoulder > 0 || t > 0 && t < 40 {
+            t += 1;
+            let v = &s.fighters[1];
+            let low = v.particle_ids().map(|i| s.world.particles[i as usize].pos.y).fold(f32::MAX, f32::min);
+            eprintln!("t{t} sh {} vel {:?} lowest {low:.2} pelvis y {:.2} flying {} hp {:.0}", s.fighters[0].shoulder, v.body_vel(&s.world), v.pos(&s.world, PELVIS).y, v.flying, v.health);
+        }
+    }
 }

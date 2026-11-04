@@ -5,7 +5,7 @@ use stickfell_physics::Vec2;
 use std::sync::Arc;
 
 use stickfell_physics::World;
-use stickfell_render::{Camera2D, Color, Font, Frame, Light, Occluder, SpriteAtlas};
+use stickfell_render::{Camera2D, Color, Font, Frame, Light, Occluder, SpriteAtlas, StaticScene};
 
 use crate::fighter::{self, Fighter, HAND_A, HEAD, HEAD_R, LIMB_R, MAX_HEALTH, NECK, PELVIS, S_FORE_A, S_FORE_B, S_HEAD, S_SHIN_A, S_SHIN_B, S_THIGH_A, S_THIGH_B, S_TORSO, S_UPPER_A, S_UPPER_B};
 use crate::level::{ArtLayer, HazardKind, LevelDef};
@@ -851,6 +851,31 @@ fn draw_nooses(s: &GameState, frame: &mut Frame, skin: Option<&Skin>) {
     }
 }
 
+/// A level's solid boxes for the renderer's baked contact shadows: made once
+/// per level and kept (the renderer remembers its bake by this `Arc`).
+pub fn static_scene(lv: &LevelDef) -> Arc<StaticScene> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static SCENES: OnceLock<Mutex<HashMap<&'static str, Arc<StaticScene>>>> = OnceLock::new();
+    let mut scenes = SCENES.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    scenes
+        .entry(lv.name)
+        .or_insert_with(|| {
+            let boxes = lv
+                .boxes
+                .iter()
+                .map(|b| {
+                    let o = stickfell_physics::Obb::new(b.center, b.half, b.angle);
+                    (o.center, o.half, o.rot)
+                })
+                .collect();
+            // (a little past the camera's limits, which the view can show)
+            let pad = Vec2::splat(3.0);
+            Arc::new(StaticScene { min: lv.min - pad, max: lv.max + pad, boxes })
+        })
+        .clone()
+}
+
 pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, cam_center: Vec2, hud: &Hud) {
     let t = frame.time;
     let shake = Vec2::new((t * 91.0).sin(), (t * 77.0).cos()) * s.shake * 0.12;
@@ -867,6 +892,7 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
         frame.sprite_atlas = Some(game_atlas);
     }
     let skin = skin_arc.as_deref();
+    frame.statics = Some(static_scene(lv));
     frame.clear = Color::hex(lv.bg);
     frame.ambient = Color::linear(lv.ambient[0], lv.ambient[1], lv.ambient[2], 1.0);
     let w = &s.world;
@@ -890,7 +916,10 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
             Some((dir, half)) => Light::spot(l.pos, l.radius * (0.95 + 0.05 * flick), color, dir, half),
             None => Light::point(l.pos, l.radius * (0.95 + 0.05 * flick), color),
         };
-        frame.light(light);
+        // how big the source is (softer shadows the bigger): a fixture's lamp
+        // head; otherwise wider the further it reaches (a glowing pit, the sky)
+        let size = if l.fixture { 0.3 } else { (l.radius * 0.03).clamp(0.12, 1.5) };
+        frame.light(light.size(size));
         if l.fixture {
             if l.flicker {
                 frame.capsule(l.pos - Vec2::new(0.0, 0.5), l.pos - Vec2::new(0.0, 0.1), 0.05, Color::hex(0x3a2a1a));
@@ -1329,8 +1358,9 @@ fn draw_hud(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, hud: 
         if me.alive && me.held_by.is_some() && me.down == 0 && !s.in_finisher(me.id as usize) {
             let pulse = if (s.frame / 8) % 2 == 0 { Color::hex(0xffb23a) } else { Color::hex(0xffe08a) };
             centered_text(frame, screen, screen.y * 0.72, 2.6 * k, "Grabbed!  Mash A / D to break free", pulse);
-        } else if me.alive && me.hold.is_some() && me.flip == 0 && !s.in_finisher(me.id as usize) {
-            centered_text(frame, screen, screen.y * 0.78, 1.8 * k, "Q throw  (holding their weapon arm: Q takes the weapon)", Color::hex(0xc0c6d4));
+        } else if me.alive && me.hold.is_some() && me.flip == 0 && me.shoulder == 0 && !s.in_finisher(me.id as usize) {
+            let tip = "Q throw  (back to them: over the shoulder;  holding their weapon arm: take the weapon)";
+            centered_text(frame, screen, screen.y * 0.78, 1.8 * k, tip, Color::hex(0xc0c6d4));
         }
     }
     let pad = 16.0 * k;

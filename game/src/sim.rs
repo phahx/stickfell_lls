@@ -71,6 +71,14 @@ const DIVE_RANGE: f32 = 3.5;
 /// at the end (along the flip, and up).
 const FLIP_FLING: f32 = 7.5;
 const FLIP_LIFT: f32 = 4.0;
+/// A shoulder throw: how far behind you they can be to haul over, how high
+/// over your neck their middle goes, where in front they're let go (just off
+/// the floor), and how hard they're driven into it then (along, down).
+const SHOULDER_REACH: f32 = 1.8;
+const SHOULDER_OVER: f32 = 1.05;
+const SHOULDER_LAND: f32 = 1.25;
+const SHOULDER_SLAM: Vec2 = Vec2::new(2.0, -11.0);
+const SHOULDER_DAMAGE: f32 = 18.0;
 /// A hit at least this hard makes the one hitting you let go.
 const HOLD_BREAK_DAMAGE: f32 = 5.0;
 /// Thrown bodies: losing more speed than this in a frame (hitting a wall,
@@ -872,6 +880,7 @@ impl GameState {
         f.hold = None;
         f.hold_t = 0;
         f.heave = 0;
+        f.shoulder = 0;
         self.world.distances[f.grab as usize].enabled = false;
         self.world.distances[f.tether as usize].enabled = false;
         // put the second hand back on a two-handed weapon
@@ -1127,10 +1136,123 @@ impl GameState {
             self.events.push(Sfx::Clash.at(at).vol(0.6));
             return true;
         }
+        if self.can_shoulder_throw(fi, v) {
+            self.start_shoulder_throw(fi, v);
+            return true;
+        }
         if f.heave == 0 {
             self.fighters[fi].heave = fighter::HEAVE_FRAMES;
         }
         false
+    }
+
+    /// Whether `fi` can haul `v` over their shoulder: on their feet, not
+    /// already throwing, with their back to `v` and `v` close behind them.
+    fn can_shoulder_throw(&self, fi: usize, v: usize) -> bool {
+        let (f, vf) = (&self.fighters[fi], &self.fighters[v]);
+        let behind = (vf.pos(&self.world, PELVIS).x - f.pos(&self.world, PELVIS).x) * f.facing;
+        let tied = self.nooses.iter().any(|n| n.victim as usize == v && !n.cut);
+        f.grounded && f.heave == 0 && f.shoulder == 0 && f.down == 0 && !vf.choking && !tied && !self.in_finisher(v)
+            && (-SHOULDER_REACH..-0.05).contains(&behind)
+    }
+
+    /// Plans a shoulder throw: the held body's middle arcs from behind `fi`,
+    /// up over their neck and down in front of them, turning heels over head
+    /// to land on its back with the head towards the thrower.
+    fn start_shoulder_throw(&mut self, fi: usize, v: usize) {
+        let f = &self.fighters[fi];
+        let dir = f.facing.signum();
+        let ids: Vec<u32> = self.fighters[v].particle_ids().collect();
+        let centre = ids.iter().map(|&i| self.world.particles[i as usize].pos).sum::<Vec2>() / ids.len() as f32;
+        let mut pose = [Vec2::ZERO; fighter::PARTICLES as usize];
+        for (k, &i) in ids.iter().enumerate() {
+            pose[k] = self.world.particles[i as usize].pos - centre;
+        }
+        let neck = f.pos(&self.world, fighter::NECK);
+        let feet = f.pos(&self.world, fighter::FOOT_A).y.min(f.pos(&self.world, fighter::FOOT_B).y);
+        let top = Vec2::new(neck.x + dir * 0.1, neck.y + SHOULDER_OVER);
+        let land = Vec2::new(f.pos(&self.world, PELVIS).x + dir * SHOULDER_LAND, feet + 0.55);
+        // (the curve's middle point is pulled up so the arc's top reaches `top`)
+        let over = top * 2.0 - (centre + land) * 0.5;
+        // turn the way they're going over (clockwise going right) to lie on
+        // their back, head towards you: at least half a turn
+        let vf = &self.fighters[v];
+        let torso = dmath::angle(vf.pos(&self.world, fighter::NECK) - vf.pos(&self.world, PELVIS));
+        let pi = core::f32::consts::PI;
+        let tau = core::f32::consts::TAU;
+        let mut turn = if dir > 0.0 { -(torso - (pi + 0.15)).rem_euclid(tau) } else { (-0.15 - torso).rem_euclid(tau) };
+        if turn.abs() < pi {
+            turn += dir * -tau;
+        }
+        let f = &mut self.fighters[fi];
+        f.shoulder = fighter::SHOULDER_FRAMES;
+        f.shoulder_dir = dir as i8;
+        f.flip_pose = pose;
+        f.flip_path = [centre, over, land];
+        f.flip_turn = turn;
+        // limp from the moment they're hauled up, and they pass over you,
+        // not through your head
+        // (thrown from the start: whatever they hit on the way hurts)
+        let vf = &mut self.fighters[v];
+        vf.knock_down(fighter::SHOULDER_FRAMES as u16 + 70);
+        vf.flying = fighter::SHOULDER_FRAMES + 20;
+        vf.flung_by = fi as u8;
+        vf.ghost = vf.ghost.max(fighter::SHOULDER_FRAMES + 6);
+        for k in 0..fighter::BONES.len() as u32 {
+            self.world.segments[(vf.seg_base + k) as usize].ignore_group = fi as u16 + 1;
+        }
+        self.events.push(Sfx::SwingHeavy.at(neck).vol(1.2));
+    }
+
+    /// Shoulder throws in progress: the held body follows the planned arc and
+    /// turn; at the end it's let go and driven into the floor.
+    fn update_shoulder_throws(&mut self) {
+        for fi in 0..self.fighters.len() {
+            let f = &self.fighters[fi];
+            if f.shoulder == 0 {
+                continue;
+            }
+            let (Some(v), true) = (f.hold.map(|v| v as usize), f.grabbing && f.alive) else {
+                self.fighters[fi].shoulder = 0;
+                continue;
+            };
+            let (t, dir) = (f.shoulder_t(), f.shoulder_dir as f32);
+            let [p0, p1, p2] = f.flip_path;
+            let centre = p0 * (1.0 - t) * (1.0 - t) + p1 * 2.0 * t * (1.0 - t) + p2 * t * t;
+            let (sn, cs) = dmath::sin_cos(f.flip_turn * t);
+            let pose = f.flip_pose;
+            let ids: Vec<u32> = self.fighters[v].particle_ids().collect();
+            for (k, &i) in ids.iter().enumerate() {
+                let p = &mut self.world.particles[i as usize];
+                if p.inv_mass == 0.0 {
+                    continue;
+                }
+                let o = pose[k];
+                let want = centre + Vec2::new(o.x * cs - o.y * sn, o.x * sn + o.y * cs);
+                p.vel = p.vel.lerp((want - p.pos) / DT, 0.6);
+            }
+            let f = &mut self.fighters[fi];
+            f.shoulder -= 1;
+            if f.shoulder > 0 {
+                continue;
+            }
+            // let go at the bottom: slammed flat
+            self.release_grab(fi);
+            self.fighters[fi].grab_cd = 30;
+            let slam = Vec2::new(dir * SHOULDER_SLAM.x, SHOULDER_SLAM.y);
+            for &id in &ids {
+                let p = &mut self.world.particles[id as usize];
+                if p.inv_mass > 0.0 {
+                    p.vel = slam;
+                }
+            }
+            let vf = &mut self.fighters[v];
+            vf.flying = 20;
+            vf.flung_by = fi as u8;
+            vf.slam = SHOULDER_DAMAGE;
+            let at = self.fighters[v].pos(&self.world, PELVIS);
+            self.events.push(Sfx::Throw.at(at).vol(1.3));
+        }
     }
 
     /// The end of a heave: whoever is held goes flying along the aim.
@@ -3486,6 +3608,22 @@ impl GameState {
 
     /// A thrown body that stops dead (a wall, the floor) takes the hit.
     fn slam_thrown(&mut self, before: &[Option<Vec2>]) {
+        // slammed down: the hit lands as soon as they touch anything solid
+        for i in 0..self.fighters.len() {
+            let f = &self.fighters[i];
+            if f.slam <= 0.0 || !f.particle_ids().any(|id| self.world.particles[id as usize].on_ground()) {
+                continue;
+            }
+            let (dmg, at, by) = (f.slam, f.pos(&self.world, fighter::NECK), Some(f.flung_by));
+            let f = &mut self.fighters[i];
+            f.slam = 0.0;
+            f.flying = 0;
+            self.events.push(Sfx::Thud.at(at).vol(1.5));
+            self.shake = (self.shake + 0.7).min(1.5);
+            if self.fighters[i].alive {
+                self.damage(i, S_TORSO, dmg, at, Vec2::NEG_Y, 0.0, Kind::Blunt, by);
+            }
+        }
         for (i, v0) in before.iter().enumerate() {
             let Some(v0) = *v0 else { continue };
             let f = &self.fighters[i];
@@ -3837,6 +3975,7 @@ impl GameState {
             }
         }
         self.update_flips();
+        self.update_shoulder_throws();
         for f in &mut self.fighters {
             if f.ghost > 0 {
                 f.ghost -= 1;
@@ -4008,6 +4147,9 @@ impl RollbackGame for GameState {
             h.write_u32(f.swing_len as u32 | (f.punch_b as u32) << 8 | (f.kick as u32) << 16 | (f.kick_kind as u32) << 24);
             h.write_u32(f.hold.map_or(255, |v| v as u32) | (f.hold_slot as u32) << 8 | (f.struggle as u32) << 16 | (f.heave as u32) << 24);
             h.write_u32(f.limbs_gone as u32 | (f.flip as u32) << 16 | (f.flip_dir as u8 as u32) << 24);
+            h.write_u8(f.shoulder);
+            h.write_f32(f.slam);
+            h.write_u8(f.shoulder_dir as u8);
             h.write_u8(f.dove as u8 | (f.prey as u8) << 1 | (f.hang_blade as u8) << 2 | (f.choking as u8) << 3 | (f.dove_shift as u8) << 4 | (f.flip_whip as u8) << 5);
             h.write_u8(f.ghost);
             h.write_f32(f.flip_turn);

@@ -178,13 +178,18 @@ impl<G: Game> Runner<G> {
         let attrs = Window::default_attributes()
             .with_title(self.cfg.title.clone())
             .with_inner_size(PhysicalSize::new(self.cfg.size.0, self.cfg.size.1))
-            .with_window_icon(self.cfg.window_icon.and_then(load_icon));
+            .with_window_icon(self.cfg.window_icon.and_then(load_icon))
+            // (shown once there's a first frame in it: a window that's up
+            // but not drawing yet looks frozen)
+            .with_visible(false);
         #[cfg(windows)]
         let attrs = {
             use winit::platform::windows::WindowAttributesExtWindows;
             attrs.with_taskbar_icon(self.cfg.taskbar_icon.and_then(load_icon))
         };
         let window = Arc::new(el.create_window(attrs)?);
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
+        let t_window = ms(self.start);
         // On Windows, DX12 presents through the desktop compositor's flip model
         // and paces frames evenly in a window; windowed Vulkan there can miss
         // vblanks (e.g. an uneven ~123 fps on a 144 Hz display). Try the
@@ -226,8 +231,12 @@ impl<G: Game> Runner<G> {
             .find(|m| modes.contains(m))
             .unwrap_or(wgpu::PresentMode::AutoNoVsync);
         surface.configure(&device, &config);
-        let renderer = Renderer::new(&device, &queue, config.format);
+        let t_gpu = ms(self.start);
+        // (shaders compile on another thread: the game can draw a loading
+        // screen meanwhile, see `Frame::shaders_ready`)
+        let renderer = Renderer::preloading(&device, &queue, config.format);
         let info = adapter.get_info();
+        eprintln!("[stickfell] startup: window {t_window:.0} ms, GPU {t_gpu:.0} ms, renderer {:.0} ms (since launch)", ms(self.start));
         eprintln!("[stickfell] {} ({:?}), surface {:?}, present {:?}", info.name, info.backend, config.format, config.present_mode);
         self.gfx = Some(Gfx { window, surface, config, device, renderer });
         self.last = Instant::now();
@@ -297,6 +306,11 @@ impl<G: Game> Runner<G> {
             }
         }
         let alpha = (self.acc / step).clamp(0.0, 1.0) as f32;
+        let was_ready = self.frame.shaders_ready;
+        self.frame.shaders_ready = gfx.renderer.ready();
+        if self.frame.shaders_ready && !was_ready {
+            eprintln!("[stickfell] startup: shaders ready {:.0} ms after launch", self.start.elapsed().as_secs_f64() * 1e3);
+        }
         self.game.draw(&mut self.frame, Vec2::new(w as f32, h as f32), alpha, dt as f32);
 
         let t_game = now.elapsed().as_secs_f64();
@@ -349,7 +363,15 @@ impl<G: Game> ApplicationHandler for Runner<G> {
             if let Err(e) = self.init_gfx(el) {
                 self.error = Some(e.to_string());
                 el.exit();
+                return;
             }
+            // draw the first frame, then show the window with it in
+            self.redraw(el);
+            if let Some(gfx) = &self.gfx {
+                gfx.window.set_visible(true);
+                gfx.window.request_redraw();
+            }
+            eprintln!("[stickfell] startup: first frame shown {:.0} ms after launch", self.start.elapsed().as_secs_f64() * 1e3);
         }
     }
 
@@ -450,6 +472,47 @@ pub fn run<G: Game>(cfg: AppConfig, game: G) -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// Times starting up headless: making the renderer, then the first frames
+/// (the game's draw, and the GPU finishing each), to find startup hitches.
+pub fn time_startup<G: Game>(game: &mut G, size: (u32, u32), frames: u32) -> Result<(), Box<dyn Error>> {
+    let t = Instant::now();
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    }))?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default()))?;
+    println!("device {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    let t = Instant::now();
+    let mut renderer = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+    println!("renderer {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("startup timing"),
+        size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&Default::default());
+    let input = Input { screen: Vec2::new(size.0 as f32, size.1 as f32), ..Default::default() };
+    for i in 0..frames {
+        let t = Instant::now();
+        game.tick(&input);
+        let mut frame = Frame::default();
+        frame.time = i as f32 / 60.0;
+        game.draw(&mut frame, Vec2::new(size.0 as f32, size.1 as f32), 1.0, 1.0 / 60.0);
+        let t_game = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        renderer.render(&frame, &view, size.0, size.1);
+        device.poll(wgpu::PollType::wait_indefinitely())?;
+        println!("frame {i}: game {:.1} ms, render {:.1} ms", t_game * 1e3, t.elapsed().as_secs_f64() * 1e3);
+    }
+    Ok(())
+}
+
 /// Ticks `game` `ticks` times, then renders its frame offscreen `n` times at
 /// `size` and prints the average GPU time per frame (render profiling).
 pub fn bench_headless<G: Game>(game: &mut G, ticks: u32, size: (u32, u32), n: u32) -> Result<(), Box<dyn Error>> {
@@ -468,9 +531,9 @@ pub fn bench_headless<G: Game>(game: &mut G, ticks: u32, size: (u32, u32), n: u3
     frame.time = ticks as f32 / 60.0;
     game.draw(&mut frame, Vec2::new(size.0 as f32, size.1 as f32), 1.0, 1.0);
     let secs = renderer.bench(&frame, size.0, size.1, n);
-    let (lights, shadow_verts) = renderer.last_stats();
+    let (lights, casters) = renderer.last_stats();
     println!(
-        "{}x{}: {:.3} ms/frame ({:.0} fps) | {} shapes, {} lights, {} occluders, {} shadow tris",
+        "{}x{}: {:.3} ms/frame ({:.0} fps) | {} shapes, {} lights, {} occluders, {} shadow casters",
         size.0,
         size.1,
         secs * 1000.0,
@@ -478,7 +541,7 @@ pub fn bench_headless<G: Game>(game: &mut G, ticks: u32, size: (u32, u32), n: u3
         frame.counts().0,
         lights,
         frame.counts().1,
-        shadow_verts / 3
+        casters
     );
     Ok(())
 }
