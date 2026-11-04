@@ -183,8 +183,8 @@ fn folder_size(dir: &Path) -> u64 {
     })
 }
 
-/// Removes Stickfell: the game, the shortcuts and the Apps entry now; the launcher (and the install folder, if
-/// nothing else is in it) just after this launcher closes. The tester key stays, for a reinstall.
+/// Removes Stickfell: the game, the shortcuts, the Apps entry, the launcher (moved out to Temp, see
+/// `remove_after_exit`) and the install folder if nothing else is in it. The tester key stays, for a reinstall.
 pub fn uninstall(root: &Path) -> Result<(), String> {
     let game = root.join(GAME);
     if game.exists() {
@@ -203,27 +203,25 @@ pub fn uninstall(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// A running exe can't delete itself: a hidden command keeps trying (for about a minute) until the launcher has
-/// closed. The whole folder only if nothing but the launcher is left in it (someone may have installed into a
-/// folder of their own).
-#[cfg(windows)]
+/// A running exe can't be deleted, but it can be moved: the launcher moves itself into the Temp folder (Windows
+/// clears that out by itself), then the install folder goes if nothing else is in it (someone may have installed
+/// into a folder of their own). No helper process. A launcher installed on another drive than Temp can't move
+/// there, so it stays, and the folder with it, for the player to delete.
 fn remove_after_exit(root: &Path) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let only_launcher = std::fs::read_dir(root).is_ok_and(|e| e.flatten().all(|e| e.file_name().eq_ignore_ascii_case(EXE)));
-    let (remove, gone) = if only_launcher {
-        (format!("rmdir /s /q \"{}\" 2>nul", root.display()), root.display().to_string())
-    } else {
-        let exe = root.join(EXE);
-        (format!("del /f /q \"{}\" 2>nul", exe.display()), exe.display().to_string())
-    };
-    // (/s: cmd takes everything between the outer quotes as it is, inner quotes included)
-    let line = format!("/s /c \"for /l %i in (1,1,40) do ( ping -n 2 127.0.0.1 >nul & {remove} & if not exist \"{gone}\" exit )\"");
-    let _ = std::process::Command::new("cmd").raw_arg(line).creation_flags(CREATE_NO_WINDOW).spawn();
+    let exe = root.join(EXE);
+    if exe.exists() {
+        let parked = std::env::temp_dir().join(format!("stickfell-uninstalled-{}.exe", std::process::id()));
+        if std::fs::rename(&exe, &parked).is_err() {
+            return;
+        }
+    }
+    let empty = std::fs::read_dir(root).is_ok_and(|mut e| e.next().is_none());
+    if empty {
+        let _ = std::fs::remove_dir(root);
+    }
 }
 
-#[cfg(not(windows))]
-fn remove_after_exit(_root: &Path) {}
+
 
 #[cfg(test)]
 mod tests {
@@ -250,6 +248,8 @@ mod round_trip {
     #[test]
     #[ignore]
     fn install_and_uninstall() {
+        // (it shares the Apps entry and shortcuts with a real install: never run it over one)
+        assert!(registered_root().is_none(), "Stickfell is really installed on this PC; this test would overwrite its registration");
         let base = PathBuf::from(std::env::var("STICKFELL_TEST_ROOT").expect("STICKFELL_TEST_ROOT"));
         let legacy = base.join("Downloads").join("game");
         std::fs::create_dir_all(&legacy).unwrap();
@@ -269,14 +269,9 @@ mod round_trip {
         eprintln!("installed: {} ; shortcut {}", exe.display(), menu.display());
 
         uninstall(&root).unwrap();
-        assert!(!root.join(GAME).exists() && !menu.exists() && registered_root().is_none(), "game, shortcut and Apps entry go at once");
-        for _ in 0..20 {
-            if !root.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-        assert!(!root.exists(), "the launcher and its folder go a moment later");
+        assert!(!root.join(GAME).exists() && !menu.exists() && registered_root().is_none(), "game, shortcut and Apps entry go");
+        assert!(!root.exists(), "the launcher and its folder go too");
         eprintln!("uninstalled cleanly");
     }
 }
+
