@@ -234,6 +234,29 @@ mod tests {
     }
 
     #[test]
+    fn uninstalling_moves_the_launcher_out_and_removes_the_emptied_folder() {
+        let root = std::env::temp_dir().join(format!("stickfell-remove-test-{}", std::process::id())).join(NAME);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(EXE), b"MZ launcher").unwrap();
+        remove_after_exit(&root);
+        assert!(!root.exists(), "the folder goes once the launcher is out of it");
+        let parked = std::env::temp_dir().join(format!("stickfell-uninstalled-{}.exe", std::process::id()));
+        assert_eq!(std::fs::read(&parked).unwrap(), b"MZ launcher", "the launcher is parked in Temp");
+        let _ = std::fs::remove_file(parked);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+
+        // someone else's files in the folder: it stays
+        let mine = std::env::temp_dir().join(format!("stickfell-remove-test2-{}", std::process::id()));
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::write(mine.join(EXE), b"MZ").unwrap();
+        std::fs::write(mine.join("notes.txt"), b"theirs").unwrap();
+        remove_after_exit(&mine);
+        assert!(mine.join("notes.txt").exists() && !mine.join(EXE).exists());
+        let _ = std::fs::remove_dir_all(&mine);
+        let _ = std::fs::remove_file(std::env::temp_dir().join(format!("stickfell-uninstalled-{}.exe", std::process::id())));
+    }
+
+    #[test]
     fn the_default_is_per_user_programs() {
         assert!(default_root().ends_with(r"Programs\Stickfell"));
     }
