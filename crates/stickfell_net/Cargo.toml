@@ -1,0 +1,8 @@
+[package]
+name = "stickfell_net"
+description = "Rollback netcode: P2P sessions, sync testing, UDP and simulated transports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

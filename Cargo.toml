@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "game", "labs/*", "launcher"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+glam = "0.30"
+wgpu = "30"
+winit = "0.30"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
+png = "0.18"
+stickfell_physics = { path = "crates/stickfell_physics" }
+stickfell_net = { path = "crates/stickfell_net" }
+stickfell_render = { path = "crates/stickfell_render" }
+stickfell_app = { path = "crates/stickfell_app" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

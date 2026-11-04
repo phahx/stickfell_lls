@@ -1,0 +1,22 @@
+[package]
+name = "stickfell"
+description = "Stickfell: Last Limb Standing, an online physics stick-figure brawler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true
+stickfell_physics.workspace = true
+stickfell_net.workspace = true
+stickfell_render.workspace = true
+stickfell_app.workspace = true
+png.workspace = true
+rodio = { version = "0.23.0", default-features = false, features = ["playback", "vorbis", "wav"] }
+# (rodio's audio backend, named here to turn on "realtime": the audio thread
+# gets real-time priority, so a busy frame never starves it into dropouts)
+cpal = { version = "0.18.2", features = ["realtime"] }
+
+[build-dependencies]
+winresource = "0.1"
+

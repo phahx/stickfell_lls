@@ -1,0 +1,8 @@
+/target
+# (stray screenshots in the root; the game's art under game/assets is committed)
+/*.png
+/dist/
+node_modules/
+update_server/dist/
+update_server/.data/
+__pycache__/

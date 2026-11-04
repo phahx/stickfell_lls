@@ -1,0 +1,9 @@
+[package]
+name = "stickfell_physics"
+description = "Deterministic 2D position-based physics (XPBD) for ragdolls and particles"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+glam.workspace = true

@@ -1,0 +1,10 @@
+target/
+dist/
+**/node_modules/
+update_server/dist/
+update_server/.data/
+labs/
+game/
+crates/
+tools/
+launcher/

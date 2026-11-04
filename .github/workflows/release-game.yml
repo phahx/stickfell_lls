@@ -1,0 +1,50 @@
+# Releases the game to testers: builds it, signs its manifest with the game channel's own key and uploads it to the
+# update service, which every launcher checks. Run it from the Actions tab ("Run workflow", with the patch notes
+# players will see), or push a tag named game-v<anything>.
+# Its secrets live only in the "game-release" GitHub Environment: STICKFELL_SIGNING_KEY (this channel's private key)
+# and STICKFELL_UPLOAD_KEY. The service's address is the repository variable STICKFELL_UPDATE_URL.
+name: Release the game
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: What changed (players see this in the launcher)
+        required: true
+  push:
+    tags: ["game-v*"]
+permissions:
+  contents: read
+concurrency:
+  group: release-game
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: windows-latest
+    environment: game-release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release -p stickfell
+      - name: Build
+        env:
+          STICKFELL_BUILD: ${{ github.run_number }}
+          STICKFELL_UPDATE_URL: ${{ vars.STICKFELL_UPDATE_URL }}
+        run: cargo build --release -p stickfell
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Sign and upload
+        env:
+          STICKFELL_SIGNING_KEY: ${{ secrets.STICKFELL_SIGNING_KEY }}
+          STICKFELL_UPLOAD_KEY: ${{ secrets.STICKFELL_UPLOAD_KEY }}
+          STICKFELL_UPDATE_URL: ${{ vars.STICKFELL_UPDATE_URL }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          COMMIT: ${{ github.sha }}
+          NOTES: ${{ inputs.notes }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: node update_server/scripts/publish-update.mjs target/release/stickfell.exe game
+      - uses: actions/upload-artifact@v4
+        with:
+          name: game-build-${{ github.run_number }}
+          path: target/release/stickfell.exe

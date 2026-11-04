@@ -1,0 +1,50 @@
+# Releases the launcher to testers: builds it, signs its manifest with the launcher channel's own key and uploads it to the
+# update service, which every launcher checks. Run it from the Actions tab ("Run workflow", with the patch notes
+# players will see), or push a tag named launcher-v<anything>.
+# Its secrets live only in the "launcher-release" GitHub Environment: STICKFELL_SIGNING_KEY (this channel's private key)
+# and STICKFELL_UPLOAD_KEY. The service's address is the repository variable STICKFELL_UPDATE_URL.
+name: Release the launcher
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: What changed (players see this in the launcher)
+        required: true
+  push:
+    tags: ["launcher-v*"]
+permissions:
+  contents: read
+concurrency:
+  group: release-launcher
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: windows-latest
+    environment: launcher-release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release -p stickfell_launcher
+      - name: Build
+        env:
+          STICKFELL_LAUNCHER_BUILD: ${{ github.run_number }}
+          STICKFELL_UPDATE_URL: ${{ vars.STICKFELL_UPDATE_URL }}
+        run: cargo build --release -p stickfell_launcher
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Sign and upload
+        env:
+          STICKFELL_SIGNING_KEY: ${{ secrets.STICKFELL_SIGNING_KEY }}
+          STICKFELL_UPLOAD_KEY: ${{ secrets.STICKFELL_UPLOAD_KEY }}
+          STICKFELL_UPDATE_URL: ${{ vars.STICKFELL_UPDATE_URL }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          COMMIT: ${{ github.sha }}
+          NOTES: ${{ inputs.notes }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: node update_server/scripts/publish-update.mjs target/release/stickfell_launcher.exe launcher
+      - uses: actions/upload-artifact@v4
+        with:
+          name: launcher-build-${{ github.run_number }}
+          path: target/release/stickfell_launcher.exe

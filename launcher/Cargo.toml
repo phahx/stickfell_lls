@@ -1,0 +1,28 @@
+[package]
+name = "stickfell_launcher"
+description = "Stickfell's launcher: keeps itself and the game up to date from the update service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "stickfell_launcher"
+path = "src/main.rs"
+
+[dependencies]
+glam.workspace = true
+stickfell_app.workspace = true
+stickfell_render.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+sha2 = "0.10"
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+ureq = "3"
+arboard = { version = "3", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory"] }
+
+[build-dependencies]
+winresource = "0.1"

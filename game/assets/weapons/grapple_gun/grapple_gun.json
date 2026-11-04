@@ -1,0 +1,330 @@
+{
+  "weapon": "grapple_gun",
+  "px_per_m": 420,
+  "units": "1x pixels (420 px/m), y down, gun space = the 340x130 workspace canvas. Multiply by 4 for @4x files.",
+  "angles": "degrees, positive = clockwise on screen",
+  "canvas": [
+    340.0,
+    130.0
+  ],
+  "draw_order": [
+    "prong_down",
+    "prong_up",
+    "hook",
+    "trigger",
+    "body",
+    "drum",
+    "needle"
+  ],
+  "pieces": [
+    {
+      "name": "prong_down",
+      "z": 0,
+      "parent": "hook",
+      "file": "pieces/prong_down.png",
+      "file_4x": "pieces/prong_down@4x.png",
+      "vector": "pieces/prong_down.svg",
+      "size": [
+        30.0,
+        25.0
+      ],
+      "origin": [
+        289.0,
+        32.0
+      ],
+      "pivot": [
+        17.5,
+        1.0
+      ],
+      "pivot_gun": [
+        306.5,
+        33.0
+      ],
+      "pivot_in_hook": [
+        -0.5,
+        3.0
+      ]
+    },
+    {
+      "name": "prong_up",
+      "z": 1,
+      "parent": "hook",
+      "file": "pieces/prong_up.png",
+      "file_4x": "pieces/prong_up@4x.png",
+      "vector": "pieces/prong_up.svg",
+      "size": [
+        30.0,
+        25.0
+      ],
+      "origin": [
+        289.0,
+        3.0
+      ],
+      "pivot": [
+        17.5,
+        24.0
+      ],
+      "pivot_gun": [
+        306.5,
+        27.0
+      ],
+      "pivot_in_hook": [
+        -0.5,
+        -3.0
+      ]
+    },
+    {
+      "name": "hook",
+      "z": 2,
+      "parent": "gun",
+      "file": "pieces/hook.png",
+      "file_4x": "pieces/hook@4x.png",
+      "vector": "pieces/hook.svg",
+      "size": [
+        58.0,
+        16.0
+      ],
+      "origin": [
+        282.0,
+        22.0
+      ],
+      "pivot": [
+        25.0,
+        8.0
+      ],
+      "pivot_gun": [
+        307.0,
+        30.0
+      ]
+    },
+    {
+      "name": "trigger",
+      "z": 3,
+      "parent": "gun",
+      "file": "pieces/trigger.png",
+      "file_4x": "pieces/trigger@4x.png",
+      "vector": "pieces/trigger.svg",
+      "size": [
+        14.0,
+        24.0
+      ],
+      "origin": [
+        94.0,
+        58.0
+      ],
+      "pivot": [
+        8.0,
+        2.0
+      ],
+      "pivot_gun": [
+        102.0,
+        60.0
+      ]
+    },
+    {
+      "name": "body",
+      "z": 4,
+      "parent": "gun",
+      "file": "pieces/body.png",
+      "file_4x": "pieces/body@4x.png",
+      "vector": "pieces/body.svg",
+      "size": [
+        264.0,
+        123.0
+      ],
+      "origin": [
+        27.0,
+        6.0
+      ],
+      "pivot": [
+        23.0,
+        94.0
+      ],
+      "pivot_gun": [
+        50.0,
+        100.0
+      ]
+    },
+    {
+      "name": "drum",
+      "z": 5,
+      "parent": "gun",
+      "file": "pieces/drum.png",
+      "file_4x": "pieces/drum@4x.png",
+      "vector": "pieces/drum.svg",
+      "size": [
+        36.0,
+        36.0
+      ],
+      "origin": [
+        82.0,
+        22.0
+      ],
+      "pivot": [
+        18.0,
+        18.0
+      ],
+      "pivot_gun": [
+        100.0,
+        40.0
+      ]
+    },
+    {
+      "name": "needle",
+      "z": 6,
+      "parent": "gun",
+      "file": "pieces/needle.png",
+      "file_4x": "pieces/needle@4x.png",
+      "vector": "pieces/needle.svg",
+      "size": [
+        10.0,
+        10.0
+      ],
+      "origin": [
+        56.0,
+        27.0
+      ],
+      "pivot": [
+        5.0,
+        5.0
+      ],
+      "pivot_gun": [
+        61.0,
+        32.0
+      ]
+    }
+  ],
+  "sockets": {
+    "grip": {
+      "on": "body",
+      "gun": [
+        50.0,
+        100.0
+      ],
+      "local": [
+        23.0,
+        94.0
+      ]
+    },
+    "muzzle": {
+      "on": "body",
+      "gun": [
+        290.0,
+        30.0
+      ],
+      "local": [
+        263.0,
+        24.0
+      ]
+    },
+    "rope_exit": {
+      "on": "body",
+      "gun": [
+        287.5,
+        30.0
+      ],
+      "local": [
+        260.5,
+        24.0
+      ]
+    },
+    "rope_eye": {
+      "on": "hook",
+      "gun": [
+        286.5,
+        30.0
+      ],
+      "local": [
+        4.5,
+        8.0
+      ],
+      "from_hook_pivot": [
+        -20.5,
+        0.0
+      ]
+    },
+    "tip": {
+      "on": "hook",
+      "gun": [
+        339.0,
+        30.0
+      ],
+      "local": [
+        57.0,
+        8.0
+      ],
+      "from_hook_pivot": [
+        32.0,
+        0.0
+      ]
+    },
+    "prong_up_hinge": {
+      "on": "hook",
+      "gun": [
+        306.5,
+        27.0
+      ],
+      "local": [
+        24.5,
+        5.0
+      ],
+      "from_hook_pivot": [
+        -0.5,
+        -3.0
+      ]
+    },
+    "prong_down_hinge": {
+      "on": "hook",
+      "gun": [
+        306.5,
+        33.0
+      ],
+      "local": [
+        24.5,
+        11.0
+      ],
+      "from_hook_pivot": [
+        -0.5,
+        3.0
+      ]
+    }
+  },
+  "animation": {
+    "trigger_pull_deg": 14.0,
+    "needle_full_deg": 0.0,
+    "needle_empty_deg": -190.0,
+    "prong_open_deg": {
+      "prong_up": 0.0,
+      "prong_down": 0.0
+    },
+    "prong_fold_deg": {
+      "prong_up": -40.0,
+      "prong_down": 40.0
+    },
+    "drum_rope_radius_px": 12.5,
+    "drum_pay_out_direction": "clockwise (positive) pays rope out, negative reels in"
+  },
+  "rope": {
+    "tile": "rope_tile.png",
+    "tile_4x": "rope_tile@4x.png",
+    "tile_size": [
+      6.0,
+      4.0
+    ],
+    "thickness_px": 4.0,
+    "colours": {
+      "outline": "#14160b",
+      "rope": "#c9a066",
+      "twist": "#7a5a2e"
+    },
+    "from": "rope_exit (body) to rope_eye (hook); draw it after prongs, before the hook piece"
+  },
+  "notes": [
+    "Place every gun-parented piece at origin (or rotate it about pivot_gun). Hook-parented pieces hang off the hook pivot via pivot_in_hook.",
+    "Loaded: hook pivot sits at pieces[hook].pivot_gun; its shaft and rope eye hide inside the muzzle. Fired: move the hook pivot freely and rotate it to the flight direction.",
+    "trigger: rotate by 0..trigger_pull_deg about its pivot (tip swings back toward the grip).",
+    "needle: drawn at full pressure; rotate toward needle_empty_deg as the gas is spent.",
+    "drum: spin as rope pays out (clockwise) or reels in (counter-clockwise).",
+    "prongs: 0 = open (as drawn); prong_fold_deg sweeps them back along the shaft for flight."
+  ]
+}

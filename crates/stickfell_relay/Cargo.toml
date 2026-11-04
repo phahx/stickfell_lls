@@ -1,0 +1,9 @@
+[package]
+name = "stickfell_relay"
+description = "Lobby + packet relay server for Stickfell online matches"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+stickfell_net.workspace = true

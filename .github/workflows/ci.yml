@@ -1,0 +1,30 @@
+# Tests everything on every push and pull request: the game, launcher and tools (Windows, where they ship), and the
+# update service (its tests, and that its image builds). Releasing is separate: release-game.yml, release-launcher.yml.
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  rust:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --release
+  update-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --no-audit --no-fund
+        working-directory: update_server
+      - run: npm run check
+        working-directory: update_server
+      - name: The image builds
+        run: docker build -f update_server/Dockerfile -t stickfell-update-server .
