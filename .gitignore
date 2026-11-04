@@ -6,3 +6,9 @@ node_modules/
 update_server/dist/
 update_server/.data/
 __pycache__/
+# a launcher run from the repo folder installs the game beside it
+/*.exe
+/game/stickfell.exe
+/game/*.update.exe
+/game/build.txt
+/game/notes.json
