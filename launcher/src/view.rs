@@ -43,8 +43,11 @@ const TITLE: Font = Font::Title;
 
 pub fn draw(ui: &mut U, s: &State) {
     ui.fill(col(c::BG));
-    if let Stage::Key { error } = s.stage {
-        return key_screen(ui, s, error.as_deref());
+    match s.stage {
+        Stage::Key { error } => return key_screen(ui, s, error.as_deref()),
+        Stage::Setup { root, desktop, legacy, error } => return setup_screen(ui, s, root, *desktop, legacy.is_some(), error.as_deref()),
+        Stage::Uninstall { done, error, .. } => return uninstall_screen(ui, s, *done, error.as_deref()),
+        _ => {}
     }
     match s.tab {
         Tab::Play => play_tab(ui, s),
@@ -420,4 +423,132 @@ fn key_screen(ui: &mut U, s: &State, error: Option<&str>) {
     ui.text_centred(BODY, lx + inner * 0.5, y + 26.0, 20.0, "Activate", Color::WHITE);
     y += 52.0 + 18.0;
     ui.paragraph(BODY, lx, y + 9.0, 13.0, 19.5, inner, 3, foot, col(c::FAINT));
+}
+
+// ---- first run: installing ----
+
+/// The dimmed key art and title bar behind a dialog, and the dialog's card: returns its top.
+fn dialog_frame(ui: &mut U, s: &State, h: f32) -> f32 {
+    key_art(ui, s);
+    ui.rect(0.0, 0.0, ui::W, ui::H, 0.0, Color::hex(0x0a0b10).alpha(0.78));
+    title_bar(ui, s, false);
+    let y0 = 360.0 - h * 0.46;
+    ui.shadow(390.0, y0 + 16.0, 500.0, h, 12.0, 48.0, Color::BLACK.alpha(0.5));
+    ui.rect(390.0, y0, 500.0, h, 12.0, col(c::CARD));
+    y0
+}
+
+/// `path` cut from the left to fit `width` ("...\Programs\Stickfell").
+fn fit_path(ui: &U, size: f32, width: f32, path: &str) -> String {
+    if ui.text_w(BODY, size, path) <= width {
+        return path.to_owned();
+    }
+    let chars: Vec<char> = path.chars().collect();
+    for start in 0..chars.len() {
+        let tail: String = chars[start..].iter().collect();
+        let shown = format!("...{tail}");
+        if ui.text_w(BODY, size, &shown) <= width {
+            return shown;
+        }
+    }
+    String::new()
+}
+
+fn setup_screen(ui: &mut U, s: &State, root: &std::path::Path, desktop: bool, moving: bool, error: Option<&str>) {
+    let (lx, inner) = (430.0, 420.0);
+    let intro = "Stickfell installs for your Windows account. The launcher and the game go in this folder:";
+    let moved = "The game you already have will be moved here, so it won't download again.";
+    let foot = "Needs about 30 MB. To remove it later, use Windows Settings, Apps.";
+    let n_intro = ui_wrap_count(ui, BODY, 15.0, inner, intro) as f32;
+    let n_moved = if moving { ui_wrap_count(ui, BODY, 13.0, inner, moved) as f32 } else { 0.0 };
+    let n_err = error.map_or(0.0, |e| ui_wrap_count(ui, BODY, 14.0, inner, e) as f32);
+    let n_foot = ui_wrap_count(ui, BODY, 13.0, inner, foot) as f32;
+    let h = 36.0 + 34.0 + 8.0 + n_intro * 22.5 + 18.0 + 16.0 + 8.0 + 48.0 + 16.0 + 24.0
+        + if moving { 10.0 + n_moved * 19.5 } else { 0.0 }
+        + if n_err > 0.0 { 10.0 + n_err * 20.0 } else { 0.0 }
+        + 20.0 + 52.0 + 18.0 + n_foot * 19.5 + 32.0;
+    let mut y = dialog_frame(ui, s, h) + 36.0;
+    ui.text(TITLE, lx, y + 17.0, 34.0, "INSTALL STICKFELL", col(c::TEXT));
+    y += 34.0 + 8.0;
+    ui.paragraph(BODY, lx, y + 11.0, 15.0, 22.5, inner, 4, intro, col(c::SOFT));
+    y += n_intro * 22.5 + 18.0;
+    ui.text(BODY, lx, y + 8.0, 13.0, "INSTALL FOLDER", col(c::MUTED));
+    y += 16.0 + 8.0;
+    let change = "Change";
+    let cw = 36.0 + ui.text_w(BODY, 15.0, change);
+    let fw = inner - 8.0 - cw;
+    ui.rect(lx, y, fw, 48.0, 6.0, col(0x2e3344));
+    ui.rect(lx + 1.0, y + 1.0, fw - 2.0, 46.0, 5.0, col(c::FIELD));
+    let shown = fit_path(ui, 15.0, fw - 28.0, &root.display().to_string());
+    ui.text(BODY, lx + 14.0, y + 24.0, 15.0, &shown, col(c::TEXT));
+    let hover = ui.hit(lx + fw + 8.0, y, cw, 48.0, Action::ChangeFolder);
+    ui.rect(lx + fw + 8.0, y, cw, 48.0, 6.0, col(if hover { 0x30364a } else { 0x252a38 }));
+    ui.text(BODY, lx + fw + 8.0 + 18.0, y + 24.0, 15.0, change, col(c::TEXT));
+    y += 48.0 + 16.0;
+    let label = "Put a shortcut on the desktop";
+    let row_w = 32.0 + ui.text_w(BODY, 15.0, label);
+    let hover = ui.hit(lx, y, row_w, 24.0, Action::ToggleDesktop);
+    if desktop {
+        ui.rect(lx, y + 2.0, 20.0, 20.0, 4.0, col(if hover { c::RED_HOVER } else { c::RED }));
+        ui.line(Vec2::new(lx + 5.0, y + 12.5), Vec2::new(lx + 8.5, y + 16.0), 2.2, Color::WHITE);
+        ui.line(Vec2::new(lx + 8.5, y + 16.0), Vec2::new(lx + 15.0, y + 8.0), 2.2, Color::WHITE);
+    } else {
+        ui.rect(lx, y + 2.0, 20.0, 20.0, 4.0, col(if hover { c::FAINT } else { 0x3a4052 }));
+        ui.rect(lx + 1.5, y + 3.5, 17.0, 17.0, 3.0, col(c::FIELD));
+    }
+    ui.text(BODY, lx + 32.0, y + 12.0, 15.0, label, col(c::SOFT));
+    y += 24.0;
+    if moving {
+        y += 10.0;
+        ui.paragraph(BODY, lx, y + 9.0, 13.0, 19.5, inner, 3, moved, col(c::MUTED));
+        y += n_moved * 19.5;
+    }
+    if let Some(e) = error {
+        y += 10.0;
+        ui.paragraph(BODY, lx, y + 10.0, 14.0, 20.0, inner, 3, e, col(c::ERROR));
+        y += n_err * 20.0;
+    }
+    y += 20.0;
+    let hover = ui.hit(lx, y, inner, 52.0, Action::Install);
+    ui.rect(lx, y, inner, 52.0, 8.0, col(if hover { c::RED_HOVER } else { c::RED }));
+    ui.text_centred(BODY, lx + inner * 0.5, y + 26.0, 20.0, "Install", Color::WHITE);
+    y += 52.0 + 18.0;
+    ui.paragraph(BODY, lx, y + 9.0, 13.0, 19.5, inner, 3, foot, col(c::FAINT));
+}
+
+fn uninstall_screen(ui: &mut U, s: &State, done: bool, error: Option<&str>) {
+    let (lx, inner) = (430.0, 420.0);
+    let (title, body) = if done {
+        ("STICKFELL REMOVED", "Stickfell has been uninstalled from this PC. Your tester key is still saved, so reinstalling won't ask for it.")
+    } else {
+        ("UNINSTALL STICKFELL?", "This removes the game, the launcher and their shortcuts from this PC. Your tester key stays saved, so you can reinstall later.")
+    };
+    let n_body = ui_wrap_count(ui, BODY, 15.0, inner, body) as f32;
+    let n_err = error.map_or(0.0, |e| ui_wrap_count(ui, BODY, 14.0, inner, e) as f32);
+    let h = 36.0 + 34.0 + 8.0 + n_body * 22.5 + if n_err > 0.0 { 12.0 + n_err * 20.0 } else { 0.0 } + 24.0 + 52.0 + 32.0;
+    let mut y = dialog_frame(ui, s, h) + 36.0;
+    ui.text(TITLE, lx, y + 17.0, 34.0, title, col(c::TEXT));
+    y += 34.0 + 8.0;
+    ui.paragraph(BODY, lx, y + 11.0, 15.0, 22.5, inner, 5, body, col(c::SOFT));
+    y += n_body * 22.5;
+    if let Some(e) = error {
+        y += 12.0;
+        ui.paragraph(BODY, lx, y + 10.0, 14.0, 20.0, inner, 3, e, col(c::ERROR));
+        y += n_err * 20.0;
+    }
+    y += 24.0;
+    if done {
+        let hover = ui.hit(lx, y, inner, 52.0, Action::Close);
+        ui.rect(lx, y, inner, 52.0, 8.0, col(if hover { c::RED_HOVER } else { c::RED }));
+        ui.text_centred(BODY, lx + inner * 0.5, y + 26.0, 20.0, "Close", Color::WHITE);
+    } else {
+        let half = (inner - 10.0) * 0.5;
+        let hover = ui.hit(lx, y, half, 52.0, Action::Close);
+        ui.rect(lx, y, half, 52.0, 8.0, col(if hover { c::RAISED_HOVER } else { c::RAISED }));
+        ui.text_centred(BODY, lx + half * 0.5, y + 26.0, 20.0, "Cancel", col(c::TEXT));
+        let bx = lx + half + 10.0;
+        let hover = ui.hit(bx, y, half, 52.0, Action::Uninstall);
+        ui.rect(bx, y, half, 52.0, 8.0, col(if hover { c::RED_HOVER } else { c::RED }));
+        ui.text_centred(BODY, bx + half * 0.5, y + 26.0, 20.0, "Uninstall", Color::WHITE);
+    }
 }

@@ -234,9 +234,14 @@ pub fn install_dir() -> Result<PathBuf> {
     exe.parent().map(Path::to_path_buf).ok_or_else(|| Problem::Other("Can't tell where Stickfell is installed.".into()))
 }
 
-/// The game's exe, in game/ beside the launcher.
+/// The game's folder in the install folder.
+pub fn game_dir(dir: &Path) -> PathBuf {
+    dir.join(crate::install::GAME)
+}
+
+/// The game's exe, in Game\ in the install folder.
 pub fn game_exe(dir: &Path) -> PathBuf {
-    dir.join("game").join("stickfell.exe")
+    game_dir(dir).join("stickfell.exe")
 }
 
 /// Whether the installed game is exactly this build.
@@ -246,19 +251,19 @@ pub fn game_is(dir: &Path, m: &Manifest) -> bool {
 
 /// The installed game's build, as the launcher noted it (None: not installed, or not by the launcher).
 pub fn installed_build(dir: &Path) -> Option<u32> {
-    game_exe(dir).exists().then(|| std::fs::read_to_string(dir.join("game").join("build.txt")).ok()?.trim().parse().ok()).flatten()
+    game_exe(dir).exists().then(|| std::fs::read_to_string(game_dir(dir).join("build.txt")).ok()?.trim().parse().ok()).flatten()
 }
 
 /// Keeps the installed build's manifest beside it (its patch notes, shown offline too).
 pub fn save_notes(dir: &Path, m: &Manifest) {
     if let Ok(text) = serde_json::to_string(m) {
-        let _ = std::fs::write(dir.join("game").join("notes.json"), text);
+        let _ = std::fs::write(game_dir(dir).join("notes.json"), text);
     }
 }
 
 /// The installed build's manifest, as [`save_notes`] kept it.
 pub fn load_notes(dir: &Path) -> Option<Manifest> {
-    serde_json::from_str(&std::fs::read_to_string(dir.join("game").join("notes.json")).ok()?).ok()
+    serde_json::from_str(&std::fs::read_to_string(game_dir(dir).join("notes.json")).ok()?).ok()
 }
 
 /// Puts a verified game build in place (written beside it first, then swapped in, so a failed write never leaves a
@@ -273,7 +278,7 @@ pub fn install_game(dir: &Path, bytes: &[u8], build: u32) -> Result<()> {
         let _ = std::fs::remove_file(&next);
         return Err(Problem::Other(format!("Couldn't replace the game. Is it still running? ({e})")));
     }
-    std::fs::write(dir.join("game").join("build.txt"), build.to_string()).map_err(disk)
+    std::fs::write(game_dir(dir).join("build.txt"), build.to_string()).map_err(disk)
 }
 
 /// Puts the new launcher in place of `exe` (Windows lets a running exe be renamed, not deleted): the old one moves

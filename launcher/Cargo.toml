@@ -21,9 +21,12 @@ p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 ureq = "3"
 arboard = { version = "3", default-features = false }
 png.workspace = true
+rfd = { version = "0.17.2", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory"] }
+mslnk = "0.1.8"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_UI_Shell", "Win32_System_Com"] }
+winreg = "0.56.0"
 
 [build-dependencies]
 winresource = "0.1"

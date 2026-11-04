@@ -1,11 +1,14 @@
-//! Stickfell's launcher (players run it as Stickfell.exe). It keeps itself and the game up to date from the update
-//! service, then starts the game: the first time it asks for a tester key (kept encrypted for this Windows account),
-//! updates itself if there's a newer launcher, then installs or updates the game in game/ beside it. It looks like a
+//! Stickfell's launcher (players run it as Stickfell.exe). The first time, it installs itself for this Windows
+//! account (see `install`: default %LOCALAPPDATA%\Programs\Stickfell, with shortcuts and an Apps entry); a copy run
+//! from anywhere else opens the installed one. It keeps itself and the game up to date from the update service,
+//! then starts the game: it asks for a tester key once (kept encrypted for this Windows account), updates itself if
+//! there's a newer launcher, then installs or updates the game in Game\ in the install folder. It looks like a
 //! game launcher: its own title bar (Play and Patch notes tabs), the key art, what's new, and a Play button docked
 //! bottom right that shows the update's progress. Offline, it plays the build that's installed.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod art;
+mod install;
 mod secret;
 mod ui;
 mod update;
@@ -25,6 +28,11 @@ const NOTICE_SECS: f32 = 5.0;
 /// Where things stand (the update work runs on its own thread and moves this along).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stage {
+    /// First run: where to install, whether to put a shortcut on the desktop, an old game folder to move in, and
+    /// why the last try failed.
+    Setup { root: PathBuf, desktop: bool, legacy: Option<PathBuf>, error: Option<String> },
+    /// `--uninstall` (from Windows' Apps list): asking, then done.
+    Uninstall { root: PathBuf, done: bool, error: Option<String> },
     /// Waiting for a tester key (and why the last one didn't work).
     Key { error: Option<String> },
     Busy { what: String, progress: Option<Progress> },
@@ -83,6 +91,10 @@ pub enum Action {
     Minimize,
     Close,
     Build(usize),
+    ChangeFolder,
+    ToggleDesktop,
+    Install,
+    Uninstall,
 }
 
 impl Action {
@@ -119,6 +131,13 @@ impl Launcher {
             Some(k) => l.start(k, false),
             None => l.set(Stage::Key { error: None }),
         }
+        l
+    }
+
+    /// A launcher that isn't installed yet: the setup screen.
+    fn setup(legacy: Option<PathBuf>) -> Self {
+        let mut l = Self::with(install::default_root(), Stage::Setup { root: install::default_root(), desktop: true, legacy, error: None });
+        l.key = secret::load();
         l
     }
 
@@ -234,7 +253,35 @@ impl Launcher {
             Action::CheckFiles => self.check_files(),
             Action::Minimize => self.window = Some(WindowAction::Minimize),
             Action::Close => self.quit = true,
+            Action::ChangeFolder | Action::ToggleDesktop | Action::Install => self.setup_action(a),
+            Action::Uninstall => {
+                if let Stage::Uninstall { root, done: false, .. } = self.stage() {
+                    let error = install::uninstall(&root).err();
+                    self.set(Stage::Uninstall { done: error.is_none(), root, error });
+                }
+            }
         }
+    }
+
+    fn setup_action(&mut self, a: Action) {
+        let Stage::Setup { mut root, mut desktop, legacy, .. } = self.stage() else { return };
+        let mut error = None;
+        match a {
+            Action::ChangeFolder => {
+                if let Some(picked) = install::choose_folder(&root) {
+                    root = picked;
+                }
+            }
+            Action::ToggleDesktop => desktop = !desktop,
+            _ => match install::install(&root, desktop, legacy.as_deref()) {
+                Ok(exe) => match std::process::Command::new(&exe).current_dir(&root).spawn() {
+                    Ok(_) => return self.quit = true,
+                    Err(e) => error = Some(format!("Installed, but the launcher wouldn't start ({e}).")),
+                },
+                Err(e) => error = Some(e),
+            },
+        }
+        self.set(Stage::Setup { root, desktop, legacy, error });
     }
 
     /// Checks the installed game against the latest signed build, and puts it right if it doesn't match.
@@ -369,6 +416,9 @@ impl Game for Launcher {
         if input.pressed(KeyCode::Escape) {
             self.menu = None;
         }
+        if let (Stage::Setup { .. }, true) = (&stage, input.pressed(KeyCode::Enter) || input.pressed(KeyCode::NumpadEnter)) {
+            return self.act(Action::Install);
+        }
         if let Stage::Key { .. } = stage {
             let ctrl = input.down(KeyCode::ControlLeft) || input.down(KeyCode::ControlRight);
             if ctrl && input.pressed(KeyCode::KeyV) {
@@ -399,7 +449,7 @@ impl Game for Launcher {
         if stage == Stage::Done {
             self.quit = true;
         }
-        if let Stage::Key { .. } = stage {
+        if matches!(stage, Stage::Key { .. } | Stage::Setup { .. } | Stage::Uninstall { .. }) {
             self.menu = None;
         }
         let art = self.art.get();
@@ -444,14 +494,46 @@ impl Game for Launcher {
 }
 
 fn main() -> std::process::ExitCode {
-    if std::env::args().any(|a| a == "--updated") {
+    let flag = |f: &str| std::env::args().any(|a| a == f);
+    if flag("--updated") {
         update::clean_up();
     }
-    let dir = match update::install_dir() {
+    let here = match update::install_dir() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("launcher: {e}");
             return std::process::ExitCode::FAILURE;
+        }
+    };
+    let launcher = if flag("--uninstall") {
+        let root = install::registered_root().unwrap_or_else(|| here.clone());
+        Launcher::with(root.clone(), Stage::Uninstall { root, done: false, error: None })
+    } else if flag("--portable") {
+        // (developers: the old layout, the game beside this exe)
+        Launcher::new(here)
+    } else {
+        match install::registered_root() {
+            Some(root) if install::same_dir(&root, &here) => {
+                install::register(&root);
+                Launcher::new(root)
+            }
+            // a copy started from elsewhere (Downloads): open the installed one instead
+            Some(root) => {
+                let exe = root.join(install::EXE);
+                return match std::process::Command::new(&exe).current_dir(&root).spawn() {
+                    Ok(_) => std::process::ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("launcher: couldn't start {}: {e}", exe.display());
+                        std::process::ExitCode::FAILURE
+                    }
+                };
+            }
+            // installed here, but Windows lost the Apps entry
+            None if install::same_dir(&here, &install::default_root()) => {
+                install::register(&here);
+                Launcher::new(here)
+            }
+            None => Launcher::setup(install::legacy_game(&here)),
         }
     };
     let cfg = AppConfig {
@@ -462,7 +544,7 @@ fn main() -> std::process::ExitCode {
         decorations: false,
         ..Default::default()
     };
-    match stickfell_app::run(cfg, Launcher::new(dir)) {
+    match stickfell_app::run(cfg, launcher) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("launcher: {e}");
@@ -492,7 +574,11 @@ mod shots {
         let history = vec![manifest(2, notes2), manifest(1, "First tester build of Stickfell: Last Limb Standing.")];
         let busy = Stage::Busy { what: "Updating to build 3".into(), progress: Some(Progress { done: 6_400_000, total: 15_200_000, speed: 3_100_000.0 }) };
         let ready = Stage::Ready { build: Some(2), warning: None, offline: false };
-        let screens: [(&str, Stage, Tab, Option<Menu>); 7] = [
+        let root = install::default_root();
+        let screens: [(&str, Stage, Tab, Option<Menu>); 10] = [
+            ("0-setup", Stage::Setup { root: root.clone(), desktop: true, legacy: Some(PathBuf::from("game")), error: None }, Tab::Play, None),
+            ("8-uninstall", Stage::Uninstall { root: root.clone(), done: false, error: None }, Tab::Play, None),
+            ("9-uninstalled", Stage::Uninstall { root: root.clone(), done: true, error: None }, Tab::Play, None),
             ("1-ready", ready.clone(), Tab::Play, None),
             ("2-updating", busy, Tab::Play, None),
             ("3-key", Stage::Key { error: Some("That key is too short. Tester keys look like STICK-XXXXX-XXXXX-XXXXX-XXXXX.".into()) }, Tab::Play, None),
