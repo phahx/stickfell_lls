@@ -2,7 +2,7 @@
 //! from whatever is in assets/voice: don't edit by hand.
 
 /// The announcer calling each finisher, in `Finish` order (empty: none).
-pub static ANNOUNCE: [&[&[u8]]; 13] = [
+pub static ANNOUNCE: [&[&[u8]]; 14] = [
     &[include_bytes!("../assets/voice/announce_behead.ogg")],
     &[include_bytes!("../assets/voice/announce_javelin.ogg")],
     &[include_bytes!("../assets/voice/announce_lift.ogg")],
@@ -16,10 +16,11 @@ pub static ANNOUNCE: [&[&[u8]]; 13] = [
     &[include_bytes!("../assets/voice/announce_spine.ogg")],
     &[include_bytes!("../assets/voice/announce_hang.ogg")],
     &[],
+    &[include_bytes!("../assets/voice/announce_stomp.ogg")],
 ];
 
 /// Per recorded voice, per `Finish`: the finisher's one-liners after the kill.
-pub static QUIPS: &[[&[&[u8]]; 13]] = &[
+pub static QUIPS: &[[&[&[u8]]; 14]] = &[
     [
         &[include_bytes!("../assets/voice/p0_quip_behead_0.ogg"), include_bytes!("../assets/voice/p0_quip_behead_1.ogg")],
         &[include_bytes!("../assets/voice/p0_quip_javelin_1.ogg")],
@@ -34,6 +35,7 @@ pub static QUIPS: &[[&[&[u8]]; 13]] = &[
         &[include_bytes!("../assets/voice/p0_quip_spine_0.ogg"), include_bytes!("../assets/voice/p0_quip_spine_1.ogg"), include_bytes!("../assets/voice/p0_quip_spine_2.ogg")],
         &[include_bytes!("../assets/voice/p0_quip_hang_1.ogg")],
         &[],
+        &[include_bytes!("../assets/voice/p0_quip_stomp_0.ogg"), include_bytes!("../assets/voice/p0_quip_stomp_1.ogg")],
     ],
 ];
 
@@ -60,4 +62,9 @@ pub static CHOKE_END: &[&[&[u8]]] = &[
 /// Per recorded voice: cries of pain when they're hurt mid-finisher.
 pub static PAINS: &[&[&[u8]]] = &[
     &[],
+];
+
+/// Per recorded voice: screaming while burning in acid or lava (looped).
+pub static BURNING: &[&[&[u8]]] = &[
+    &[include_bytes!("../assets/voice/p0_plea_burning_0.ogg"), include_bytes!("../assets/voice/p0_plea_burning_1.ogg")],
 ];

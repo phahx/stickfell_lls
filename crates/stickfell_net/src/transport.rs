@@ -12,6 +12,15 @@ pub trait Transport {
     fn recv(&mut self) -> Option<Vec<u8>>;
 }
 
+impl Transport for Box<dyn Transport + Send> {
+    fn send_to(&mut self, player: usize, data: &[u8]) {
+        (**self).send_to(player, data)
+    }
+    fn recv(&mut self) -> Option<Vec<u8>> {
+        (**self).recv()
+    }
+}
+
 impl Transport for Box<dyn Transport> {
     fn send_to(&mut self, player: usize, data: &[u8]) {
         (**self).send_to(player, data)

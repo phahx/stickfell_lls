@@ -16,7 +16,7 @@ mod frame;
 mod renderer;
 
 pub use font::Font;
-pub use frame::{Camera2D, Color, Frame, Light, Occluder, SpriteAtlas, StaticScene};
+pub use frame::{Camera2D, Color, Frame, Light, LiquidLook, Occluder, SpriteAtlas, StaticScene, VapourField};
 pub use glam::Vec2;
 pub use renderer::Renderer;
 pub use wgpu;

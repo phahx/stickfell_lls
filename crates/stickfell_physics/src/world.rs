@@ -24,6 +24,8 @@ pub struct Particle {
     pub radius: f32,
     pub friction: f32,
     pub collide_static: bool,
+    /// Passes through statics carrying this tag (0 = none).
+    pub skip_tag: u32,
     /// Highest-y static contact normal touched during the last step (ZERO if none).
     pub ground: Vec2,
 }
@@ -39,6 +41,7 @@ impl Particle {
             radius,
             friction: 0.6,
             collide_static: true,
+            skip_tag: 0,
             ground: Vec2::ZERO,
         }
     }
@@ -146,6 +149,9 @@ pub struct Skewer {
     pub base: u32,
     pub tip: u32,
     pub u_min: f32,
+    /// How far up the blade (toward the tip) the body may sit; past it, it's
+    /// drawn back down.
+    pub u_max: f32,
     pub friction: f32,
     /// Where the body sits along the blade after the last step (0 = base, 1 = tip).
     pub u: f32,
@@ -190,6 +196,13 @@ pub struct Segment {
     /// static geometry, so long blades and limbs can't slip through corners.
     pub collide_static: bool,
     pub tag: u32,
+    /// Passes through statics carrying this tag (0 = none).
+    pub skip_tag: u32,
+    /// How much liquid seeps through it rather than being pushed out of
+    /// its way (0 solid .. 1 none pushed: it only feels the flow). A body is
+    /// a wall across the whole of a 2D world; in a real one water would go
+    /// round it.
+    pub porous: f32,
 }
 
 /// A dynamic segment-vs-segment contact recorded during the last step.
@@ -317,7 +330,7 @@ impl World {
 
     /// Adds a disabled skewer slot; fill it in and enable it when something gets run through.
     pub fn add_skewer_slot(&mut self) -> u32 {
-        self.skewers.push(Skewer { a: 0, b: 0, s: 0.0, base: 0, tip: 0, u_min: 0.0, friction: 0.0, u: 0.0, enabled: false, anchored: false });
+        self.skewers.push(Skewer { a: 0, b: 0, s: 0.0, base: 0, tip: 0, u_min: 0.0, u_max: f32::MAX, friction: 0.0, u: 0.0, enabled: false, anchored: false });
         (self.skewers.len() - 1) as u32
     }
 
@@ -334,7 +347,7 @@ impl World {
     }
 
     pub fn add_segment(&mut self, a: u32, b: u32, radius: f32, group: u16, tag: u32) -> u32 {
-        self.segments.push(Segment { a, b, radius, group, ignore_group: 0, enabled: true, collide_static: false, tag });
+        self.segments.push(Segment { a, b, radius, group, ignore_group: 0, enabled: true, collide_static: false, tag, skip_tag: 0, porous: 0.0 });
         (self.segments.len() - 1) as u32
     }
 
@@ -591,7 +604,7 @@ impl World {
             }
             let u = (p - w0).dot(ax) / l2;
             self.skewers[i].u = u;
-            let uc = u.max(sk.u_min);
+            let uc = u.min(sk.u_max).max(sk.u_min);
             let ks = [1.0 - sk.s, sk.s, -(1.0 - uc), -uc];
             let denom: f32 = (0..4).map(|k| ps[k].inv_mass * ks[k] * ks[k]).sum();
             if denom < 1e-12 {
@@ -754,6 +767,9 @@ impl World {
                 continue;
             }
             for s in &self.statics {
+                if p.skip_tag != 0 && s.tag == p.skip_tag {
+                    continue;
+                }
                 let Some((n, pen)) = s.collide_circle(p.pos, p.radius) else {
                     continue;
                 };
@@ -801,6 +817,9 @@ impl World {
                     break;
                 }
                 let o = self.statics[oi];
+                if sg.skip_tag != 0 && o.tag == sg.skip_tag {
+                    continue;
+                }
                 let (d, _) = crate::collide::point_segment(o.center, pa.pos, pb.pos);
                 if d > o.bound_radius() + r {
                     continue;

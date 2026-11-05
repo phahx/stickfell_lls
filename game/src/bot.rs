@@ -42,8 +42,9 @@ pub fn bot_input(s: &GameState, me: usize) -> u32 {
     let my = f.pos(w, PELVIS);
     let neck = f.pos(w, NECK);
     let tick = s.frame.wrapping_add(me as u32 * 37);
-    // grabbed: thrash about to break free (a beat late, and not every frame)
-    if f.held_by.is_some() {
+    // grabbed, or run through on a spike: thrash about to break free (a beat
+    // late, and not every frame)
+    if f.held_by.is_some() || f.impaled > 0 {
         let k = (tick / 3) % 4;
         let bits = if k == 0 { LEFT } else if k == 2 { RIGHT } else { 0 };
         return encode(if f.struggle > 0 || tick % 20 > 6 { bits } else { 0 }, f.aim);
@@ -73,7 +74,7 @@ pub fn bot_input(s: &GameState, me: usize) -> u32 {
     let enemy = s
         .fighters
         .iter()
-        .filter(|o| o.alive && o.id != f.id)
+        .filter(|o| o.alive && !s.allies(o.id as usize, me))
         .min_by(|a, b| (a.pos(w, PELVIS) - my).length_squared().total_cmp(&(b.pos(w, PELVIS) - my).length_squared()));
     // unarmed: go get a weapon if one is reasonably close
     let weapon_goal = if f.weapon.is_none() {

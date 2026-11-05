@@ -12,7 +12,21 @@ use crate::level::{ArtLayer, HazardKind, LevelDef};
 use crate::sim::{CLASH_KEY_NAMES, CLASH_WIN, ClashStage, GameState, Phase};
 use crate::weapon::{Kind, Weapon};
 
-pub const PLAYER_COLORS: [u32; 4] = [0xe8484f, 0x3f8cff, 0xffc93c, 0x4cd16a];
+/// Each player's colour (every one for themselves), by slot.
+pub const PLAYER_COLORS: [u32; 8] = [0xe8484f, 0x3f8cff, 0xffc93c, 0x4cd16a, 0xb06cff, 0xff8a2a, 0x3fd8d8, 0xff6ac1];
+/// In a team match: the red team's shades and the blue team's (each
+/// fighter on a team a shade of its colour, so they can still be told apart).
+pub const TEAM_COLORS: [[u32; 4]; 2] = [[0xe8484f, 0xff8a5a, 0xc8306a, 0xff6a6a], [0x3f8cff, 0x3fc8e8, 0x6a6cff, 0x7ab0ff]];
+/// The teams' names, as the round's winner is called.
+pub const TEAM_NAMES: [&str; 2] = ["RED TEAM", "BLUE TEAM"];
+
+/// The colour fighter `id` is drawn and labelled in.
+pub fn fighter_color(s: &GameState, id: usize) -> u32 {
+    match s.team(id) {
+        Some(t) => TEAM_COLORS[t as usize][(id / 2) % 4],
+        None => PLAYER_COLORS[id % PLAYER_COLORS.len()],
+    }
+}
 
 #[derive(Default)]
 pub struct Hud {
@@ -20,20 +34,15 @@ pub struct Hud {
     pub banner: Option<(String, Color)>,
     /// Screen-space cursor (drawn as the corners of a small ring).
     pub mouse: Option<Vec2>,
-    /// Where the cursor has just been (`Frame::mouse_trail`): the dot
-    /// is smeared along it so a fast flick reads as one motion, not a row of
-    /// separate crosshairs.
-    pub trail: Vec<(Vec2, f32)>,
     /// Index of the local player's fighter.
     pub local: Option<usize>,
-    pub show_help: bool,
     /// Draw the world only (menu background).
     pub world_only: bool,
     /// Camera view height in metres (0 = the normal `CAMERA_HEIGHT`).
     pub zoom: f32,
     /// Who's saying a voice line right now (per fighter): what kind, and how
     /// open their mouth is.
-    pub talk: [Option<(crate::sfx::Sfx, f32)>; 4],
+    pub talk: [Option<(crate::sfx::Sfx, f32)>; crate::sim::MAX_PLAYERS],
     /// Character art to draw the fighters with (None: the game's own, from
     /// `character`; the character lab swaps in a kit it's trying out).
     pub skin: Option<Arc<Skin>>,
@@ -93,6 +102,122 @@ fn draw_rope_tiled(frame: &mut Frame, path: &[Vec2], uv: [f32; 4], thick: f32) {
             frame.sprite(center, Vec2::new(piece * 0.5, thick * 0.5), dir, [uv[0], uv[1], uv[2] * frac, uv[3]], Color::WHITE);
             d += tile;
         }
+    }
+}
+
+/// Steam: its grid handed to the renderer, drawn as one volume (see
+/// stickfell_render's shaders/vapour.wgsl).
+fn draw_steam(s: &GameState, frame: &mut Frame, _t: f32) {
+    let (origin, w, h, thick) = s.steam.grid();
+    if thick.iter().all(|&t| t < 0.002) {
+        return;
+    }
+    frame.vapour = Some(stickfell_render::VapourField {
+        origin,
+        cell: crate::steam::CELL,
+        w: w as u32,
+        h: h as u32,
+        thick: thick.to_vec(),
+        density: STEAM_DENSITY,
+        max_opacity: STEAM_MAX_OPACITY,
+    });
+}
+
+/// How dense steam looks (opacity 1 - e^(-this x thickness)), and the most
+/// opaque it gets (still see-through: fighters stay readable).
+const STEAM_DENSITY: f32 = 1.3;
+const STEAM_MAX_OPACITY: f32 = 0.72;
+
+/// The flood trap: a lever on its floor, a hatch in the ceiling whose two
+/// doors swing down when it's thrown (and back up when it's thrown back).
+fn draw_trap(s: &GameState, frame: &mut Frame) {
+    let Some(def) = s.trap.def else { return };
+    let thrown = s.trap.lever(s.round_frame);
+    let open = s.trap.hatch(s.round_frame);
+    // the lever: a base, the handle, a red knob
+    let iron = Color::hex(0x2c2f36);
+    frame.rect(def.lever + Vec2::new(0.0, 0.06), Vec2::new(0.16, 0.06), Vec2::X, 0.02, iron);
+    let tip = def.handle(thrown);
+    frame.capsule(def.lever + Vec2::new(0.0, 0.08), tip, 0.035, Color::hex(0x8a8f99));
+    frame.circle(tip, 0.07, Color::hex(0xc8302a));
+    frame.occluder(Occluder::Segment { a: def.lever, b: tip });
+    // the hatch: a dark opening, two doors hinged at its sides swinging down
+    let half = def.hatch_half;
+    let open_ease = open * open * (3.0 - 2.0 * open);
+    frame.rect(def.hatch + Vec2::new(0.0, 0.08), Vec2::new(half, 0.08), Vec2::X, 0.0, Color::hex(0x0b0d12));
+    for side in [-1.0f32, 1.0] {
+        let hinge = def.hatch + Vec2::new(side * half, -0.03);
+        // closed: lying flat across its half; open: hanging straight down
+        let ang = open_ease * core::f32::consts::FRAC_PI_2;
+        let dir = Vec2::new(-side * ang.cos(), -ang.sin());
+        let mid = hinge + dir * (half * 0.5);
+        frame.rect(mid, Vec2::new(half * 0.5, 0.04), dir * -side, 0.01, Color::hex(0x4b5262));
+        frame.occluder(Occluder::Segment { a: hinge, b: hinge + dir * half });
+    }
+}
+
+/// The liquids: every drop a blob (they run together into the body of
+/// liquid in the shader, see stickfell_render's fluid_*.wgsl), foamier the
+/// faster it's going; and the glowing ones light the room around them.
+fn draw_liquids(s: &GameState, frame: &mut Frame, t: f32) {
+    let drops = &s.fluid.drops;
+    if drops.is_empty() {
+        return;
+    }
+    for (k, l) in crate::liquid::LIQUIDS.iter().enumerate() {
+        frame.fluid_looks[k] = l.look();
+    }
+    for d in drops {
+        let churn = ((d.vel.length() - 2.0) / 4.0).clamp(0.0, 1.0);
+        frame.fluid_drop(d.pos, d.vel, crate::liquid::DROP_BLOB, d.kind, churn, d.dye);
+    }
+    // light from glowing liquid: one over each patch of it (a coarse grid)
+    let cell = 3.0;
+    let mut patches: Vec<(i32, i32, u8, Vec2, f32, f32)> = Vec::new();
+    for d in drops {
+        // (cooled lava gives no light)
+        if crate::liquid::LIQUIDS[d.kind as usize].light.is_none() || d.dye >= crate::liquid::COOLED_LAVA {
+            continue;
+        }
+        let key = ((d.pos.x / cell).floor() as i32, (d.pos.y / cell).floor() as i32);
+        match patches.iter_mut().find(|p| p.0 == key.0 && p.1 == key.1 && p.2 == d.kind) {
+            Some(p) => {
+                p.3 += d.pos;
+                p.4 += 1.0;
+                p.5 = p.5.max(d.pos.y);
+            }
+            None => patches.push((key.0, key.1, d.kind, d.pos, 1.0, d.pos.y)),
+        }
+    }
+    for (k, (_, _, kind, sum, n, top)) in patches.iter().enumerate() {
+        if *n < 4.0 {
+            continue;
+        }
+        let Some((color, strength)) = crate::liquid::LIQUIDS[*kind as usize].light else { continue };
+        let c = *sum / *n;
+        let flicker = 1.0 + 0.06 * (t * 3.1 + k as f32 * 1.7).sin();
+        let size = (*n / 60.0).sqrt().clamp(0.4, 1.0);
+        frame.light(Light::point(Vec2::new(c.x, top + 0.4), cell * 1.6 + 1.0, Color::hex(color).scale(strength * size * flicker)).no_shadows());
+    }
+}
+
+/// A spike: a stack of thin slabs narrowing to the point makes the triangle
+/// (lit on one side, shaded on the other); from `from` (share up it) to the
+/// point, bloody if it's through someone.
+fn draw_tooth(frame: &mut Frame, t: &crate::level::Tooth, from: f32, bloody: bool) {
+    let n = 10;
+    let step = (t.tip.y - t.base.y) / n as f32;
+    let (dark, lit) = if bloody { (Color::hex(0x7a3a3e), Color::hex(0xa8565a)) } else { (Color::hex(0x8b929d), Color::hex(0xb9bfc8)) };
+    for k in 0..n {
+        let mid = (k as f32 + 0.5) / n as f32;
+        if mid < from {
+            continue;
+        }
+        let hw = t.half_width * 0.92 * (1.0 - mid);
+        let y = t.base.y + step * (k as f32 + 0.5);
+        let half = Vec2::new(hw, step * 0.5 + 0.002);
+        frame.rect(Vec2::new(t.tip.x, y), half, Vec2::X, 0.0, dark);
+        frame.rect(Vec2::new(t.tip.x - hw * 0.5, y), Vec2::new(hw * 0.5, half.y), Vec2::X, 0.0, lit);
     }
 }
 
@@ -338,11 +463,23 @@ fn draw_skinned(frame: &mut Frame, skin: &Skin, w: &World, f: &Fighter, col: Col
         frame.occluder(Occluder::Segment { a, b });
     }
     // the head hangs off the neck, so its shading turns with it
+    if f.head_popped {
+        return;
+    }
     let head = f.pos(w, HEAD);
     let down = (f.pos(w, NECK) - head).normalize_or(Vec2::NEG_Y);
     let k = head_r / skin.head.radius.max(1.0);
-    skin.head.place(frame, head, down, k, k, col);
+    // flattened by a stomp from above: squeezed top to bottom, spread sideways
+    let across = Vec2::new(-down.y, down.x);
+    let (sx, sy) = (squash_scale(across, f.head_squash), squash_scale(down, f.head_squash));
+    skin.head.place(frame, head, down, k * sx, k * sy, col);
     draw_part_wounds(frame, w, f, S_HEAD, now);
+}
+
+/// How a squashed head (flattened by `q`, 0..1, from straight above) scales
+/// along `axis`: shorter the more upright the axis, wider the more level.
+fn squash_scale(axis: Vec2, q: f32) -> f32 {
+    1.0 - q * 0.65 * axis.y * axis.y + q * 0.45 * axis.x * axis.x
 }
 
 /// A fighter's expression.
@@ -527,7 +664,7 @@ fn draw_part_wounds(frame: &mut Frame, w: &World, f: &Fighter, part: u32, now: u
         let (at, run) = f.wound_at(w, wd);
         let r = wd.size;
         let age = now.saturating_sub(wd.born) as f32 / 60.0;
-        if matches!(part, S_HEAD | S_TORSO) && wd.kind != WoundKind::Cut {
+        if matches!(part, S_HEAD | S_TORSO) && !matches!(wd.kind, WoundKind::Cut | WoundKind::Spatter) {
             // runs down (whichever way is down) as it bleeds, stopping at the edge
             let want = (age * 0.1).min(r * 1.6 + 0.04);
             let mut run_down = 0.0;
@@ -560,6 +697,15 @@ fn draw_part_wounds(frame: &mut Frame, w: &World, f: &Fighter, part: u32, now: u
             WoundKind::Cut => {
                 frame.capsule(at - run, at + run, r * 0.45, blood);
                 frame.capsule(at - run * 0.85, at + run * 0.85, r * 0.2, dark);
+            }
+            WoundKind::Spatter => {
+                // a splash of someone else's blood: a blot and a few flecks
+                frame.circle(at, r * 0.5, blood);
+                for k in 0..4 {
+                    let a = k as f32 * 1.7 + wd.born as f32 * 0.53;
+                    let o = Vec2::new(a.cos(), a.sin()) * r * (0.55 + 0.15 * ((k * 5) % 3) as f32);
+                    frame.circle(at + o, r * (0.16 + 0.07 * ((k * 7) % 3) as f32), if k % 2 == 0 { blood } else { dark });
+                }
             }
         }
     }
@@ -594,7 +740,7 @@ fn draw_weapon(frame: &mut Frame, s: &GameState, w: &Weapon, skin: Option<&Skin>
     let def = w.def();
     let pt = |i: u8| world.particles[w.particle(i) as usize].pos;
     if let (true, Some(skin)) = (w.owner > 0, skin) {
-        let tint = Color::hex(PLAYER_COLORS[(w.owner - 1) as usize % 4]).lerp(Color::hex(0x555555), 0.35);
+        let tint = Color::hex(fighter_color(s, (w.owner - 1) as usize)).lerp(Color::hex(0x555555), 0.35);
         draw_skinned_limb(frame, skin, world, w, tint);
         // the torn end, still bloody
         frame.circle(pt(def.points.len() as u8 - 1), 0.065, Color::hex(0x8a0d0d));
@@ -646,7 +792,7 @@ fn draw_weapon(frame: &mut Frame, s: &GameState, w: &Weapon, skin: Option<&Skin>
         let (a, b) = (world.particles[seg.a as usize].pos, world.particles[seg.b as usize].pos);
         if w.owner > 0 {
             // a severed limb: its owner's colour, outlined like a body
-            let base = Color::hex(PLAYER_COLORS[(w.owner - 1) as usize % 4]).lerp(Color::hex(0x555555), 0.35);
+            let base = Color::hex(fighter_color(s, (w.owner - 1) as usize)).lerp(Color::hex(0x555555), 0.35);
             frame.capsule(a, b, sg.r + 0.03, Color::hex(0x0d0e12));
             frame.capsule(a, b, sg.r, base);
             frame.occluder(Occluder::Segment { a, b });
@@ -940,6 +1086,10 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
         draw_art(frame, lv, ArtLayer::Solid);
     }
     for (i, o) in w.statics.iter().enumerate() {
+        // (spike beds draw themselves, below)
+        if crate::level::is_spike(o.tag) {
+            continue;
+        }
         if !art {
             let color = Color::hex(lv.boxes.get(i).map_or(0x3a3f4b, |b| b.color));
             frame.rect(o.center, o.half, o.rot, 0.04, color);
@@ -949,33 +1099,25 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
         frame.occluder(Occluder::Box { center: o.center, half: o.half, rot: o.rot });
     }
 
+    draw_liquids(s, frame, t);
+    draw_trap(s, frame);
+    draw_steam(s, frame, t);
+
     // hazards
     for h in &s.hazards {
         match h.kind {
             HazardKind::Spikes if art => {}
             HazardKind::Spikes => {
-                let base = h.a.y - h.size.y;
-                let top = h.a.y + h.size.y;
-                frame.rect(Vec2::new(h.a.x, base + 0.06), Vec2::new(h.size.x, 0.06), Vec2::X, 0.02, Color::hex(0x3a3a3e));
-                let n = (h.size.x * 2.0 / 0.24) as i32;
-                for i in 0..=n {
-                    let x = h.a.x - h.size.x + i as f32 * 0.24;
-                    let tip = top + 0.08 * ((i * 7 % 3) as f32 - 1.0);
-                    frame.capsule(Vec2::new(x, base + 0.05), Vec2::new(x, tip), 0.025, Color::hex(0xa8aeb8));
+                // the teeth as they really are (the same ones that hurt)
+                let (c, half) = h.plate();
+                frame.rect(c, half, Vec2::X, 0.02, Color::hex(0x3a3a3e));
+                for t in h.teeth() {
+                    draw_tooth(frame, &t, 0.0, false);
+                    frame.occluder(Occluder::Segment { a: t.base, b: t.tip });
                 }
             }
-            HazardKind::Acid => {
-                let wob = (t * 2.0).sin() * 0.04;
-                if !art {
-                    frame.rect_glow(h.a + Vec2::new(0.0, wob), h.size, Vec2::X, 0.05, Color::hex(0x58e040), 1.4);
-                }
-                for i in 0..6 {
-                    let x = h.a.x - h.size.x + (i as f32 + 0.5) * h.size.x / 3.0 + (t * 0.7 + i as f32).sin() * 0.3;
-                    let rise = ((t * 0.8 + i as f32 * 0.37).fract()) * h.size.y * 1.6;
-                    frame.circle_glow(Vec2::new(x, h.a.y - h.size.y + rise), 0.07, Color::hex(0xa0ff70), 2.0);
-                }
-                frame.light(Light::point(h.a + Vec2::new(0.0, h.size.y + 0.5), h.size.x * 2.2, Color::hex(0x60ff50).scale(1.1)).no_shadows());
-            }
+            // (drawn from the drops themselves, below)
+            HazardKind::Acid | HazardKind::Water | HazardKind::Lava => {}
             HazardKind::Saw => {
                 if h.a != h.b {
                     frame.capsule(h.a, h.b, 0.08, Color::hex(0x2a2d33));
@@ -995,11 +1137,21 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
         }
     }
 
-    // ropes and wrecking balls
+    // ropes (the rope tile, from whichever atlas is bound) and wrecking balls
+    let rope_uv = match skin {
+        Some(sk) => sk.rigs.iter().find_map(|r| r.rope),
+        None if art => crate::character::skin().rigs.iter().find_map(|r| r.rope),
+        None => None,
+    };
     for chain in &s.ropes {
-        for pair in chain.windows(2) {
-            let (a, b) = (w.particles[pair[0] as usize].pos, w.particles[pair[1] as usize].pos);
-            frame.capsule(a, b, 0.04, Color::hex(0x8a6a40));
+        let path: Vec<Vec2> = chain.iter().map(|&id| w.particles[id as usize].pos).collect();
+        match rope_uv {
+            Some(uv) => draw_rope_tiled(frame, &path, uv, 0.09),
+            None => {
+                for pair in path.windows(2) {
+                    frame.capsule(pair[0], pair[1], 0.04, Color::hex(0x8a6a40));
+                }
+            }
         }
     }
     for b in &s.balls {
@@ -1058,8 +1210,11 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
     }
 
     for f in &s.fighters {
-        let base = Color::hex(PLAYER_COLORS[f.id as usize % 4]);
+        let base = Color::hex(fighter_color(s, f.id as usize));
         let mut col = if f.alive { base } else { base.lerp(Color::hex(0x555555), 0.6) };
+        if f.scorch > 0.0 {
+            col = col.lerp(Color::hex(0x2a1d16), f.scorch * 0.85);
+        }
         if f.hit_flash > 0 {
             col = col.lerp(Color::WHITE, f.hit_flash as f32 / 7.0);
         }
@@ -1120,9 +1275,16 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
         // (faces and the rest are sized to the head: 1 on the original HEAD_R)
         let head_r = w.segments[(f.seg_base + S_HEAD) as usize].radius;
         let hk = head_r / HEAD_R;
-        if skin.is_none() {
-            frame.circle(head, head_r + 0.03, outline);
-            frame.circle(head, head_r, col);
+        if skin.is_none() && !f.head_popped {
+            if f.head_squash > 0.0 {
+                // flattened: a squat rounded slab instead of a ball
+                let half = Vec2::new(squash_scale(Vec2::X, f.head_squash), squash_scale(Vec2::Y, f.head_squash)) * head_r;
+                frame.rect(head, half + Vec2::splat(0.03), Vec2::X, half.y + 0.03, outline);
+                frame.rect(head, half, Vec2::X, half.y, col);
+            } else {
+                frame.circle(head, head_r + 0.03, outline);
+                frame.circle(head, head_r, col);
+            }
             draw_part_wounds(frame, w, f, S_HEAD, s.frame);
         }
         if !f.has(S_HEAD) {
@@ -1134,7 +1296,9 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
         let side = Vec2::new(look.y, -look.x) * f.facing;
         let eye = head + (side * 0.09 + look * 0.04) * hk;
         let faces = skin.is_none_or(|k| k.faces);
-        if !faces {
+        if f.head_popped {
+            // (nothing left to have a face)
+        } else if !faces {
             // (a skin without faces: the art's head is left bare)
         } else if f.alive && f.has(S_HEAD) {
             let talk = hud.talk.get(f.id as usize).copied().flatten();
@@ -1143,6 +1307,7 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
             let face = match talk {
                 _ if f.hurt > 0 => Face::Pained,
                 Some((crate::sfx::Sfx::Plea, _)) => Face::Scared,
+                _ if f.burning => Face::Pained,
                 Some((crate::sfx::Sfx::Quip, _)) => Face::Smug,
                 _ if victim || f.choking || f.dazed > 0 || f.held_by.is_some() => Face::Scared,
                 _ if performing => Face::Angry,
@@ -1168,7 +1333,9 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
                 frame.capsule(eye - d, eye + d, 0.012 * hk, outline);
             }
         }
-        frame.occluder(Occluder::Circle { center: head, radius: head_r * 0.8 });
+        if !f.head_popped {
+            frame.occluder(Occluder::Circle { center: head, radius: head_r * 0.8 });
+        }
         if f.alive && f.held_by.is_some() && f.down == 0 {
             // the struggle to break free, filling up over their head
             let at = head + Vec2::new(0.0, 0.48);
@@ -1197,13 +1364,33 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
         }
     }
 
+    // spikes run through bodies: the bloody point sticking out of them
+    for (fi, f) in s.fighters.iter().enumerate() {
+        let Some(&[pb, pt, slot]) = s.spike_pins.get(fi) else { continue };
+        if f.impaled == 0 || !w.skewers[slot as usize].enabled {
+            continue;
+        }
+        let (base, tip) = (w.particles[pb as usize].pos, w.particles[pt as usize].pos);
+        let tooth = crate::level::Tooth { base, tip, half_width: crate::level::SPIKE_SPACING * 0.5 };
+        let sk = w.skewers[slot as usize];
+        let at = w.particles[sk.a as usize].pos.lerp(w.particles[sk.b as usize].pos, sk.s);
+        let from = ((at.y - base.y) / (tip.y - base.y)).clamp(0.0, 1.0);
+        draw_tooth(frame, &tooth, from, true);
+    }
+
     draw_nooses(s, frame, skin);
 
     let mut spark_sum = Vec2::ZERO;
     let mut n_sparks = 0.0;
     for sp in &s.sparks {
         let k = sp.life as f32 / sp.max_life as f32;
-        if sp.blood {
+        if sp.steam {
+            // a puff, swelling as it fades
+            let r = 0.05 + 0.15 * (1.0 - k);
+            frame.circle(sp.pos, r, Color::hex(sp.tint).alpha(0.18 * k));
+        } else if sp.tint != 0 {
+            frame.circle(sp.pos, 0.016 + 0.01 * k, Color::hex(sp.tint).alpha(0.85));
+        } else if sp.blood {
             frame.circle(sp.pos, 0.035 + 0.02 * k, Color::hex(0x9a0e0e));
         } else {
             let c = Color::hex(0xff3010).lerp(Color::hex(0xffe08a), k);
@@ -1265,7 +1452,7 @@ fn draw_finishers(s: &GameState, frame: &mut Frame, screen: Vec2, hud: &Hud) {
     if let Some((mv, a, left)) = s.finish_banner {
         let alpha = (left as f32 / 20.0).min(1.0);
         let grow = 1.0 + ((100 - left.min(100)) as f32 / 8.0).min(1.0) * 0.3;
-        centered_title(frame, screen, screen.y * 0.22, 6.0 * k * grow, mv.title(), Color::hex(PLAYER_COLORS[a as usize % 4]).alpha(alpha));
+        centered_title(frame, screen, screen.y * 0.22, 6.0 * k * grow, mv.title(), Color::hex(fighter_color(s, a as usize)).alpha(alpha));
     }
 }
 
@@ -1275,7 +1462,7 @@ fn draw_clash(s: &GameState, frame: &mut Frame, screen: Vec2, hud: &Hud) {
     if let Some((w, left)) = s.clash_banner {
         let a = (left as f32 / 20.0).min(1.0);
         let text = if hud.local == Some(w as usize) { "YOU WIN THE CLASH!".to_string() } else { format!("P{} WINS THE CLASH!", w + 1) };
-        centered_title(frame, screen, screen.y * 0.2, 5.0 * k, &text, Color::hex(PLAYER_COLORS[w as usize % 4]).alpha(a));
+        centered_title(frame, screen, screen.y * 0.2, 5.0 * k, &text, Color::hex(fighter_color(s, w as usize)).alpha(a));
     }
     let Some(c) = s.clash else { return };
     let me = hud.local.and_then(|l| c.side_of(l));
@@ -1292,7 +1479,7 @@ fn draw_clash(s: &GameState, frame: &mut Frame, screen: Vec2, hud: &Hud) {
     let t = frame.time;
     // scores: pips on each side, in each fighter's color
     for side in 0..2 {
-        let col = Color::hex(PLAYER_COLORS[c.fighters[side] as usize % 4]);
+        let col = Color::hex(fighter_color(s, c.fighters[side] as usize));
         let x0 = if side == 0 { screen.x * 0.28 } else { screen.x * 0.72 };
         let label = if Some(side) == me { "You" } else { names[side].as_str() };
         let tw = Frame::text_width(label, 2.4 * k);
@@ -1328,7 +1515,7 @@ fn draw_clash(s: &GameState, frame: &mut Frame, screen: Vec2, hud: &Hud) {
         ClashStage::Point => {
             if let Some(side) = c.last {
                 let text = if Some(side as usize) == me { "POINT!".to_string() } else { format!("{} SCORES", names[side as usize]) };
-                centered_title(frame, screen, cy - 20.0 * k, 4.0 * k, &text, Color::hex(PLAYER_COLORS[c.fighters[side as usize] as usize % 4]));
+                centered_title(frame, screen, cy - 20.0 * k, 4.0 * k, &text, Color::hex(fighter_color(s, c.fighters[side as usize] as usize)));
             }
         }
     }
@@ -1354,26 +1541,20 @@ fn draw_hud(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, hud: 
     draw_clash(s, frame, screen, hud);
     draw_finishers(s, frame, screen, hud);
     let k = (screen.y / 720.0).clamp(0.6, 3.0);
-    if let Some(me) = hud.local.and_then(|l| s.fighters.get(l)) {
-        if me.alive && me.held_by.is_some() && me.down == 0 && !s.in_finisher(me.id as usize) {
-            let pulse = if (s.frame / 8) % 2 == 0 { Color::hex(0xffb23a) } else { Color::hex(0xffe08a) };
-            centered_text(frame, screen, screen.y * 0.72, 2.6 * k, "Grabbed!  Mash A / D to break free", pulse);
-        } else if me.alive && me.hold.is_some() && me.flip == 0 && me.shoulder == 0 && !s.in_finisher(me.id as usize) {
-            let tip = "Q throw  (back to them: over the shoulder;  holding their weapon arm: take the weapon)";
-            centered_text(frame, screen, screen.y * 0.78, 1.8 * k, tip, Color::hex(0xc0c6d4));
-        }
-    }
     let pad = 16.0 * k;
-    let panel_w = 200.0 * k;
+    // (as wide as there's room for, eight across)
+    let n = s.fighters.len().max(1) as f32;
+    let panel_w = (200.0 * k).min((screen.x - pad * 2.0 - (n - 1.0) * 10.0 * k) / n);
     let cam = frame.camera;
     for f in &s.fighters {
         let i = f.id as usize;
         let x = pad + i as f32 * (panel_w + 10.0 * k);
         let y = pad;
-        let col = Color::hex(PLAYER_COLORS[i % 4]);
+        let col = Color::hex(fighter_color(s, i));
         frame.ui_rect(Vec2::new(x, y), Vec2::new(panel_w, 46.0 * k), 6.0 * k, Color::BLACK.alpha(0.45));
         frame.ui_rect(Vec2::new(x + 8.0 * k, y + 8.0 * k), Vec2::new(14.0 * k, 14.0 * k), 3.0 * k, col);
-        let name = if hud.local == Some(i) { format!("P{} You", i + 1) } else { format!("P{}", i + 1) };
+        let bot = if i >= s.humans { " AI" } else { "" };
+        let name = if hud.local == Some(i) { format!("P{} You", i + 1) } else { format!("P{}{bot}", i + 1) };
         frame.ui_text(Vec2::new(x + 30.0 * k, y + 8.5 * k), 2.0 * k, &name, Color::WHITE);
         for wi in 0..s.scores[i].min(8) {
             frame.ui_circle(Vec2::new(x + panel_w - 14.0 * k - wi as f32 * 13.0 * k, y + 15.0 * k), 4.5 * k, Color::hex(0xffd75a));
@@ -1392,8 +1573,14 @@ fn draw_hud(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, hud: 
             continue;
         }
         let p = world_to_screen(&cam, screen, f.pos(&s.world, HEAD) + Vec2::new(0.0, 0.55));
-        let col = Color::hex(PLAYER_COLORS[f.id as usize % 4]);
-        let tag = if hud.local == Some(f.id as usize) { "You".to_string() } else { format!("P{}", f.id + 1) };
+        let col = Color::hex(fighter_color(s, f.id as usize));
+        let tag = if hud.local == Some(f.id as usize) {
+            "You".to_string()
+        } else if f.id as usize >= s.humans {
+            format!("P{} AI", f.id + 1)
+        } else {
+            format!("P{}", f.id + 1)
+        };
         let w = Frame::text_width(&tag, 1.6 * k);
         frame.ui_text(Vec2::new(p.x - w * 0.5, p.y), 1.6 * k, &tag, col);
     }
@@ -1425,8 +1612,10 @@ fn draw_hud(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, hud: 
     }
     if let Phase::RoundOver { winner, .. } = s.phase {
         let (text, col) = match winner {
-            Some(w) if hud.local == Some(w as usize) => ("YOU WIN THE ROUND".to_string(), Color::hex(PLAYER_COLORS[w as usize % 4])),
-            Some(w) => (format!("PLAYER {} WINS", w + 1), Color::hex(PLAYER_COLORS[w as usize % 4])),
+            Some(w) if s.teams > 0 && hud.local.is_some_and(|me| s.allies(me, w as usize)) => ("YOUR TEAM WINS".to_string(), Color::hex(fighter_color(s, w as usize))),
+            Some(w) if s.teams > 0 => (format!("{} WINS", TEAM_NAMES[w as usize % 2]), Color::hex(TEAM_COLORS[w as usize % 2][0])),
+            Some(w) if hud.local == Some(w as usize) => ("YOU WIN THE ROUND".to_string(), Color::hex(fighter_color(s, w as usize))),
+            Some(w) => (format!("PLAYER {} WINS", w + 1), Color::hex(fighter_color(s, w as usize))),
             None => ("NO SURVIVORS".to_string(), Color::WHITE),
         };
         centered_title(frame, screen, screen.y * 0.3, 6.0 * k, &text, col);
@@ -1439,35 +1628,6 @@ fn draw_hud(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, hud: 
     for (line, col) in hud.lines.iter().rev() {
         frame.ui_text(Vec2::new(pad, y), 1.6 * k, line, *col);
         y -= 14.0 * k;
-    }
-    if hud.show_help {
-        let lines = [
-            "A/D move   W jump (again in mid-air)   S crouch (while running: slide)",
-            "Mouse aims your weapon  -  LMB swing  RMB stab (impales)",
-            "Shift grab (RMB too when unarmed)   E pick up   Q throw",
-            "Bare hands: LMB punch (click again: one-two)  S+LMB leg sweep",
-            "  LMB in the air: dropkick   Grab someone + Q: throw them",
-            "Grab in mid-air near someone: dive at them (catch the head to flip them)",
-            "  Press Shift during the flip to whip them where you aim",
-            "Sword finisher with a wall behind them: pinned to it",
-            "Grapple gun finisher: noose them, LMB fires the hook up to hang them",
-            "  Cut the rope with a blade to save them",
-            "Stab a wall to stick your blade in: hang, W to climb",
-            "Cut-off arms and legs can be picked up and swung",
-            "Guns: LMB fires",
-            "Grabbed? Mash A / D to break free",
-            "Swords locked? Hit the key shown first - first to 3",
-            "Skull over someone? Walk up and press F to finish them",
-            "Wall jump: jump again while touching a wall (twice)",
-
-            "F1 hide help   Esc leave match",
-        ];
-        let mut y = screen.y - pad - 10.0 * k;
-        for l in lines.iter().rev() {
-            let w = Frame::text_width(l, 1.6 * k);
-            frame.ui_text(Vec2::new(screen.x - pad - w, y), 1.6 * k, l, Color::hex(0xc0c6d4));
-            y -= 14.0 * k;
-        }
     }
     if let Some(m) = hud.mouse {
         // a small, faint ring (just its corners): your arm and weapon already
@@ -1489,7 +1649,6 @@ fn draw_hud(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, hud: 
             frame.ui_ring_corners(p, r, line + 2.0 * k, arc + 0.08, Color::hex(0x10131a).alpha(a * 0.45));
             frame.ui_ring_corners(p, r, line, arc, Color::WHITE.alpha(a));
         };
-        motion_blur(&hud.trail, line * 2.0, |p, a| ring(frame, p, a * alpha / 0.55));
         ring(frame, m, alpha);
         // rounds left, as pips under the ring
         let gun = hud.local.and_then(|i| s.fighters[i].weapon).map(|wi| &s.weapons[wi as usize]).filter(|w| w.is_gun() || (w.is_knives() && w.def().ammo > 1));
@@ -1501,79 +1660,5 @@ fn draw_hud(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, hud: 
                 frame.ui_circle(Vec2::new(x, m.y + r + 8.0 * k), 2.2 * k, col);
             }
         }
-    }
-}
-
-/// How long (seconds) a moving cursor's streak is: about one frame of a
-/// 60 Hz display, so even there a flick looks continuous.
-const CURSOR_BLUR: f32 = 0.016;
-
-/// Calls `ghost(position, alpha)` for copies of something `size` pixels thick
-/// spaced closely along where the cursor went in the last `CURSOR_BLUR`
-/// seconds, fading out with age: together they read as one smooth streak.
-fn motion_blur(trail: &[(Vec2, f32)], size: f32, mut ghost: impl FnMut(Vec2, f32)) {
-    // the path within the window, oldest first, cut where the window starts
-    let mut path: Vec<(Vec2, f32)> = Vec::with_capacity(trail.len() + 1);
-    for (i, &(p, age)) in trail.iter().enumerate() {
-        if age > CURSOR_BLUR {
-            continue;
-        }
-        if path.is_empty() && i > 0 {
-            let (q, qa) = trail[i - 1];
-            let t = ((qa - CURSOR_BLUR) / (qa - age).max(1e-6)).clamp(0.0, 1.0);
-            path.push((q.lerp(p, t), CURSOR_BLUR));
-        }
-        path.push((p, age));
-    }
-    let length: f32 = path.windows(2).map(|w| w[0].0.distance(w[1].0)).sum();
-    if length < size {
-        return;
-    }
-    let n = ((length / (size * 0.6)).ceil() as usize).clamp(2, 480);
-    let spacing = length / n as f32;
-    let (mut seg, mut into) = (0, 0.0);
-    for i in 0..n {
-        let d = spacing * i as f32;
-        // walk to distance d along the path
-        while seg + 2 < path.len() && into + path[seg].0.distance(path[seg + 1].0) < d {
-            into += path[seg].0.distance(path[seg + 1].0);
-            seg += 1;
-        }
-        let ((a, aa), (b, ba)) = (path[seg], path[seg + 1]);
-        let len = a.distance(b).max(1e-6);
-        let t = ((d - into) / len).clamp(0.0, 1.0);
-        let fade = 1.0 - (aa + (ba - aa) * t) / CURSOR_BLUR;
-        // overlapping copies add up to about `0.55 * fade` however densely
-        // they're packed
-        let want = 0.55 * fade.clamp(0.0, 1.0);
-        let alpha = 1.0 - (1.0 - want).powf(spacing / size);
-        if alpha > 0.004 {
-            ghost(a.lerp(b, t), alpha);
-        }
-    }
-}
-
-#[cfg(test)]
-mod cursor_blur_tests {
-    use super::*;
-
-    #[test]
-    fn a_flick_smears_into_one_streak_and_a_still_cursor_doesnt() {
-        // 1500 px in 10 ms, sampled at 1000 Hz, plus older samples outside the window
-        let trail: Vec<(Vec2, f32)> = (0..=30).map(|i| (Vec2::new(i as f32 * 150.0, 300.0), (30 - i) as f32 * 0.001)).collect();
-        let mut ghosts = Vec::new();
-        motion_blur(&trail, 2.0, |p, a| ghosts.push((p, a)));
-        assert!(ghosts.len() >= 100, "dense enough to look continuous ({})", ghosts.len());
-        let gap = ghosts.windows(2).map(|w| w[0].0.distance(w[1].0)).fold(0.0, f32::max);
-        let span = ghosts.last().unwrap().0.x - ghosts[0].0.x;
-        eprintln!("flick: {} copies over {span:.0} px, widest gap {gap:.1} px", ghosts.len());
-        // only the last 16 ms of travel (2400 px at this speed), capped copies
-        assert!(span > 2000.0 && span < 2450.0);
-        assert!(ghosts.first().unwrap().1 < ghosts.last().unwrap().1, "fades toward the old end");
-        // standing still: nothing extra
-        let still = [(Vec2::new(5.0, 5.0), 0.2), (Vec2::new(5.0, 5.0), 0.1)];
-        let mut n = 0;
-        motion_blur(&still, 2.0, |_, _| n += 1);
-        assert_eq!(n, 0);
     }
 }

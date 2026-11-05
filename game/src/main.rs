@@ -6,6 +6,7 @@
 //!
 //! dev tools:
 //! stickfell --host [--autostart 2] | --join ABCD   skip the menu
+//! (--ai N adds N AI fighters, --teams N plays N-a-side, to the modes below)
 //! stickfell --bot                   a CPU drives your fighter (soak-testing netcode)
 //! stickfell --net --player 0 --bind 0.0.0.0:7000 --peer 1.2.3.4:7001   direct-IP match (no relay)
 //! stickfell --verify 3600 [--players 4] [--level 1]   headless CPU match under rollback checking
@@ -20,9 +21,13 @@ mod draw;
 mod fighter;
 mod input;
 mod level;
+mod liquid;
+mod lobby;
 mod loading;
 mod sfx;
 mod sim;
+mod steam;
+mod stepper;
 mod voice;
 mod weapon;
 
@@ -51,6 +56,9 @@ enum Action {
     ConfirmJoin,
     Cancel,
     Start,
+    /// Host, in the room: the next mode (free for all, 2v2, ...) or AI setting.
+    CycleMode,
+    CycleAi,
     Leave,
     Quit,
     Practice,
@@ -132,23 +140,160 @@ impl Perf {
     }
 }
 
+/// The network link a match plays over (it goes with the session to the
+/// sim thread).
+type Link = Box<dyn Transport + Send>;
+type Session = P2PSession<GameState, Link>;
+
 struct Match {
     perf: Perf,
-    session: P2PSession<GameState, Box<dyn Transport>>,
+    /// The session (rollback and all), stepped on the sim thread.
+    sim: stepper::Stepper<Session, NetReport>,
+    /// What it last reported: the newest state (drawn, heard), and the
+    /// particle positions before it (render interpolation), when it came in.
+    game: GameState,
+    prev: Vec<Vec2>,
+    arrived: std::time::Instant,
+    net: NetReport,
     local: usize,
     cam: Vec2,
     cam_ready: bool,
     /// Camera view height (zooms in for blade locks).
     cam_h: f32,
-    /// Particle positions before the latest tick (render interpolation).
-    prev: Vec<Vec2>,
     log: Vec<String>,
     ended: Option<u32>,
 }
 
+/// How a match's session stands after a tick on the sim thread.
+#[derive(Default)]
+struct NetReport {
+    /// The newest state, if the tick moved it on.
+    game: Option<GameState>,
+    /// Whether it stepped (it doesn't while it waits for the others), and
+    /// how long that took.
+    stepped: Option<u64>,
+    events: Vec<SessionEvent>,
+    disconnected: Vec<bool>,
+    frames_ahead: f32,
+    syncing: bool,
+    frame: i32,
+    final_frame: i32,
+    stats: stickfell_net::NetStats,
+}
+
+impl Match {
+    /// One tick of the session, on the sim thread: hear from the others,
+    /// and step with `local` (unless it's too far ahead of them).
+    fn tick_job(local: u32) -> impl FnOnce(&mut Session) -> NetReport + Send {
+        move |s| {
+            s.poll();
+            let events = s.drain_events();
+            // Small leads are evened out by ticking a bit slower (see
+            // `tick_rate`); only a big lead skips a tick outright.
+            let (mut game, mut stepped) = (None, None);
+            if s.frames_ahead() < 3.0 || !s.should_wait() {
+                let t0 = std::time::Instant::now();
+                if matches!(s.advance(local), stickfell_net::AdvanceResult::Advanced) {
+                    game = Some(s.game().clone());
+                }
+                stepped = Some(t0.elapsed().as_micros() as u64);
+            }
+            let n = s.game().num_players;
+            NetReport {
+                game,
+                stepped,
+                events,
+                disconnected: (0..n).map(|p| s.is_disconnected(p)).collect(),
+                frames_ahead: s.frames_ahead(),
+                syncing: s.state() == SessionState::Syncing,
+                frame: s.frame(),
+                final_frame: s.final_frame(),
+                stats: s.stats,
+            }
+        }
+    }
+
+    /// Takes in whatever the sim thread has finished: the new states (and
+    /// their sounds), what happened on the network.
+    fn take(&mut self, audio: &mut Option<audio::Audio>) {
+        for mut r in self.sim.finished() {
+            for ev in std::mem::take(&mut r.events) {
+                let msg = match ev {
+                    SessionEvent::Connected { player } => format!("P{} connected", player + 1),
+                    SessionEvent::Disconnected { player } => format!("P{} left", player + 1),
+                    SessionEvent::Desync { frame, .. } => format!("Desync at frame {frame}"),
+                };
+                eprintln!("[stickfell] {msg}");
+                self.log.push(msg);
+            }
+            if let Some(us) = r.stepped {
+                self.perf.add_tick(us);
+            }
+            if let Some(g) = r.game.take() {
+                self.prev = draw::snapshot(&self.game);
+                self.game = g;
+                self.arrived = std::time::Instant::now();
+                // only the newest frame's sounds: frames re-run by a
+                // rollback already made their noise the first time
+                if let Some(a) = audio {
+                    a.play_frame(&self.game.events, self.cam, &speakers(&self.game));
+                    a.surroundings(&surroundings(&self.game, self.local, self.cam), self.cam);
+                }
+            }
+            // voice lines wait until their frame is final for everyone (so
+            // everyone hears the same ones): the newest state's frame count
+            // is ahead of the session's by a fixed offset
+            if let (Some(_), Some(a)) = (r.stepped, audio.as_mut()) {
+                let through = r.final_frame + 1 + (self.game.frame as i32 - r.frame);
+                a.speak(&self.game.voice_log, through.max(0) as u32, self.cam);
+            }
+            self.net = r;
+        }
+    }
+}
+
+/// In a room, waiting for the match: the relay connection and the match
+/// settings (the host's, or as heard from it).
+struct Room {
+    client: LobbyClient,
+    sync: lobby::RoomSync,
+    /// When the settings last went round (the host sends them every 250 ms).
+    sent: Option<std::time::Instant>,
+}
+
+impl Room {
+    fn new(client: LobbyClient) -> Self {
+        let sync = if client.is_host() { lobby::RoomSync::host() } else { lobby::RoomSync::default() };
+        Self { client, sync, sent: None }
+    }
+
+    /// Settings round the room: the host sends them out, everyone else
+    /// answers what they got.
+    fn exchange(&mut self, players: usize) {
+        let hosting = self.client.is_host();
+        for (from, pkt) in self.client.take_data() {
+            if let Some(back) = self.sync.receive(from, &pkt, hosting) {
+                self.client.send_data(0, &back);
+            }
+        }
+        if hosting && self.sent.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(250)) {
+            for (slot, pkt) in self.sync.outgoing(players) {
+                self.client.send_data(slot, &pkt);
+            }
+            self.sent = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Whether the host can start: enough players for the mode, and
+    /// everyone has the settings.
+    fn can_start(&self, players: usize) -> bool {
+        players >= 2 && self.sync.rules.problem(players).is_none() && self.sync.everyone_has_them(players)
+    }
+}
+
 enum Screen {
     Menu { code: String, entering: bool, error: Option<String> },
-    Lobby(Box<LobbyClient>),
+    Lobby(Box<Room>),
     Match(Box<Match>),
     Practice(Box<Practice>),
 }
@@ -156,8 +301,16 @@ enum Screen {
 /// Single-player practice yard: you against harmless dummies, no network.
 struct Practice {
     level: usize,
+    /// The yard, stepped on the sim thread; each step hands back the new
+    /// state (and whether someone was moved across it: not blended).
+    sim: stepper::Stepper<GameState, (GameState, bool)>,
+    /// The newest state (drawn, heard), the particle positions before it
+    /// (render interpolation), and when it came in.
     game: GameState,
     prev: Vec<Vec2>,
+    arrived: std::time::Instant,
+    /// B pressed: a dummy brought with the next step.
+    dummy: bool,
     cam: Vec2,
     cam_h: f32,
     cam_ready: bool,
@@ -166,7 +319,24 @@ struct Practice {
 impl Practice {
     fn new(level: usize) -> Self {
         let game = GameState::new(4, level, 0x7EA1);
-        Self { level, prev: draw::snapshot(&game), game, cam: Vec2::ZERO, cam_h: CAMERA_HEIGHT, cam_ready: false }
+        let sim = stepper::Stepper::new(game.clone());
+        Self { level, sim, prev: draw::snapshot(&game), game, arrived: std::time::Instant::now(), dummy: false, cam: Vec2::ZERO, cam_h: CAMERA_HEIGHT, cam_ready: false }
+    }
+
+    /// Takes in whatever steps the sim thread has finished (and plays
+    /// their sounds).
+    fn take(&mut self, audio: &mut Option<audio::Audio>) {
+        for (g, moved) in self.sim.finished() {
+            self.prev = draw::snapshot(if moved { &g } else { &self.game });
+            self.game = g;
+            self.arrived = std::time::Instant::now();
+            if let Some(a) = audio {
+                a.play_frame(&self.game.events, self.cam, &speakers(&self.game));
+                a.surroundings(&surroundings(&self.game, 0, self.cam), self.cam);
+                // (no one else to wait for: every frame is final)
+                a.speak(&self.game.voice_log, self.game.frame, self.cam);
+            }
+        }
     }
 }
 
@@ -189,12 +359,12 @@ impl Demo {
     }
     fn tick(&mut self) {
         self.prev = draw::snapshot(&self.game);
-        let inputs: Vec<u32> = (0..4).map(|p| bot::bot_input(&self.game, p)).collect();
+        let inputs: Vec<u32> = (0..self.game.fighters.len()).map(|p| bot::bot_input(&self.game, p)).collect();
         self.game.step(&inputs);
     }
     fn draw(&mut self, levels: &[LevelDef], frame: &mut Frame, screen: Vec2, alpha: f32, dt: f32) {
         let g = draw::interpolate(&self.game, &self.prev, alpha);
-        let follow = (g.frame / 600) as usize % 4;
+        let follow = (g.frame / 600) as usize % g.fighters.len().max(1);
         let target = draw::camera_target(&g, Some(follow));
         draw::follow_camera(&mut self.cam, target, &g, screen, !self.ready, dt, CAMERA_HEIGHT);
         self.ready = true;
@@ -211,11 +381,12 @@ struct App {
     demo: Demo,
     buttons: Vec<(Vec2, Vec2, Action)>,
     quit: bool,
-    show_help: bool,
     mouse: Vec2,
     camera: Camera2D,
     screen_size: Vec2,
     autostart: Option<usize>,
+    /// The settings `--host --autostart` starts with (`--ai`, `--teams`).
+    autostart_rules: Option<lobby::Rules>,
     bot_local: bool,
     announced: bool,
     /// Escape opens this instead of quitting or leaving straight away.
@@ -238,11 +409,11 @@ impl App {
             demo: Demo::new(),
             buttons: Vec::new(),
             quit: false,
-            show_help: true,
             mouse: Vec2::ZERO,
             camera: Camera2D { center: Vec2::ZERO, height: CAMERA_HEIGHT },
             screen_size: Vec2::new(1280.0, 720.0),
             autostart: None,
+            autostart_rules: None,
             bot_local: false,
             announced: false,
             confirm: None,
@@ -253,18 +424,36 @@ impl App {
         }
     }
 
-    fn start_match(&mut self, transport: Box<dyn Transport>, num_players: usize, local: usize, seed: u32, delay: i32) {
-        let game = GameState::new(num_players, seed as usize % level::ARENAS, seed);
+    /// The tick rate (share of 60 a second) for a match this far ahead of
+    /// the other players: running ahead, slow down slightly until they
+    /// catch up (smoother than skipping a tick).
+    fn match_rate(ahead: f32) -> f64 {
+        match ahead {
+            a if a > 1.0 => 0.94,
+            a if a > 0.4 => 0.97,
+            _ => 1.0,
+        }
+    }
+
+    fn start_match(&mut self, transport: Link, num_players: usize, local: usize, seed: u32, delay: i32, rules: lobby::Rules) {
+        // (the AI fighters come after the players, and are played in the sim)
+        let fighters = num_players + rules.bots(num_players);
+        let game = GameState::new_match(fighters, num_players, rules.teams, level::first_arena(seed, fighters), seed);
         let mut cfg = SessionConfig::new(num_players, local);
         cfg.input_delay = delay;
+        let session = P2PSession::new(game.clone(), transport, cfg);
+        let net = NetReport { syncing: session.state() == SessionState::Syncing, ..Default::default() };
         self.screen = Screen::Match(Box::new(Match {
             perf: Perf::default(),
-            session: P2PSession::new(game, transport, cfg),
+            sim: stepper::Stepper::new(session),
+            prev: draw::snapshot(&game),
+            game,
+            arrived: std::time::Instant::now(),
+            net,
             local,
             cam: Vec2::ZERO,
             cam_ready: false,
             cam_h: CAMERA_HEIGHT,
-            prev: Vec::new(),
             log: Vec::new(),
             ended: None,
         }));
@@ -282,8 +471,8 @@ impl App {
                 None => {}
             },
             Action::ConfirmNo => self.confirm = None,
-            Action::Host => match LobbyClient::host(&self.relay, 4) {
-                Ok(c) => self.screen = Screen::Lobby(Box::new(c)),
+            Action::Host => match LobbyClient::host(&self.relay, sim::MAX_PLAYERS as u8) {
+                Ok(c) => self.screen = Screen::Lobby(Box::new(Room::new(c))),
                 Err(e) => self.screen = menu(Some(format!("Can't reach the relay: {e}"))),
             },
             Action::Join => {
@@ -298,7 +487,7 @@ impl App {
                     _ => return,
                 };
                 match LobbyClient::join(&self.relay, &code) {
-                    Ok(c) => self.screen = Screen::Lobby(Box::new(c)),
+                    Ok(c) => self.screen = Screen::Lobby(Box::new(Room::new(c))),
                     Err(e) => self.screen = menu(Some(format!("Can't reach the relay: {e}"))),
                 }
             }
@@ -309,13 +498,23 @@ impl App {
                 }
             }
             Action::Start => {
-                if let Screen::Lobby(c) = &mut self.screen {
-                    c.start();
+                if let Screen::Lobby(r) = &mut self.screen {
+                    r.client.start();
+                }
+            }
+            Action::CycleMode | Action::CycleAi => {
+                if let Screen::Lobby(r) = &mut self.screen {
+                    let players = match r.client.state() {
+                        LobbyState::InRoom { players, .. } => *players,
+                        _ => 1,
+                    };
+                    let rules = if a == Action::CycleMode { r.sync.rules.next_mode() } else { r.sync.rules.next_ai(players) };
+                    r.sync.set(rules);
                 }
             }
             Action::Leave => {
-                if let Screen::Lobby(c) = &mut self.screen {
-                    c.leave();
+                if let Screen::Lobby(r) = &mut self.screen {
+                    r.client.leave();
                 }
                 self.screen = menu(None);
             }
@@ -335,7 +534,10 @@ impl App {
             Color::hex(0x1c1f27).alpha(0.92)
         };
         frame.ui_rect(min, size, 6.0 * k, bg);
-        let scale = 2.6 * k;
+        // (shrunk to fit, if it has to be)
+        let room = w - 24.0 * k;
+        let full = Frame::text_width(label, 2.6 * k);
+        let scale = if full > room { 2.6 * k * room / full } else { 2.6 * k };
         let tw = Frame::text_width(label, scale);
         let tc = if enabled { Color::WHITE } else { Color::hex(0x6a6f7a) };
         frame.ui_text(Vec2::new(center_x - tw * 0.5, y + (h - 7.0 * scale) * 0.5), scale, label, tc);
@@ -365,9 +567,6 @@ impl Game for App {
         // (nothing runs until it's all loaded)
         if self.loading.is_some() {
             return;
-        }
-        if input.pressed(KeyCode::F1) {
-            self.show_help = !self.show_help;
         }
         if input.pressed(KeyCode::KeyM) {
             self.muted = !self.muted;
@@ -418,26 +617,38 @@ impl Game for App {
                     self.confirm = Some(Confirm::Quit);
                 }
             }
-            Screen::Lobby(client) => {
+            Screen::Lobby(room) => {
                 self.demo.tick();
                 if esc {
                     action = Some(Action::Leave);
                 }
-                let state = client.poll().clone();
+                let state = room.client.poll().clone();
                 if let LobbyState::InRoom { code, players, .. } = &state {
                     if !self.announced {
                         eprintln!("[stickfell] room code {code}");
                         self.announced = true;
                     }
-                    if client.is_host() && self.autostart.is_some_and(|n| *players >= n) {
-                        client.start();
+                    room.exchange(*players);
+                    if room.client.is_host() {
+                        if let Some(r) = self.autostart_rules {
+                            room.sync.set(r);
+                        }
+                        if self.autostart.is_some_and(|n| *players >= n) && room.can_start(*players) {
+                            room.client.start();
+                        }
                     }
                 }
                 match state {
                     LobbyState::Started { num_players, slot, seed } => {
-                        let Screen::Lobby(client) = std::mem::replace(&mut self.screen, menu(None)) else { unreachable!() };
-                        let transport: Box<dyn Transport> = Box::new(client.into_transport());
-                        self.start_match(transport, num_players, slot, seed, 2);
+                        let Screen::Lobby(room) = std::mem::replace(&mut self.screen, menu(None)) else { unreachable!() };
+                        // (the host made sure everyone had its settings before starting)
+                        if !room.sync.heard {
+                            self.screen = menu(Some("Didn't get the match settings from the host".into()));
+                            return;
+                        }
+                        let rules = room.sync.rules;
+                        let transport: Link = Box::new(room.client.into_transport());
+                        self.start_match(transport, num_players, slot, seed, 2, rules);
                         return;
                     }
                     LobbyState::Failed(msg) => {
@@ -454,18 +665,29 @@ impl Game for App {
                 if input.pressed(KeyCode::KeyR) && self.confirm.is_none() {
                     **p = Practice::new(p.level);
                 }
-                p.prev = draw::snapshot(&p.game);
-                let g = &p.game;
-                let neck = g.fighters[0].pos(&g.world, NECK);
-                let mouse_world = self.camera.screen_to_world(self.mouse, self.screen_size);
-                let me = if self.confirm.is_some() { input::encode(0, g.fighters[0].aim) } else { input::read_local(input, mouse_world - neck) };
-                let mut inputs = vec![me];
-                inputs.extend((1..g.num_players).map(|i| bot::dummy_input(g, i)));
-                p.game.step(&inputs);
-                if let Some(a) = &mut self.audio {
-                    a.play_frame(&p.game.events, p.cam, &speakers(&p.game));
-                    // (no one else to wait for: every frame is final)
-                    a.speak(&p.game.voice_log, p.game.frame, p.cam);
+                // B: a dummy right in front of you, facing you
+                if input.pressed(KeyCode::KeyB) && self.confirm.is_none() {
+                    p.dummy = true;
+                }
+                p.take(&mut self.audio);
+                // the next step, worked out on the sim thread (aimed from
+                // where you were last seen); with the sim thread still busy
+                // with the last two, the game waits a tick
+                if p.sim.ready() {
+                    let g = &p.game;
+                    let neck = g.fighters[0].pos(&g.world, NECK);
+                    let mouse_world = self.camera.screen_to_world(self.mouse, self.screen_size);
+                    let me = if self.confirm.is_some() { input::encode(0, g.fighters[0].aim) } else { input::read_local(input, mouse_world - neck) };
+                    let dummy = std::mem::take(&mut p.dummy);
+                    p.sim.send(move |g| {
+                        if dummy {
+                            g.bring_dummy(0);
+                        }
+                        let mut inputs = vec![me];
+                        inputs.extend((1..g.num_players).map(|i| bot::dummy_input(g, i)));
+                        g.step(&inputs);
+                        (g.clone(), dummy)
+                    });
                 }
             }
             Screen::Match(m) => {
@@ -473,19 +695,10 @@ impl Game for App {
                     self.confirm = Some(Confirm::LeaveMatch);
                 }
                 let prompt_open = self.confirm.is_some();
-                let s = &mut m.session;
-                s.poll();
-                for ev in s.drain_events() {
-                    let msg = match ev {
-                        SessionEvent::Connected { player } => format!("P{} connected", player + 1),
-                        SessionEvent::Disconnected { player } => format!("P{} left", player + 1),
-                        SessionEvent::Desync { frame, .. } => format!("Desync at frame {frame}"),
-                    };
-                    eprintln!("[stickfell] {msg}");
-                    m.log.push(msg);
-                }
-                let n = s.game().num_players;
-                let everyone_left = n > 1 && (0..n).filter(|&p| p != m.local).all(|p| s.is_disconnected(p));
+                m.take(&mut self.audio);
+                let n = m.game.num_players;
+                let gone = &m.net.disconnected;
+                let everyone_left = n > 1 && gone.len() == n && (0..n).filter(|&p| p != m.local).all(|p| gone[p]);
                 if everyone_left && m.ended.is_none() {
                     m.ended = Some(240);
                 }
@@ -496,11 +709,11 @@ impl Game for App {
                         return;
                     }
                 }
-                m.prev = draw::snapshot(s.game());
-                // Small leads are evened out by ticking a bit slower (see
-                // `tick_rate`); only a big lead skips a tick outright.
-                if s.frames_ahead() < 3.0 || !s.should_wait() {
-                    let g = s.game();
+                // the next tick, on the sim thread (aimed from where you
+                // were last seen); with it still busy with the last two, this
+                // tick waits
+                if m.sim.ready() {
+                    let g = &m.game;
                     let neck = g.fighters[m.local].pos(&g.world, NECK);
                     let mouse_world = self.camera.screen_to_world(self.mouse, self.screen_size);
                     let local = if self.bot_local {
@@ -511,25 +724,9 @@ impl Game for App {
                     } else {
                         input::read_local(input, mouse_world - neck)
                     };
-                    let t0 = std::time::Instant::now();
-                    let advanced = matches!(s.advance(local), stickfell_net::AdvanceResult::Advanced);
-                    m.perf.add_tick(t0.elapsed().as_micros() as u64);
-                    // only the newest frame's sounds: frames re-run by a
-                    // rollback already made their noise the first time
-                    if let (true, Some(a)) = (advanced, &mut self.audio) {
-                        a.play_frame(&s.game().events, m.cam, &speakers(s.game()));
-                    }
-                    // voice lines wait until their frame is final for everyone
-                    // (so everyone hears the same ones): the newest state's
-                    // frame count is ahead of the session's by a fixed offset
-                    if let Some(a) = &mut self.audio {
-                        let g = s.game();
-                        let through = s.final_frame() + 1 + (g.frame as i32 - s.frame());
-                        a.speak(&g.voice_log, through.max(0) as u32, m.cam);
-                    }
+                    m.sim.send(Match::tick_job(local));
                 }
-                let ahead = s.frames_ahead();
-                m.perf.report(&s.stats, ahead);
+                m.perf.report(&m.net.stats, m.net.frames_ahead);
             }
         }
         if let Some(a) = action {
@@ -557,7 +754,11 @@ impl Game for App {
         match &mut self.screen {
             Screen::Match(m) => {
                 let t0 = std::time::Instant::now();
-                let g = &draw::interpolate(m.session.game(), &m.prev, alpha);
+                // (the newest state from the sim thread, as soon as it's in;
+                // blended toward over a tick from when it came)
+                m.take(&mut self.audio);
+                let tick = 1.0 / (60.0 * Self::match_rate(m.net.frames_ahead));
+                let g = &draw::interpolate(&m.game, &m.prev, stepper::blend(m.arrived, tick));
                 // blade locks, finishers, slow-mo: swoop in on the action
                 let shot = draw::cinematic(g, m.local);
                 let want_h = shot.map_or(CAMERA_HEIGHT, |s| s.1);
@@ -565,14 +766,14 @@ impl Game for App {
                 let target = shot.map_or_else(|| draw::camera_target(g, Some(m.local)), |s| s.0);
                 draw::follow_camera(&mut m.cam, target, g, screen, !m.cam_ready, dt, m.cam_h);
                 m.cam_ready = true;
-                let mut hud = Hud { local: Some(m.local), mouse: Some(self.mouse), trail: frame.mouse_trail.clone(), show_help: self.show_help, zoom: m.cam_h, talk: self.audio.as_ref().map_or([None; 4], |a| a.talking()), ..Default::default() };
-                if m.session.state() == SessionState::Syncing {
+                let mut hud = Hud { local: Some(m.local), mouse: Some(self.mouse), zoom: m.cam_h, talk: self.audio.as_ref().map_or([None; sim::MAX_PLAYERS], |a| a.talking()), ..Default::default() };
+                if m.net.syncing {
                     hud.banner = Some(("Connecting to players...".into(), Color::WHITE));
                 }
                 if m.ended.is_some() {
                     hud.banner = Some(("Everyone else left".into(), Color::hex(0xffb040)));
                 }
-                hud.lines.push((format!("Online  frame {}", m.session.frame()), Color::hex(0x9fd0ff)));
+                hud.lines.push((format!("Online  frame {}", m.net.frame), Color::hex(0x9fd0ff)));
                 if !m.perf.line.is_empty() {
                     hud.lines.push((m.perf.line.clone(), Color::hex(0x9fd0ff)));
                 }
@@ -585,15 +786,15 @@ impl Game for App {
                 m.perf.add_draw(t0.elapsed().as_micros() as u64, dt);
             }
             Screen::Practice(p) => {
-                let g = &draw::interpolate(&p.game, &p.prev, alpha);
+                p.take(&mut self.audio);
+                let g = &draw::interpolate(&p.game, &p.prev, stepper::blend(p.arrived, 1.0 / 60.0));
                 let shot = draw::cinematic(g, 0);
                 let want_h = shot.map_or(CAMERA_HEIGHT, |s| s.1);
                 p.cam_h += (want_h - p.cam_h) * (1.0 - (-dt * 7.0).exp());
                 let target = shot.map_or_else(|| draw::camera_target(g, Some(0)), |s| s.0);
                 draw::follow_camera(&mut p.cam, target, g, screen, !p.cam_ready, dt, p.cam_h);
                 p.cam_ready = true;
-                let mut hud = Hud { local: Some(0), mouse: Some(self.mouse), trail: frame.mouse_trail.clone(), show_help: self.show_help, zoom: p.cam_h, talk: self.audio.as_ref().map_or([None; 4], |a| a.talking()), ..Default::default() };
-                hud.lines.push(("Practice  -  R resets the yard  -  Esc leaves".into(), Color::hex(0xffd75a)));
+                let hud = Hud { local: Some(0), mouse: Some(self.mouse), zoom: p.cam_h, talk: self.audio.as_ref().map_or([None; sim::MAX_PLAYERS], |a| a.talking()), ..Default::default() };
                 let lv = &self.levels[g.level_index];
                 draw::draw_game(g, lv, frame, screen, p.cam, &hud);
                 self.camera = frame.camera;
@@ -635,25 +836,54 @@ impl Game for App {
                 let build = option_env!("STICKFELL_BUILD").filter(|b| !b.is_empty()).map_or("Built on a PC".to_owned(), |b| format!("Build {b}"));
                 text_c(frame, screen, screen.y - 40.0 * k, 1.8 * k, &format!("{build}   Relay {}", self.relay), Color::hex(0x8a90a0));
             }
-            Screen::Lobby(c) => match c.state() {
+            Screen::Lobby(r) => match r.client.state() {
                 LobbyState::InRoom { code, players, max, .. } => {
+                    let (players, rules) = (*players, r.sync.rules);
                     text_c(frame, screen, y0 - 20.0 * k, 2.6 * k, "Room code", Color::hex(0xc8ccd6));
                     let spaced: String = code.chars().flat_map(|c| [c, ' ']).collect();
                     title_c(frame, screen, y0 + 14.0 * k, 9.0 * k, spaced.trim_end(), Color::hex(0xffd75a));
                     text_c(frame, screen, y0 + 92.0 * k, 2.6 * k, &format!("Players {players}/{max}"), Color::WHITE);
-                    for i in 0..*players {
-                        let x = cx + (i as f32 - (*players as f32 - 1.0) * 0.5) * 40.0 * k;
-                        frame.ui_circle(Vec2::new(x, y0 + 132.0 * k), 12.0 * k, Color::hex(draw::PLAYER_COLORS[i % 4]));
-                    }
-                    if c.is_host() {
-                        self.button(frame, cx, y0 + 170.0 * k, bw, "Start match", Action::Start, k, *players >= 2);
-                        if *players < 2 {
-                            text_c(frame, screen, y0 + 226.0 * k, 1.8 * k, "Share the code - you need 2 or more players", Color::hex(0x8a90a0));
+                    // everyone who'll be in it: the players, then the AI
+                    // (hollow), in their colours (by team, in teams)
+                    let all = players + rules.bots(players);
+                    for i in 0..all {
+                        let x = cx + (i as f32 - (all as f32 - 1.0) * 0.5) * 40.0 * k;
+                        let col = match rules.teams {
+                            0 => draw::PLAYER_COLORS[i % draw::PLAYER_COLORS.len()],
+                            _ => draw::TEAM_COLORS[i % 2][(i / 2) % 4],
+                        };
+                        let at = Vec2::new(x, y0 + 132.0 * k);
+                        frame.ui_circle(at, 12.0 * k, Color::hex(col));
+                        if i >= players {
+                            frame.ui_circle(at, 7.0 * k, Color::hex(0x15171c));
                         }
-                    } else {
-                        text_c(frame, screen, y0 + 180.0 * k, 2.4 * k, "Waiting for the host to start", Color::hex(0xc8ccd6));
                     }
-                    self.button(frame, cx, y0 + 250.0 * k, bw, "Leave", Action::Leave, k, true);
+                    let grey = Color::hex(0x8a90a0);
+                    if r.client.is_host() {
+                        let mode = format!("Mode: {}", rules.mode());
+                        self.button(frame, cx, y0 + 166.0 * k, bw, &mode, Action::CycleMode, k, true);
+                        self.button(frame, cx, y0 + 216.0 * k, bw, &rules.ai_label(players), Action::CycleAi, k, true);
+                        let ready = r.can_start(players);
+                        self.button(frame, cx, y0 + 272.0 * k, bw, "Start match", Action::Start, k, ready);
+                        let note = if players < 2 {
+                            Some("Share the code - you need 2 or more players".to_string())
+                        } else if let Some(p) = rules.problem(players) {
+                            Some(p)
+                        } else if !ready {
+                            Some("Sending everyone the settings...".to_string())
+                        } else {
+                            None
+                        };
+                        if let Some(n) = note {
+                            text_c(frame, screen, y0 + 326.0 * k, 1.8 * k, &n, grey);
+                        }
+                        self.button(frame, cx, y0 + 348.0 * k, bw, "Leave", Action::Leave, k, true);
+                    } else {
+                        let what = if r.sync.heard { format!("{}   {}", rules.mode(), rules.ai_label(players)) } else { "Getting the settings...".to_string() };
+                        text_c(frame, screen, y0 + 170.0 * k, 2.2 * k, &what, Color::WHITE);
+                        text_c(frame, screen, y0 + 206.0 * k, 2.4 * k, "Waiting for the host to start", Color::hex(0xc8ccd6));
+                        self.button(frame, cx, y0 + 250.0 * k, bw, "Leave", Action::Leave, k, true);
+                    }
                 }
                 _ => {
                     text_c(frame, screen, y0 + 30.0 * k, 3.0 * k, "Contacting the relay...", Color::WHITE);
@@ -701,11 +931,7 @@ impl Game for App {
         match &self.screen {
             // running ahead of the other players: slow down slightly until
             // they catch up (smoother than skipping a tick)
-            Screen::Match(m) => match m.session.frames_ahead() {
-                a if a > 1.0 => 0.94,
-                a if a > 0.4 => 0.97,
-                _ => 1.0,
-            },
+            Screen::Match(m) => Self::match_rate(m.net.frames_ahead),
             _ => 1.0,
         }
     }
@@ -721,7 +947,7 @@ struct Spectate {
 
 impl Game for Spectate {
     fn tick(&mut self, _input: &Input) {
-        let inputs: Vec<u32> = (0..self.game.num_players).map(|p| bot::bot_input(&self.game, p)).collect();
+        let inputs: Vec<u32> = (0..self.game.humans).map(|p| bot::bot_input(&self.game, p)).collect();
         self.game.step(&inputs);
     }
     fn draw(&mut self, frame: &mut Frame, screen: Vec2, _alpha: f32, _dt: f32) {
@@ -753,6 +979,8 @@ struct Args {
     host: bool,
     join: Option<String>,
     autostart: Option<usize>,
+    /// AI fighters and team size (`--ai`, `--teams`).
+    rules: lobby::Rules,
     bot: bool,
     menu_shot: bool,
     loading_shot: bool,
@@ -792,6 +1020,7 @@ fn parse_args() -> Result<Args, String> {
         host: false,
         join: None,
         autostart: None,
+        rules: lobby::Rules::default(),
         bot: false,
         menu_shot: false,
         loading_shot: false,
@@ -825,6 +1054,8 @@ fn parse_args() -> Result<Args, String> {
             "--join" => a.join = Some(val("--join")?),
             "--autostart" => a.autostart = Some(num(val("--autostart")?)? as usize),
             "--bot" => a.bot = true,
+            "--ai" => a.rules.ai = num(val("--ai")?)?.min(sim::MAX_PLAYERS as u32 - 1) as u8,
+            "--teams" => a.rules.teams = (num(val("--teams")?)?).clamp(2, 4) as u8,
             "--menu" => a.menu_shot = true,
             "--loading" => a.loading_shot = true,
             "-h" | "--help" => {
@@ -852,7 +1083,8 @@ fn main() -> ExitCode {
     };
 
     if let Some(frames) = args.verify {
-        let mut s = SyncTestSession::new(GameState::new(args.players, args.level, args.seed), 7);
+        let fighters = args.players + args.rules.bots(args.players);
+        let mut s = SyncTestSession::new(GameState::new_match(fighters, args.players, args.rules.teams, args.level, args.seed), 7);
         for _ in 0..frames {
             let inputs: Vec<u32> = (0..args.players).map(|p| bot::bot_input(&s.game, p)).collect();
             if let Err(e) = s.advance(&inputs) {
@@ -909,7 +1141,7 @@ fn main() -> ExitCode {
 
     if let Some(n) = args.bench {
         let mut sp = Spectate {
-            game: GameState::new(args.players, args.level, args.seed),
+            game: GameState::new_match(args.players + args.rules.bots(args.players), args.players, args.rules.teams, args.level, args.seed),
             follow: args.follow.min(args.players - 1),
             cam: Vec2::ZERO,
             levels: levels(),
@@ -925,7 +1157,7 @@ fn main() -> ExitCode {
 
     if let Some(path) = &args.screenshot {
         let mut sp = Spectate {
-            game: GameState::new(args.players, args.level, args.seed),
+            game: GameState::new_match(args.players + args.rules.bots(args.players), args.players, args.rules.teams, args.level, args.seed),
             follow: args.follow.min(args.players - 1),
             cam: Vec2::ZERO,
             levels: levels(),
@@ -945,6 +1177,7 @@ fn main() -> ExitCode {
     let mut app = App::new(menu(None), args.relay.clone());
     app.loading = Some(Box::new(loading::Loading::start()));
     app.autostart = args.autostart;
+    app.autostart_rules = Some(args.rules);
     app.bot_local = args.bot;
     if args.host {
         app.do_action(Action::Host);
@@ -968,7 +1201,7 @@ fn main() -> ExitCode {
             }
         };
         eprintln!("[stickfell] direct online as P{} on {bind}", args.player + 1);
-        app.start_match(Box::new(transport), args.players, args.player, args.seed, args.delay);
+        app.start_match(Box::new(transport), args.players, args.player, args.seed, args.delay, args.rules);
     }
     let cfg = AppConfig {
         title: "Stickfell: Last Limb Standing".into(),
@@ -987,6 +1220,233 @@ fn main() -> ExitCode {
 
 /// Where each fighter's voice comes from, and whether they're still alive to
 /// use it (for steering voice lines).
+/// What's around `listener` for the sound loops: the nearest calm water and
+/// hot lava, whether fighter `me` has their head under water, and everyone
+/// swimming.
+fn surroundings(g: &sim::GameState, me: usize, listener: stickfell_physics::Vec2) -> audio::Surroundings {
+    let mut s = audio::Surroundings::default();
+    let (mut water, mut lava) = (f32::MAX, f32::MAX);
+    for d in &g.fluid.drops {
+        let l = (d.pos - listener).length_squared();
+        if d.kind == liquid::WATER_DROP && l < water {
+            water = l;
+            s.water = Some(d.pos);
+        } else if d.kind == liquid::LAVA_DROP && d.dye < liquid::COOLED_LAVA && l < lava {
+            lava = l;
+            s.lava = Some(d.pos);
+        }
+    }
+    if let Some(f) = g.fighters.get(me) {
+        let head = g.fluid.sample(f.pos(&g.world, fighter::HEAD));
+        s.under = f.alive && head.amount[liquid::WATER_DROP as usize] > sim::HEAD_UNDER;
+    }
+    for (i, f) in g.fighters.iter().enumerate().take(sim::MAX_PLAYERS) {
+        if f.swimming {
+            s.swimming[i] = Some(f.pos(&g.world, fighter::PELVIS));
+        }
+    }
+    s
+}
+
 fn speakers(g: &sim::GameState) -> Vec<audio::Speaker> {
-    g.fighters.iter().map(|f| audio::Speaker { mouth: f.pos(&g.world, fighter::HEAD), alive: f.alive, choking: f.choking }).collect()
+    g.fighters.iter().map(|f| audio::Speaker { mouth: f.pos(&g.world, fighter::HEAD), alive: f.alive, choking: f.choking, burning: f.burning }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_loops_hear_the_pool_the_lava_and_a_head_under() {
+        let mut g = sim::GameState::new(4, level::TRAINING, 7);
+        for _ in 0..20 {
+            g.step(&[0, 0, 0, 0]);
+        }
+        let (p, l) = (level::YARD_POOL, level::YARD_LAVA);
+        let pool = Vec2::new((p.0 + p.1) * 0.5, p.3);
+        let lava = Vec2::new((l.0 + l.1) * 0.5, l.3);
+        let s = surroundings(&g, 0, pool + Vec2::new(0.0, 2.0));
+        let water = s.water.expect("water heard by the pool");
+        assert!((water - pool).length() < 2.5 && water.x > p.0 && water.x < p.1, "the nearest water is the pool's ({water:?})");
+        let s = surroundings(&g, 0, lava + Vec2::new(0.0, 2.0));
+        let hot = s.lava.expect("lava heard by the lava");
+        assert!(hot.x > l.0 && hot.x < l.1, "the nearest lava is the pit's ({hot:?})");
+        assert!(!s.under && s.swimming.iter().all(|w| w.is_none()), "nobody's in anything yet");
+        // fighter 0 held at the bottom of the pool
+        let at = Vec2::new(pool.x, p.2 + 0.5);
+        for _ in 0..30 {
+            let head = g.fighters[0].pos(&g.world, fighter::HEAD);
+            for id in g.fighters[0].particle_ids() {
+                let q = &mut g.world.particles[id as usize];
+                q.pos += at - head;
+                q.prev = q.pos;
+                q.vel = Vec2::ZERO;
+            }
+            g.step(&[0, 0, 0, 0]);
+        }
+        assert!(surroundings(&g, 0, pool).under, "head under: the drone");
+        assert!(!surroundings(&g, 1, pool).under, "someone else's head under isn't yours");
+    }
+}
+
+#[cfg(test)]
+mod sim_thread_tests {
+    use super::*;
+    use stickfell_net::RollbackGame;
+
+    /// Steps practice the way `App::tick` does: a job a tick on the sim
+    /// thread, the results taken in as they come.
+    fn run(p: &mut Practice, ticks: u32, buttons: u16) {
+        let mut sent = 0;
+        while sent < ticks {
+            p.take(&mut None);
+            if p.sim.ready() {
+                let aim = Vec2::new(0.6, 0.1);
+                let me = input::encode(buttons, aim);
+                p.sim.send(move |g| {
+                    let mut inputs = vec![me];
+                    inputs.extend((1..g.num_players).map(|i| bot::dummy_input(g, i)));
+                    g.step(&inputs);
+                    (g.clone(), false)
+                });
+                sent += 1;
+            } else {
+                // (as the game would: off drawing, not spinning on a core)
+                std::thread::sleep(std::time::Duration::from_micros(500));
+            }
+        }
+        for (g, _) in p.sim.wait() {
+            p.prev = draw::snapshot(&p.game);
+            p.game = g;
+        }
+    }
+
+    #[test]
+    fn practice_on_the_sim_thread_comes_out_the_same() {
+        let mut p = Practice::new(level::TRAINING);
+        let mut same = p.game.clone();
+        run(&mut p, 120, input::RIGHT);
+        let me = input::encode(input::RIGHT, Vec2::new(0.6, 0.1));
+        for _ in 0..120 {
+            let mut inputs = vec![me];
+            inputs.extend((1..same.num_players).map(|i| bot::dummy_input(&same, i)));
+            same.step(&inputs);
+        }
+        assert_eq!(p.game.frame, same.frame, "every step came back");
+        assert_eq!(p.game.checksum(), same.checksum(), "the same world as stepping it here");
+    }
+
+    #[test]
+    #[ignore]
+    fn measure_drawing_thread_flooded() {
+        // the yard flooded to the cap, then: what's left on the drawing
+        // thread each tick and each drawn frame
+        let mut p = Practice::new(level::TRAINING);
+        let cap: Option<u32> = std::env::var("FLOOD_CAP").ok().map(|c| c.parse().unwrap());
+        if let Some(c) = cap {
+            p.game.trap.def = Some(level::TrapDef { max_drops: c, ..p.game.trap.def.unwrap() });
+        }
+        let def = p.game.trap.def.unwrap();
+        p.sim.send(move |g| {
+            if let Some(c) = cap {
+                g.trap.def = Some(level::TrapDef { max_drops: c, ..g.trap.def.unwrap() });
+            }
+            g.trap.open = true;
+            g.trap.toggled = g.round_frame.max(1);
+            (g.clone(), false)
+        });
+        p.sim.wait();
+        let mut frames = 0;
+        while (p.game.fluid.drops.len() as u32) < def.max_drops && frames < 60 * 60 {
+            run(&mut p, 60, 0);
+            frames += 60;
+        }
+        run(&mut p, 600, 0);
+        eprintln!("{} drops", p.game.fluid.drops.len());
+        // the sim thread's step, for comparison
+        let t = std::time::Instant::now();
+        run(&mut p, 120, 0);
+        eprintln!("120 steps on the sim thread: {:.2} ms a step (wall)", t.elapsed().as_secs_f64() * 1000.0 / 120.0);
+        let mut g = p.game.clone();
+        let t = std::time::Instant::now();
+        for _ in 0..120 {
+            let inputs: Vec<u32> = (0..g.num_players).map(|i| if i == 0 { 0 } else { bot::dummy_input(&g, i) }).collect();
+            g.step(&inputs);
+        }
+        eprintln!("the same 120 stepped right here: {:.2} ms a step", t.elapsed().as_secs_f64() * 1000.0 / 120.0);
+        // drawing-thread work: taking in a state (it's moved, not copied), the
+        // blend copy for drawing, and the snapshot for the next blend
+        let n = 200;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let _ = draw::interpolate(&p.game, &p.prev, 0.5);
+        }
+        let interp = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            p.prev = draw::snapshot(&p.game);
+        }
+        let snap = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let _ = p.game.clone();
+        }
+        let clone = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        eprintln!("drawing thread: blend {interp:.3} ms a drawn frame, snapshot {snap:.3} ms a tick; (the copy the sim thread sends back: {clone:.3} ms, on its side)");
+    }
+}
+
+#[cfg(test)]
+mod lobby_shots {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The room screen, as the host sees it and as a guest does, with the
+    /// longest labels the settings have (SHOT_DIR, default here).
+    #[test]
+    #[ignore]
+    fn screenshot_lobby() {
+        let dir = std::env::var("SHOT_DIR").unwrap_or_else(|_| ".".into());
+        let mut server = stickfell_net::RelayServer::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap().to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let th = std::thread::spawn(move || {
+            while !stop2.load(Ordering::Relaxed) {
+                server.poll();
+            }
+        });
+        let mut host = LobbyClient::host(&addr, 8).unwrap();
+        let code = loop {
+            if let LobbyState::InRoom { code, .. } = host.poll() {
+                break code.clone();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let mut guest = LobbyClient::join(&addr, &code).unwrap();
+        while !matches!(guest.poll(), LobbyState::InRoom { players: 2, .. }) {
+            host.poll();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        while !matches!(host.poll(), LobbyState::InRoom { players: 2, .. }) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut h = Room::new(host);
+        let mut g = Room::new(guest);
+        for (name, rules) in [("ffa", lobby::Rules { teams: 0, ai: 6 }), ("teams", lobby::Rules { teams: 2, ai: 1 }), ("short", lobby::Rules { teams: 4, ai: 0 })] {
+            h.sync.set(rules);
+            g.sync.rules = rules;
+            g.sync.heard = true;
+            for (who, room) in [("host", &mut h), ("guest", &mut g)] {
+                let taken = std::mem::replace(room, Room::new(LobbyClient::host(&addr, 8).unwrap()));
+                let mut app = App::new(Screen::Lobby(Box::new(taken)), addr.clone());
+                stickfell_app::capture_headless(&mut app, 1, (1280, 720), format!("{dir}/lobby_{name}_{who}.png").as_ref()).unwrap();
+                let Screen::Lobby(back) = std::mem::replace(&mut app.screen, menu(None)) else { panic!("left the room") };
+                *room = *back;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        th.join().unwrap();
+    }
 }

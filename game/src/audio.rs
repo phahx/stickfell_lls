@@ -66,9 +66,10 @@ fn files(kind: Sfx) -> &'static [&'static [u8]] {
         Sfx::Thud => sounds!("impact_body_ufx_1.ogg", "impact_body_ufx_2.ogg", "blunt_hit_heavy_ufx_1.ogg"),
         Sfx::Saw => sounds!("impact_metal_ufx_1.ogg", "impact_metal_ufx_2.ogg", "impact_metal_ufx_3.ogg"),
         Sfx::Spikes => sounds!("sticky_hit_body_ufx_1.ogg", "sticky_hit_body_ufx_2.ogg"),
-        Sfx::Splash => sounds!("impact_body_ufx_1.ogg"),
+        Sfx::Splash => sounds!("env_water_splash.ogg"),
+        Sfx::Slide => sounds!("env_slide.ogg"),
         // voice lines live in `voice` (see `Voices`)
-        Sfx::Announce | Sfx::Plea | Sfx::Quip | Sfx::Choke | Sfx::ChokeEnd | Sfx::Pain => &[],
+        Sfx::Announce | Sfx::Plea | Sfx::Quip | Sfx::Choke | Sfx::ChokeEnd | Sfx::Pain | Sfx::Burning => &[],
     }
 }
 
@@ -85,11 +86,13 @@ struct Voices {
     choke_end: Vec<Vec<Clip>>,
     /// Per recorded voice: cries of pain (hurt mid-finisher).
     pains: Vec<Vec<Clip>>,
+    /// Per recorded voice: screams while burning in acid or lava.
+    burning: Vec<Vec<Clip>>,
     /// Which line plays, when, and at what pitch (the same for every player).
     lines: Lines,
     /// The line each fighter is saying right now (and what kind), steered
     /// every frame.
-    live: [Option<(Arc<VoiceCtl>, Sfx)>; 4],
+    live: [Option<(Arc<VoiceCtl>, Sfx)>; crate::sim::MAX_PLAYERS],
 }
 
 /// Decides voice lines from the frame they're said on alone, so every
@@ -101,7 +104,7 @@ struct Lines {
     /// Frames heard up to (lines from later frames are still to come).
     heard: u32,
     /// The frame each speaker is free to talk again (no talking over yourself).
-    busy_until: [u32; 4],
+    busy_until: [u32; crate::sim::MAX_PLAYERS],
     /// The last take per (kind, voice), so it isn't picked again next.
     last: std::collections::HashMap<(usize, usize), usize>,
 }
@@ -111,7 +114,7 @@ impl Lines {
     /// pitch, or `None` if the speaker is still talking. `seconds` is each
     /// take's length.
     fn decide(&mut self, frame: u32, e: SfxEvent, voices: usize, seconds: &[f32], ids: &[usize]) -> Option<(usize, f32)> {
-        let slot = e.speaker as usize % 4;
+        let slot = e.speaker as usize % crate::sim::MAX_PLAYERS;
         let fighter = e.kind != Sfx::Announce;
         // (the death rattle cuts in over whatever choke was playing, and
         // pain over anything: they're free to talk again once it's out)
@@ -134,7 +137,7 @@ impl Lines {
         self.last.insert(key, ids[pick]);
         // players sharing a recorded voice are told apart by pitch, and a
         // touch of variety either way
-        let shared = if voices < 4 { [1.0, 0.94, 1.06, 0.97][slot] } else { 1.0 };
+        let shared = if voices < crate::sim::MAX_PLAYERS { [1.0, 0.94, 1.06, 0.97, 1.03, 0.91, 1.09, 0.95][slot] } else { 1.0 };
         let jitter = ((h >> 16) % 1000) as f32 / 1000.0;
         let pitch = if fighter { shared + (jitter - 0.5) * 0.04 } else { 1.0 };
         if fighter {
@@ -155,12 +158,13 @@ fn line_hash(frame: u32, e: SfxEvent) -> u32 {
 }
 
 /// One fighter, as the voice player sees them: where their mouth is, and
-/// whether they're alive and strung up choking.
+/// whether they're alive, strung up choking, or burning.
 #[derive(Clone, Copy, Debug)]
 pub struct Speaker {
     pub mouth: Vec2,
     pub alive: bool,
     pub choking: bool,
+    pub burning: bool,
 }
 
 /// Live controls for one voice line: where it sits (left/right gain and
@@ -197,7 +201,39 @@ impl VoiceCtl {
 fn limited_bus(channels: rodio::ChannelCount, rate: rodio::SampleRate) -> (rodio::mixer::Mixer, Safety<impl Source>) {
     let (bus, mixed) = rodio::mixer::mixer(channels, rate);
     bus.add(rodio::source::Zero::new(channels, rate));
-    (bus, Safety(mixed.limit(rodio::source::LimitSettings::dynamic_content())))
+    (bus, Safety(Guard(mixed).limit(rodio::source::LimitSettings::dynamic_content())))
+}
+
+/// Ahead of the limiter: a sample that isn't a number becomes silence, and
+/// none is let through louder than `GUARD_MAX`. The limiter keeps track of
+/// how loud things have been; one bad sample into that and it never comes
+/// back (measured: a steady tone silent for good after a single NaN).
+struct Guard<S: Source>(S);
+
+/// The loudest a mixed sample may be going into the limiter (18 dB over
+/// full scale: anything past that is a fault, not a loud sound).
+const GUARD_MAX: f32 = 8.0;
+
+impl<S: Source> Iterator for Guard<S> {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        self.0.next().map(|v| if v.is_finite() { v.clamp(-GUARD_MAX, GUARD_MAX) } else { 0.0 })
+    }
+}
+
+impl<S: Source> Source for Guard<S> {
+    fn current_span_len(&self) -> Option<usize> {
+        self.0.current_span_len()
+    }
+    fn channels(&self) -> rodio::ChannelCount {
+        self.0.channels()
+    }
+    fn sample_rate(&self) -> rodio::SampleRate {
+        self.0.sample_rate()
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        self.0.total_duration()
+    }
 }
 
 /// The very last stage before the speakers: whatever the limiter let
@@ -464,6 +500,9 @@ const VOICE_SILENT: f32 = 16.0;
 
 /// Left/right gain for a voice at `pos` heard from `listener`.
 fn voice_gains(pos: Vec2, listener: Vec2, volume: f32) -> (f32, f32) {
+    if !pos.is_finite() || !listener.is_finite() || !volume.is_finite() {
+        return (0.0, 0.0);
+    }
     let d = pos - listener;
     let t = ((d.length() - VOICE_FULL) / (VOICE_SILENT - VOICE_FULL)).clamp(0.0, 1.0);
     let falloff = 1.0 - t * t * (3.0 - 2.0 * t);
@@ -490,6 +529,7 @@ impl Voices {
             chokes: voice::CHOKES.iter().map(|l| all(l)).collect(),
             choke_end: voice::CHOKE_END.iter().map(|l| all(l)).collect(),
             pains: voice::PAINS.iter().map(|l| all(l)).collect(),
+            burning: voice::BURNING.iter().map(|l| all(l)).collect(),
             lines: Lines::default(),
             live: Default::default(),
         }
@@ -557,13 +597,16 @@ fn loudness(kind: Sfx) -> f32 {
         Sfx::SwingHeavy => 0.55,
         Sfx::Pickup | Sfx::Throw | Sfx::Empty => 0.5,
         Sfx::Shot | Sfx::PistolShot => 0.8,
+        // (water is background: one splash 2 m off measured 11.7 dB over
+        // the -32 dBFS it should be, 6 dB under a sword hit there)
+        Sfx::Splash => 0.18,
         Sfx::Announce => 1.0,
-        Sfx::Plea | Sfx::Quip | Sfx::Choke | Sfx::ChokeEnd | Sfx::Pain => 0.85,
+        Sfx::Plea | Sfx::Quip | Sfx::Choke | Sfx::ChokeEnd | Sfx::Pain | Sfx::Burning => 0.85,
         _ => 0.7,
     }
 }
 
-const ALL: [Sfx; 31] = [
+const ALL: [Sfx; 33] = [
     Sfx::Swing,
     Sfx::SwingHeavy,
     Sfx::Stab,
@@ -589,12 +632,14 @@ const ALL: [Sfx; 31] = [
     Sfx::Saw,
     Sfx::Spikes,
     Sfx::Splash,
+    Sfx::Slide,
     Sfx::Announce,
     Sfx::Plea,
     Sfx::Quip,
     Sfx::Choke,
     Sfx::ChokeEnd,
     Sfx::Pain,
+    Sfx::Burning,
 ];
 
 #[derive(Clone, Copy)]
@@ -604,11 +649,169 @@ struct Clip {
     data: &'static [f32],
 }
 
+/// The sounds that never stop, only get louder and quieter: calm water
+/// and bubbling lava near where they are, the drone of being under water,
+/// and the splashing of each fighter swimming.
+const BED_WATER: &[u8] = include_bytes!("../assets/sfx/env_water_loop.ogg");
+const BED_LAVA: &[u8] = include_bytes!("../assets/sfx/env_lava_loop.ogg");
+const BED_UNDER: &[u8] = include_bytes!("../assets/sfx/env_underwater_loop.ogg");
+const BED_SWIM: &[u8] = include_bytes!("../assets/sfx/env_tread_water_loop.ogg");
+
+/// How loud each loop plays at its loudest (as `loudness` does for the
+/// rest; the files are all stored equally loud, tools/envimport.py), and how
+/// much the others are turned down with your head under water. Water is
+/// background: measured, the yard flooding (pour, splashes and loops) heard
+/// from 4 m off the pour is -36 to -37 dBFS, 10 dB under a sword hit 2 m
+/// off at its loudest (-26); the drone under water works out at -40.5.
+const WATER_LOUDNESS: f32 = 0.075;
+const LAVA_LOUDNESS: f32 = 0.35;
+const UNDER_LOUDNESS: f32 = 0.25;
+const SWIM_LOUDNESS: f32 = 0.225;
+const UNDER_DUCK: f32 = 0.3;
+/// How long a loop takes to come up or die away to a new level (s).
+const BED_EASE: f32 = 0.25;
+
+/// What's around the listener this frame, for the loops: the nearest calm
+/// water and hot lava, whether the fighter you're playing has their head
+/// under, and where each fighter swimming is.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Surroundings {
+    pub water: Option<Vec2>,
+    pub lava: Option<Vec2>,
+    pub under: bool,
+    pub swimming: [Option<Vec2>; crate::sim::MAX_PLAYERS],
+}
+
+/// The left/right gain a loop should play at (read on the audio thread).
+#[derive(Default)]
+struct BedCtl {
+    left: AtomicU32,
+    right: AtomicU32,
+}
+
+impl BedCtl {
+    fn set(&self, (l, r): (f32, f32)) {
+        self.left.store(l.to_bits(), Ordering::Relaxed);
+        self.right.store(r.to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// A recording played round and round forever (mixed to mono, starting
+/// `start` of the way in), at the gains in its `BedCtl`, eased over
+/// `BED_EASE` so it swells and fades rather than jumping.
+struct Bed {
+    clip: Clip,
+    at: usize,
+    ctl: Arc<BedCtl>,
+    gain: (f32, f32),
+    ease: f32,
+    out: [f32; 2],
+    side: usize,
+}
+
+impl Bed {
+    fn new(clip: Clip, start: f32, ctl: Arc<BedCtl>) -> Self {
+        let ch = clip.channels.get() as usize;
+        let frames = clip.data.len() / ch;
+        let at = ((frames as f32 * start.fract()) as usize).min(frames.saturating_sub(1)) * ch;
+        let ease = 1.0 - (-1.0 / (BED_EASE * clip.rate.get() as f32)).exp();
+        Self { clip, at, ctl, gain: (0.0, 0.0), ease, out: [0.0; 2], side: 2 }
+    }
+}
+
+impl Iterator for Bed {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        if self.side == 2 {
+            let ch = self.clip.channels.get() as usize;
+            if self.clip.data.len() < ch {
+                return Some(0.0);
+            }
+            let x = self.clip.data[self.at..self.at + ch].iter().sum::<f32>() / ch as f32;
+            self.at += ch;
+            if self.at + ch > self.clip.data.len() {
+                self.at = 0;
+            }
+            let f = |a: &AtomicU32| f32::from_bits(a.load(Ordering::Relaxed));
+            let (l, r) = (f(&self.ctl.left), f(&self.ctl.right));
+            self.gain.0 += (l - self.gain.0) * self.ease;
+            self.gain.1 += (r - self.gain.1) * self.ease;
+            self.out = [x * self.gain.0, x * self.gain.1];
+            self.side = 0;
+        }
+        let v = self.out[self.side];
+        self.side += 1;
+        Some(v)
+    }
+}
+
+impl Source for Bed {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> rodio::ChannelCount {
+        NonZero::new(2).unwrap()
+    }
+    fn sample_rate(&self) -> rodio::SampleRate {
+        self.clip.rate
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// The loops, playing (silently until they're wanted).
+struct Beds {
+    water: Arc<BedCtl>,
+    lava: Arc<BedCtl>,
+    under: Arc<BedCtl>,
+    swim: [Arc<BedCtl>; crate::sim::MAX_PLAYERS],
+}
+
+/// The loops' recordings, decoded.
+struct BedClips {
+    water: Option<Clip>,
+    lava: Option<Clip>,
+    under: Option<Clip>,
+    swim: Option<Clip>,
+}
+
+impl BedClips {
+    fn decode() -> Self {
+        let get = |b: &'static [u8], what: &str| {
+            let c = decode(b);
+            if c.is_none() {
+                eprintln!("[audio] couldn't decode the {what} loop");
+            }
+            c
+        };
+        Self { water: get(BED_WATER, "water"), lava: get(BED_LAVA, "lava"), under: get(BED_UNDER, "under water"), swim: get(BED_SWIM, "swimming") }
+    }
+}
+
+/// Left/right gain for a loop at `pos` heard from `listener`: carried and
+/// panned like the other sounds (see `Audio::play`).
+fn bed_gains(pos: Vec2, listener: Vec2, gain: f32) -> (f32, f32) {
+    if !pos.is_finite() || !listener.is_finite() || !gain.is_finite() {
+        return (0.0, 0.0);
+    }
+    let d = pos - listener;
+    let dist = d.length();
+    if dist > 40.0 {
+        return (0.0, 0.0);
+    }
+    let falloff = 1.0 / (1.0 + (dist / 10.0) * (dist / 10.0));
+    let g = (gain * falloff).min(1.0);
+    let pan = (d.x / 14.0).clamp(-1.0, 1.0);
+    (g * (1.0 - pan.max(0.0) * 0.7), g * (1.0 + pan.min(0.0) * 0.7))
+}
+
 /// Every sound effect and voice line, decoded (the slow part of starting
 /// audio, so it can happen on another thread while the game loads).
 pub struct Sounds {
     clips: Vec<Vec<Clip>>,
     voices: Voices,
+    beds: BedClips,
 }
 
 impl Sounds {
@@ -634,13 +837,13 @@ impl Sounds {
             }
             clips.push(list);
         }
-        Self { clips, voices: Voices::load() }
+        Self { clips, voices: Voices::load(), beds: BedClips::decode() }
     }
 }
 
 pub struct Audio {
     /// The open output (kept alive for as long as the game plays sound).
-    _sink: MixerDeviceSink,
+    _sink: Option<MixerDeviceSink>,
     /// Every sound plays into this, and it goes out through a limiter: a
     /// pile-up of loud hits never goes over full scale (which some drivers
     /// answer by muting everything for a few seconds).
@@ -651,6 +854,8 @@ pub struct Audio {
     seed: u32,
     /// How many of each kind started this frame (stops pile-ups).
     this_frame: [u8; ALL.len()],
+    /// The loops (see `surroundings`).
+    beds: Beds,
     pub volume: f32,
 }
 
@@ -669,8 +874,35 @@ impl Audio {
         sink.log_on_drop(false);
         let (bus, mixed) = limited_bus(sink.config().channel_count(), sink.config().sample_rate());
         sink.mixer().add(mixed);
-        let Sounds { clips, voices } = sounds;
-        Some(Self { _sink: sink, bus, clips, voices, seed: 0x9E37_79B9, this_frame: [0; ALL.len()], volume: MASTER_VOLUME })
+        Some(Self::on(Some(sink), bus, sounds))
+    }
+
+    /// No speakers: the mix comes out of the returned source (tests listen
+    /// to it).
+    #[cfg(test)]
+    fn offline(sounds: Sounds, rate: u32) -> (Self, Safety<impl Source>) {
+        let (bus, mixed) = limited_bus(NonZero::new(2).unwrap(), NonZero::new(rate).unwrap());
+        (Self::on(None, bus, sounds), mixed)
+    }
+
+    /// Playing into `bus`: the loops started (silent until wanted).
+    fn on(sink: Option<MixerDeviceSink>, bus: rodio::mixer::Mixer, sounds: Sounds) -> Self {
+        let Sounds { clips, voices, beds: bed_clips } = sounds;
+        let beds = Beds { water: Arc::default(), lava: Arc::default(), under: Arc::default(), swim: Default::default() };
+        let start = |clip: Option<Clip>, from: f32, ctl: &Arc<BedCtl>| {
+            if let Some(c) = clip {
+                bus.add(Bed::new(c, from, ctl.clone()));
+            }
+        };
+        start(bed_clips.water, 0.0, &beds.water);
+        start(bed_clips.lava, 0.0, &beds.lava);
+        start(bed_clips.under, 0.0, &beds.under);
+        // (every swimmer splashing from a different place in it, so two
+        // never splash in step)
+        for (i, ctl) in beds.swim.iter().enumerate() {
+            start(bed_clips.swim, i as f32 * 0.25, ctl);
+        }
+        Self { _sink: sink, bus, clips, voices, seed: 0x9E37_79B9, this_frame: [0; ALL.len()], beds, volume: MASTER_VOLUME }
     }
 
     fn rand(&mut self) -> u32 {
@@ -683,7 +915,7 @@ impl Audio {
     /// Plays one frame's events as heard from `listener` (the camera).
     /// Who is talking right now, per fighter: what kind of line, and how far
     /// open their mouth is (0..1, following the words).
-    pub fn talking(&self) -> [Option<(Sfx, f32)>; 4] {
+    pub fn talking(&self) -> [Option<(Sfx, f32)>; crate::sim::MAX_PLAYERS] {
         std::array::from_fn(|i| {
             let (ctl, kind) = self.voices.live[i].as_ref()?;
             if ctl.finished.load(Ordering::Relaxed) {
@@ -707,8 +939,9 @@ impl Audio {
             }
             match speakers.get(i) {
                 // (the last gasp goes on after they're gone; a choke stops
-                // the moment they're cut down)
-                Some(s) if (s.alive && (s.choking || *kind != Sfx::Choke)) || *kind == Sfx::ChokeEnd => {
+                // the moment they're cut down, a scream the moment they're
+                // out of what's burning them)
+                Some(s) if (s.alive && (s.choking || *kind != Sfx::Choke) && (s.burning || *kind != Sfx::Burning)) || *kind == Sfx::ChokeEnd => {
                     let (l, r) = voice_gains(s.mouth, listener, self.volume * loudness(Sfx::Quip));
                     ctl.set(l, r, (s.mouth - listener).length());
                 }
@@ -719,6 +952,23 @@ impl Audio {
         // (voice lines come through `speak`, once their frame is final)
         for e in events.iter().filter(|e| !e.kind.is_voice()) {
             self.play(*e, listener);
+        }
+    }
+
+    /// Sets the loops for this frame from what's around `listener` (the
+    /// camera): calm water and bubbling lava from where they are, the drone
+    /// with your head under (everything else dulled under it), splashing
+    /// wherever someone's swimming.
+    pub fn surroundings(&mut self, s: &Surroundings, listener: Vec2) {
+        let v = self.volume;
+        let duck = if s.under { UNDER_DUCK } else { 1.0 };
+        let at = |pos: Option<Vec2>, loud: f32| pos.map_or((0.0, 0.0), |p| bed_gains(p, listener, loud * v * duck));
+        self.beds.water.set(at(s.water, WATER_LOUDNESS));
+        self.beds.lava.set(at(s.lava, LAVA_LOUDNESS));
+        let under = if s.under { UNDER_LOUDNESS * v } else { 0.0 };
+        self.beds.under.set((under, under));
+        for (ctl, pos) in self.beds.swim.iter().zip(s.swimming) {
+            ctl.set(at(pos, SWIM_LOUDNESS));
         }
     }
 
@@ -741,6 +991,11 @@ impl Audio {
     fn play(&mut self, e: SfxEvent, listener: Vec2) {
         let idx = ALL.iter().position(|k| *k == e.kind).unwrap_or(0);
         if self.this_frame[idx] >= 3 || self.clips[idx].is_empty() {
+            return;
+        }
+        // (somewhere that isn't a number: not played at all; it would come
+        // out as NaN gains)
+        if !e.pos.is_finite() || !listener.is_finite() || !e.volume.is_finite() {
             return;
         }
         let d = e.pos - listener;
@@ -780,6 +1035,7 @@ impl Audio {
             Sfx::Choke => pool.extend(v.chokes.get(who).into_iter().flatten()),
             Sfx::ChokeEnd => pool.extend(v.choke_end.get(who).into_iter().flatten()),
             Sfx::Pain => pool.extend(v.pains.get(who).into_iter().flatten()),
+            Sfx::Burning => pool.extend(v.burning.get(who).into_iter().flatten()),
             _ => {
                 // the finisher's own lines twice as likely as the generic ones
                 for c in v.quips.get(who).and_then(|q| q.get(e.variant as usize)).into_iter().flatten() {
@@ -794,7 +1050,7 @@ impl Audio {
         let pool: Vec<Clip> = pool.into_iter().copied().collect();
         if e.kind == Sfx::Pain {
             // hurt: whatever they were saying stops (with or without a cry)
-            if let Some((old, _)) = self.voices.live[e.speaker as usize % 4].take() {
+            if let Some((old, _)) = self.voices.live[e.speaker as usize % crate::sim::MAX_PLAYERS].take() {
                 old.stop.store(true, Ordering::Relaxed);
             }
         }
@@ -810,7 +1066,7 @@ impl Audio {
             self.bus.add(Voice::new(src, ctl, Space::PublicAddress));
             return;
         }
-        let slot = e.speaker as usize % 4;
+        let slot = e.speaker as usize % crate::sim::MAX_PLAYERS;
         let ctl = Arc::new(VoiceCtl::default());
         let (l, r) = voice_gains(e.pos, listener, e.volume * loudness(e.kind) * self.volume);
         if l + r < 0.005 && (e.pos - listener).length() > VOICE_SILENT {
@@ -1067,6 +1323,228 @@ mod voice_tests {
     }
 
     #[test]
+    fn the_loops_decode_and_go_round_easing_to_their_level() {
+        let b = BedClips::decode();
+        for (what, c) in [("water", b.water), ("lava", b.lava), ("under", b.under), ("swim", b.swim)] {
+            let c = c.unwrap_or_else(|| panic!("the {what} loop decodes"));
+            assert!(c.seconds() > 5.0, "{what}: a loop, not a blip ({:.2} s)", c.seconds());
+        }
+        // a tiny loop of known samples: it wraps, and its gain eases in
+        let data: &'static [f32] = Box::leak(vec![0.5f32, -0.5, 0.25].into_boxed_slice());
+        let rate = 1000;
+        let clip = Clip { channels: NonZero::new(1).unwrap(), rate: NonZero::new(rate).unwrap(), data };
+        let ctl = Arc::new(BedCtl::default());
+        ctl.set((1.0, 0.5));
+        let mut bed = Bed::new(clip, 0.0, ctl);
+        let out: Vec<f32> = bed.by_ref().take(2 * (rate as usize) * 2).collect();
+        // (the gain eases up over BED_EASE: after 4 of them it's there)
+        let last = &out[out.len() - 6..];
+        let at = (2 * rate as usize - 3) % 3;
+        let want = [data[at], data[(at + 1) % 3], data[(at + 2) % 3]];
+        for k in 0..3 {
+            assert!((last[2 * k] - want[k]).abs() < 1e-3, "left {} vs {}", last[2 * k], want[k]);
+            assert!((last[2 * k + 1] - want[k] * 0.5).abs() < 1e-3, "right {} vs {}", last[2 * k + 1], want[k] * 0.5);
+        }
+        assert!(out[0].abs() < 0.01, "it fades in rather than starting loud ({})", out[0]);
+    }
+
+    /// Dev tool: rapid gunfire through the real mixer and limiter, offline:
+    /// how loud it comes out over time, how hard the limiter pulls it down,
+    /// and how fast it mixes against real time.
+    #[test]
+    #[ignore]
+    fn measure_gunfire_mix() {
+        let sounds = Sounds::decode();
+        let rate = 48_000u32;
+        let ch = NonZero::new(2).unwrap();
+        let (bus, mut out) = limited_bus(ch, NonZero::new(rate).unwrap());
+        let (raw_bus, mut raw) = rodio::mixer::mixer(ch, NonZero::new(rate).unwrap());
+        raw_bus.add(rodio::source::Zero::new(ch, NonZero::new(rate).unwrap()));
+        let clips = |k: Sfx| sounds.clips[ALL.iter().position(|x| *x == k).unwrap()].clone();
+        let every: usize = std::env::var("FIRE_EVERY").ok().map_or(14, |v| v.parse().unwrap());
+        // (two shooters 3 m off: each shot, its bang, a ricochet and a hit, as `play` would)
+        let gain = |k: Sfx| MASTER_VOLUME * loudness(k) / (1.0 + 0.3 * 0.3);
+        let seconds = 4.0;
+        let frames = (seconds * 60.0) as usize;
+        let per = rate as usize * 2 / 60;
+        let (mut peak, mut lo_rms, mut hi_gr) = (0.0f32, f32::MAX, 0.0f32);
+        let t = std::time::Instant::now();
+        let mut rows = Vec::new();
+        for f in 0..frames {
+            if f % every == 0 || (f + every / 2) % every == 0 {
+                for k in [Sfx::PistolShot, Sfx::Ricochet, Sfx::BulletHit] {
+                    let c = clips(k)[f % clips(k).len()];
+                    let g = gain(k);
+                    for b in [&bus, &raw_bus] {
+                        let src = StaticSamplesBuffer::new(c.channels, c.rate, c.data);
+                        b.add(ChannelVolume::new(src, vec![g, g]));
+                    }
+                }
+            }
+            let (mut sum_o, mut sum_r, mut pk) = (0.0f32, 0.0f32, 0.0f32);
+            for _ in 0..per {
+                let o = out.next().unwrap();
+                let r = raw.next().unwrap_or(0.0);
+                sum_o += o * o;
+                sum_r += r * r;
+                pk = pk.max(o.abs());
+            }
+            let (ro, rr) = ((sum_o / per as f32).sqrt(), (sum_r / per as f32).sqrt());
+            let gr = if rr > 1e-4 { 20.0 * (rr / ro.max(1e-9)).log10() } else { 0.0 };
+            peak = peak.max(pk);
+            hi_gr = hi_gr.max(gr);
+            if f > 30 {
+                lo_rms = lo_rms.min(ro);
+            }
+            if f % 6 == 0 {
+                rows.push(format!("{:4.2}s out {:5.1} dBFS (peak {:5.1}), unlimited {:5.1} dBFS, limiter -{gr:4.1} dB", f as f32 / 60.0, 20.0 * ro.max(1e-9).log10(), 20.0 * pk.max(1e-9).log10(), 20.0 * rr.max(1e-9).log10()));
+            }
+        }
+        let took = t.elapsed().as_secs_f64();
+        for r in rows {
+            eprintln!("{r}");
+        }
+        eprintln!("shots every {every} frames: peak out {:.1} dBFS, most the limiter pulled down {hi_gr:.1} dB, quietest 1/60 s after the start {:.1} dBFS; mixed {seconds} s (twice: limited and raw) in {:.3} s", 20.0 * peak.log10(), 20.0 * lo_rms.max(1e-9).log10(), took);
+    }
+
+    /// One sample that isn't a number into the mix, then a steady tone: the
+    /// rest of the mix carries on.
+    #[test]
+    fn a_bad_sample_never_silences_the_mix() {
+        let rate = NonZero::new(48_000u32).unwrap();
+        let ch = NonZero::new(2).unwrap();
+        let (bus, mut out) = limited_bus(ch, rate);
+        let tone: &'static [f32] = Box::leak((0..48_000 * 4).map(|i| (i as f32 * 0.05).sin() * 0.3).collect::<Vec<_>>().into_boxed_slice());
+        bus.add(ChannelVolume::new(StaticSamplesBuffer::new(NonZero::new(1).unwrap(), rate, tone), vec![1.0, 1.0]));
+        let bad: &'static [f32] = Box::leak(vec![f32::NAN; 4].into_boxed_slice());
+        for half in 0..8 {
+            if half == 2 {
+                bus.add(ChannelVolume::new(StaticSamplesBuffer::new(NonZero::new(1).unwrap(), rate, bad), vec![1.0, 1.0]));
+            }
+            let n = 48_000; // half a second, stereo
+            let rms = ((0..n).map(|_| out.next().unwrap().powi(2)).sum::<f32>() / n as f32).sqrt();
+            let db = 20.0 * rms.max(1e-9).log10();
+            eprintln!("{:.1}-{:.1} s{}: {db:.1} dBFS", half as f32 * 0.5, half as f32 * 0.5 + 0.5, if half == 2 { " (a NaN goes in)" } else { "" });
+            assert!(db > -20.0, "the tone carries on ({db:.1} dBFS)");
+        }
+        assert_eq!(voice_gains(Vec2::NAN, Vec2::ZERO, 1.0), (0.0, 0.0));
+        assert_eq!(bed_gains(Vec2::new(1.0, f32::NAN), Vec2::ZERO, 1.0), (0.0, 0.0));
+    }
+
+    /// Dev tool: a volley of shots (and a voice line, with its room), then
+    /// quiet: how long the mix takes for each 0.1 s it hands the speakers, and
+    /// whether anything in it is left decaying through denormal numbers.
+    #[test]
+    #[ignore]
+    fn measure_mix_cost_after_a_volley() {
+        let sounds = Sounds::decode();
+        let rate = NonZero::new(48_000u32).unwrap();
+        let ch = NonZero::new(2).unwrap();
+        let (bus, mut out) = limited_bus(ch, rate);
+        let shot = sounds.clips[ALL.iter().position(|x| *x == Sfx::PistolShot).unwrap()][0];
+        for k in 0..12 {
+            // (all within the first 0.2 s, stacked)
+            let pad: Vec<f32> = vec![0.0; k * 800 * shot.channels.get() as usize];
+            let data: &'static [f32] = Box::leak([pad.as_slice(), shot.data].concat().into_boxed_slice());
+            bus.add(ChannelVolume::new(StaticSamplesBuffer::new(shot.channels, shot.rate, data), vec![0.6, 0.6]));
+        }
+        if let Some(line) = sounds.voices.burning.iter().flatten().next().copied() {
+            let ctl = Arc::new(VoiceCtl::default());
+            ctl.set(0.8, 0.8, 4.0);
+            bus.add(Voice::new(StaticSamplesBuffer::new(line.channels, line.rate, line.data), ctl, Space::Arena));
+        }
+        let chunk = 48_000 * 2 / 10;
+        let mut worst = 0.0f64;
+        for i in 0..100 {
+            let t = std::time::Instant::now();
+            let mut tiny = 0usize;
+            let mut level = 0.0f32;
+            for _ in 0..chunk {
+                let v = out.next().unwrap();
+                if v != 0.0 && v.abs() < f32::MIN_POSITIVE {
+                    tiny += 1;
+                }
+                level = level.max(v.abs());
+            }
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            worst = worst.max(ms);
+            if i % 5 == 0 || ms > 20.0 {
+                eprintln!("{:4.1}-{:4.1} s: mixed in {ms:6.2} ms (real time 100 ms), peak {level:.2e}, {tiny} denormal samples out", i as f32 / 10.0, i as f32 / 10.0 + 0.1);
+            }
+        }
+        eprintln!("worst 0.1 s took {worst:.2} ms to mix");
+    }
+
+    /// Loudness of `n` samples off the mix: RMS and peak, dBFS.
+    fn listen(out: &mut impl Iterator<Item = f32>, n: usize) -> (f32, f32) {
+        let (mut sum, mut peak) = (0.0f32, 0.0f32);
+        for _ in 0..n {
+            let v = out.next().unwrap_or(0.0);
+            sum += v * v;
+            peak = peak.max(v.abs());
+        }
+        (20.0 * (sum / n as f32).sqrt().max(1e-9).log10(), 20.0 * peak.max(1e-9).log10())
+    }
+
+    /// Dev tool: the yard flooding, heard from its floor near the pour,
+    /// against a sword hit 2 m off: how loud the water is in the real mix.
+    #[test]
+    #[ignore]
+    fn measure_water_loudness() {
+        use stickfell_net::RollbackGame;
+        let rate = 48_000u32;
+        let frame = rate as usize * 2 / 60;
+        // the reference: one sword hit, 2 m away, its loudest 0.25 s
+        let (mut a, mut out) = Audio::offline(Sounds::decode(), rate);
+        a.play(SfxEvent { kind: Sfx::HitBlade, pos: Vec2::new(2.0, 0.0), volume: 1.0, variant: 0, speaker: 0 }, Vec2::ZERO);
+        let hit = (0..8).map(|_| listen(&mut out, rate as usize / 2)).fold((f32::MIN, f32::MIN), |m, v| (m.0.max(v.0), m.1.max(v.1)));
+        eprintln!("sword hit 2 m off: loudest half second {:.1} dBFS RMS, peak {:.1}", hit.0, hit.1);
+        let (mut a, mut out) = Audio::offline(Sounds::decode(), rate);
+        a.play(SfxEvent { kind: Sfx::Splash, pos: Vec2::new(2.0, 0.0), volume: 1.0, variant: 0, speaker: 0 }, Vec2::ZERO);
+        let sp = (0..8).map(|_| listen(&mut out, rate as usize / 2)).fold((f32::MIN, f32::MIN), |m, v| (m.0.max(v.0), m.1.max(v.1)));
+        eprintln!("one splash (volume 1) 2 m off: loudest half second {:.1} dBFS RMS, peak {:.1} (loudness {})", sp.0, sp.1, loudness(Sfx::Splash));
+        // the flood (WATER_PART: "beds" only the loops, "splashes" only the one-shots)
+        let part = std::env::var("WATER_PART").unwrap_or_default();
+        let (mut a, mut out) = Audio::offline(Sounds::decode(), rate);
+        let mut g = crate::sim::GameState::new(4, crate::level::TRAINING, 7);
+        let def = g.trap.def.unwrap();
+        g.trap.open = true;
+        g.trap.toggled = g.round_frame.max(1);
+        let cam = Vec2::new(def.hatch.x + 4.0, 1.5);
+        let mut per_kind = std::collections::BTreeMap::<String, (u32, f32)>::new();
+        let mut secs = Vec::new();
+        let (mut sum, mut peak, mut n) = (0.0f32, 0.0f32, 0usize);
+        for k in 1..=60 * 30u32 {
+            g.step(&[0, 0, 0, 0]);
+            for e in g.events.iter().filter(|e| matches!(e.kind, Sfx::Splash | Sfx::HitHeavy)) {
+                let c = per_kind.entry(format!("{:?}", e.kind)).or_default();
+                c.0 += 1;
+                c.1 = c.1.max(e.volume);
+            }
+            // (only the water: the rest of the yard's noise left out)
+            let water: Vec<SfxEvent> = g.events.iter().copied().filter(|e| e.kind == Sfx::Splash).collect();
+            if part != "beds" {
+                a.play_frame(&water, cam, &crate::speakers(&g));
+            }
+            if part != "splashes" {
+                a.surroundings(&crate::surroundings(&g, 0, cam), cam);
+            }
+            for _ in 0..frame {
+                let v = out.next().unwrap_or(0.0);
+                sum += v * v;
+                peak = peak.max(v.abs());
+                n += 1;
+            }
+            if k % 120 == 0 {
+                secs.push(format!("{:.0}", 20.0 * (sum / n as f32).sqrt().max(1e-9).log10()));
+                (sum, n) = (0.0, 0);
+            }
+        }
+        eprintln!("water sounds ({part}) while the yard floods (from 4 m off the pour), RMS every 2 s, dBFS: {}; peak {:.1}", secs.join(" "), 20.0 * peak.max(1e-9).log10());
+        eprintln!("water sound events over 30 s: {per_kind:?}");
+    }
+
+    #[test]
     fn voices_only_carry_so_far() {
         let here = Vec2::ZERO;
         let (l, r) = voice_gains(Vec2::new(3.0, 0.0), here, 1.0);
@@ -1083,14 +1561,15 @@ mod voice_tests {
         let v = Voices::load();
         let listed = |l: &[&[u8]]| l.len();
         assert_eq!(v.announce.len(), crate::voice::ANNOUNCE.len(), "a slot per finisher");
-        assert_eq!(crate::voice::ANNOUNCE.len(), crate::weapon::Finish::Pin as usize + 1, "voice.rs is out of date with the finishers");
+        assert_eq!(crate::voice::ANNOUNCE.len(), crate::weapon::Finish::Stomp as usize + 1, "voice.rs is out of date with the finishers");
         assert_eq!(v.announce.iter().map(|l| l.len()).sum::<usize>(), crate::voice::ANNOUNCE.iter().map(|l| listed(l)).sum::<usize>());
         assert_eq!(v.quips.len(), crate::voice::QUIPS.len());
         assert_eq!(v.chokes.iter().map(|l| l.len()).sum::<usize>(), crate::voice::CHOKES.iter().map(|l| listed(l)).sum::<usize>());
         assert_eq!(v.choke_end.iter().map(|l| l.len()).sum::<usize>(), crate::voice::CHOKE_END.iter().map(|l| listed(l)).sum::<usize>());
         assert_eq!(v.pleas.iter().map(|l| l.len()).sum::<usize>(), crate::voice::PLEAS.iter().map(|l| listed(l)).sum::<usize>());
+        assert_eq!(v.burning.iter().map(|l| l.len()).sum::<usize>(), crate::voice::BURNING.iter().map(|l| listed(l)).sum::<usize>());
         assert!(v.quips.iter().all(|p| p.len() == crate::voice::ANNOUNCE.len()));
-        for c in v.announce.iter().flatten().chain(v.quips.iter().flatten().flatten()).chain(v.quips_any.iter().flatten()).chain(v.pleas.iter().flatten()).chain(v.chokes.iter().flatten()).chain(v.choke_end.iter().flatten()) {
+        for c in v.announce.iter().flatten().chain(v.quips.iter().flatten().flatten()).chain(v.quips_any.iter().flatten()).chain(v.pleas.iter().flatten()).chain(v.chokes.iter().flatten()).chain(v.choke_end.iter().flatten()).chain(v.burning.iter().flatten()) {
             let s = c.seconds();
             assert!((0.2..4.0).contains(&s), "voice line {s:.2} s long");
         }

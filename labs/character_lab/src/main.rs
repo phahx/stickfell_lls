@@ -28,8 +28,12 @@ mod fighter;
 mod input;
 #[path = "../../../game/src/level.rs"]
 mod level;
+#[path = "../../../game/src/liquid.rs"]
+mod liquid;
 #[path = "../../../game/src/sfx.rs"]
 mod sfx;
+#[path = "../../../game/src/steam.rs"]
+mod steam;
 #[path = "../../../game/src/sim.rs"]
 mod sim;
 #[path = "../../../game/src/voice.rs"]
@@ -279,7 +283,7 @@ impl Game for Lab {
                 .game
                 .fighters
                 .iter()
-                .map(|f| audio::Speaker { mouth: f.pos(&self.game.world, fighter::HEAD), alive: f.alive, choking: f.choking })
+                .map(|f| audio::Speaker { mouth: f.pos(&self.game.world, fighter::HEAD), alive: f.alive, choking: f.choking, burning: f.burning })
                 .collect();
             a.play_frame(&self.game.events, self.cam, &speakers);
             a.speak(&self.game.voice_log, self.game.frame, self.cam);
@@ -303,10 +307,8 @@ impl Game for Lab {
         let mut hud = Hud {
             local: Some(0),
             mouse: (!self.headless).then_some(self.mouse),
-            trail: frame.mouse_trail.clone(),
-            show_help: false,
             zoom: self.cam_h,
-            talk: self.audio.as_ref().map_or([None; 4], |a| a.talking()),
+            talk: self.audio.as_ref().map_or([None; sim::MAX_PLAYERS], |a| a.talking()),
             skin: self.skin(),
             capsules: !self.opts.skin,
             ..Default::default()

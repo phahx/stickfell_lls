@@ -9,7 +9,8 @@ ElevenLabs) into the game, replacing whatever was there.
 
 Files must be named as on the voice script (announce_spin, p0_plea_3,
 p0_quip_spine_0, ...; hanging: p0_hanging_choke_0, _1, ... looped, and
-p0_hanging_choke_end for the death; cries of pain: p0_pain_0, _1, ...), in any format libsndfile reads (MP3, WAV, OGG, FLAC).
+p0_hanging_choke_end for the death; cries of pain: p0_pain_0, _1, ...;
+screams while burning in acid or lava, looped: p0_plea_burning_0, _1, ...), in any format libsndfile reads (MP3, WAV, OGG, FLAC).
 Extra takes like p0_quip_spine_2 are fine. Each clip gets its silence
 trimmed and its level evened out, is saved as OGG in game/assets/voice, and
 game/src/voice.rs is rewritten to list exactly what's there.
@@ -25,7 +26,7 @@ import soundfile as sf
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import voicelines as vl  # noqa: E402
 
-NAME = re.compile(r"^(announce_(%s)|p\d+_(plea_\d+|pain_\d+|quip_any_\d+|quip_(%s)_\d+|hanging_choke_(\d+|end)))$" % ("|".join(vl.FINISHERS), "|".join(vl.FINISHERS)))
+NAME = re.compile(r"^(announce_(%s)|p\d+_(plea_\d+|plea_burning_\d+|pain_\d+|quip_any_\d+|quip_(%s)_\d+|hanging_choke_(\d+|end)))$" % ("|".join(vl.FINISHERS), "|".join(vl.FINISHERS)))
 AUDIO = (".mp3", ".wav", ".ogg", ".flac")
 FIN = "|".join(vl.FINISHERS)
 

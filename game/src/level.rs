@@ -54,12 +54,17 @@ pub struct RopeDef {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HazardKind {
-    /// A bed of spikes (rect `a` +- `size`): hurts on touch, more on a hard landing.
+    /// A bed of spikes (rect `a` +- `size`): a base plate and a row of teeth
+    /// (see [`HazardDef::teeth`]), each solid; touching one hurts, landing on
+    /// its point far more.
     Spikes,
     /// A spinning blade of radius `size.x`, sliding between `a` and `b`.
     Saw,
-    /// A vat of acid (rect `a` +- `size`): burns and slows.
+    /// Liquids (rect `a` +- `size`, its top the surface): see
+    /// [`crate::liquid`] for how each looks and behaves.
     Acid,
+    Water,
+    Lava,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -72,7 +77,69 @@ pub struct HazardDef {
     pub speed: f32,
 }
 
+/// A spike's collision box carries this tag (so it isn't drawn, grabbed or
+/// stuck into as level geometry).
+pub const SPIKE_TAG: u32 = 1;
+/// A spike bed's base plate carries this one (an impaled body still lies on it).
+pub const SPIKE_PLATE_TAG: u32 = 2;
+/// Is this static part of a spike bed?
+pub fn is_spike(tag: u32) -> bool {
+    tag == SPIKE_TAG || tag == SPIKE_PLATE_TAG
+}
+/// Teeth along a spike bed, as the kit's spike strip has them (8 to a metre).
+pub const SPIKE_SPACING: f32 = 0.125;
+/// A tooth's point and the top of the base plate, as shares of the bed's
+/// height (measured off the kit's spike strip).
+const SPIKE_TIP: f32 = 0.896;
+const SPIKE_PLATE: f32 = 0.167;
+/// How wide a tooth's solid core is (half, m): things rest on its point.
+pub const SPIKE_CORE: f32 = 0.012;
+
+/// One spike: from the middle of its base on the plate up to its point, and
+/// half its width at the base (it narrows to nothing at the point).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tooth {
+    pub base: Vec2,
+    pub tip: Vec2,
+    pub half_width: f32,
+}
+
+impl Tooth {
+    /// Whether a body part of radius `r` at `p` touches this spike, and how
+    /// far up it (0 at the base .. 1 at the point).
+    pub fn touch(&self, p: Vec2, r: f32) -> Option<f32> {
+        let up = self.tip.y - self.base.y;
+        if up <= 0.0 || p.y > self.tip.y + r || p.y < self.base.y - r {
+            return None;
+        }
+        let t = ((p.y - self.base.y) / up).clamp(0.0, 1.0);
+        ((p.x - self.tip.x).abs() <= self.half_width * (1.0 - t) + r).then_some(t)
+    }
+}
+
 impl HazardDef {
+    /// A spike bed's teeth, evenly along it, the first half a gap in.
+    pub fn teeth(&self) -> Vec<Tooth> {
+        if self.kind != HazardKind::Spikes {
+            return Vec::new();
+        }
+        let (bottom, h) = (self.a.y - self.size.y, self.size.y * 2.0);
+        let n = ((self.size.x * 2.0) / SPIKE_SPACING).round().max(1.0) as usize;
+        let left = self.a.x - self.size.x + SPIKE_SPACING * 0.5;
+        (0..n)
+            .map(|i| {
+                let x = left + i as f32 * SPIKE_SPACING;
+                Tooth { base: Vec2::new(x, bottom + h * SPIKE_PLATE), tip: Vec2::new(x, bottom + h * SPIKE_TIP), half_width: SPIKE_SPACING * 0.5 }
+            })
+            .collect()
+    }
+
+    /// A spike bed's base plate (centre, half size).
+    pub fn plate(&self) -> (Vec2, Vec2) {
+        let (bottom, h) = (self.a.y - self.size.y, self.size.y * 2.0);
+        (Vec2::new(self.a.x, bottom + h * SPIKE_PLATE * 0.5), Vec2::new(self.size.x, h * SPIKE_PLATE * 0.5))
+    }
+
     /// Where a saw's hub is at `frame` (others never move).
     pub fn center(&self, frame: u32) -> Vec2 {
         if self.a == self.b {
@@ -141,6 +208,8 @@ pub struct LevelDef {
     /// Practice yard: one of every weapon on the rack, no drops, and the round
     /// only resets when the player or all the dummies are down for good.
     pub training: bool,
+    /// A flood trap (practice only).
+    pub trap: Option<TrapDef>,
     pub bg: u32,
     pub ambient: [f32; 3],
 }
@@ -187,20 +256,63 @@ fn acid(cx: f32, cy: f32, hx: f32, hy: f32) -> HazardDef {
     HazardDef { kind: HazardKind::Acid, a: v(cx, cy), b: v(cx, cy), size: v(hx, hy), speed: 0.0 }
 }
 
-#[allow(dead_code)] // no current map has saws
+/// A pool from `x0` to `x1`, from `bottom` up to its surface at `top`.
+fn pool(kind: HazardKind, x0: f32, x1: f32, bottom: f32, top: f32) -> HazardDef {
+    let (a, size) = (v((x0 + x1) * 0.5, (bottom + top) * 0.5), v((x1 - x0) * 0.5, (top - bottom) * 0.5));
+    HazardDef { kind, a, b: a, size, speed: 0.0 }
+}
+
 fn saw(a: Vec2, b: Vec2, radius: f32, speed: f32) -> HazardDef {
     HazardDef { kind: HazardKind::Saw, a, b, size: v(radius, radius), speed }
 }
 
+/// A lever that opens a hatch in the ceiling and lets a flood of water in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrapDef {
+    /// The lever's pivot (on a floor).
+    pub lever: Vec2,
+    /// The middle of the hatch (on the ceiling's underside), and half its width.
+    pub hatch: Vec2,
+    pub hatch_half: f32,
+    /// How fast the water comes in while the hatch is open (drops a
+    /// second), and how much liquid the level can hold before it stops
+    /// (drops in all, pools included: what the liquid can be simulated at).
+    pub pour_rate: f32,
+    pub max_drops: u32,
+}
+
+impl TrapDef {
+    /// Where the lever's handle ends, `pulled` 0 (up and back) .. 1 (over).
+    pub fn handle(&self, pulled: f32) -> Vec2 {
+        let ang = 2.2 - 1.4 * pulled.clamp(0.0, 1.0);
+        self.lever + stickfell_physics::dmath::dir(ang) * 0.55
+    }
+}
+
 /// The arenas online matches rotate through (the training yard comes after them).
-pub const ARENAS: usize = 4;
+pub const ARENAS: usize = 5;
+/// Index of the eight-player arena in `levels()`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const GAUNTLET: usize = 4;
 /// Index of the practice yard in `levels()`.
-pub const TRAINING: usize = 4;
+pub const TRAINING: usize = 5;
 /// Index of the art test level (a practice yard built from the level kit).
-pub const ART_TEST: usize = 5;
+pub const ART_TEST: usize = 6;
+
+/// The arena after `now` in the rotation with a spawn for each of
+/// `fighters` (the big ones only, with more than four).
+pub fn next_arena(now: usize, fighters: usize) -> usize {
+    let lv = levels();
+    (1..=ARENAS).map(|k| (now + k) % ARENAS).find(|&i| lv[i].spawns.len() >= fighters).unwrap_or(0)
+}
+
+/// The arena a match starts in (from its seed).
+pub fn first_arena(seed: u32, fighters: usize) -> usize {
+    next_arena((seed as usize % ARENAS + ARENAS - 1) % ARENAS, fighters)
+}
 
 pub fn levels() -> Vec<LevelDef> {
-    vec![foundry(), rooftops(), keep(), brickworks(), training_yard(), art_test()]
+    vec![foundry(), rooftops(), keep(), brickworks(), gauntlet(), training_yard(), art_test()]
 }
 
 const STONE: u32 = 0x3a3f4b;
@@ -298,6 +410,7 @@ fn foundry() -> LevelDef {
         art: vec![],
         training: false,
         bg: 0x5a6070,
+        trap: None,
         ambient: [0.15, 0.16, 0.21],
     }
 }
@@ -391,6 +504,7 @@ fn rooftops() -> LevelDef {
         art: vec![],
         training: false,
         bg: 0x1a2030,
+        trap: None,
         ambient: [0.09, 0.10, 0.16],
     }
 }
@@ -474,7 +588,181 @@ fn keep() -> LevelDef {
         art: vec![],
         training: false,
         bg: 0x161a26,
+        trap: None,
         ambient: [0.15, 0.14, 0.17],
+    }
+}
+
+/// The Gauntlet's pools: (left, right, bottom, surface) of each.
+pub const GAUNTLET_POOL: (f32, f32, f32, f32) = (-32.0, -28.0, -3.35, -0.35);
+pub const GAUNTLET_LAVA_A: (f32, f32, f32, f32) = (-26.5, -23.0, -1.75, -0.45);
+pub const GAUNTLET_LAVA_B: (f32, f32, f32, f32) = (21.0, 28.0, -1.7, -0.5);
+pub const GAUNTLET_WELL: (f32, f32, f32, f32) = (31.0, 34.0, -3.5, -0.6);
+
+/// An arena for up to eight (88 x 24 m), with every hazard in it, each
+/// more than one way. From the left:
+///
+/// - a steel tower with the flood lever on top, climbed by wall-jumping up
+///   a chimney beside it (the hatch is over the open floor further in);
+/// - a deep pool to dive into off a ledge, a wall, and a lava pit with a
+///   long rope hung over it (the flood boils off on it);
+/// - open floor with crates, and a low platform a light log swings across;
+/// - a trench of spikes, with a short rope over it;
+/// - the stage in the middle, a heavy wrecking ball swinging through it;
+/// - a shallow trough of acid to wade or hop across on two stones;
+/// - a saw rising and falling through a gap in a walkway, and the floor
+///   under it;
+/// - a wide lava pit with a bridge a saw runs back and forth along;
+/// - a deep, narrow well of acid with a rope over it;
+/// - a ledge with spikes along its middle over a saw sunk in the floor;
+/// - a second steel tower.
+///
+/// Walkways run along above (3.5 m apart, a double jump), the highest
+/// under the ceiling, and lamps hang from it.
+fn gauntlet() -> LevelDef {
+    let r = |x0: f32, y0: f32, x1: f32, y1: f32, color: u32| b((x0 + x1) * 0.5, (y0 + y1) * 0.5, (x1 - x0) * 0.5, (y1 - y0) * 0.5, color);
+    // (a walkway: 0.44 m thick, its top at `top`)
+    let walk = |x0: f32, x1: f32, top: f32| platform((x0 + x1) * 0.5, top - 0.22, (x1 - x0) * 0.5, WOODC);
+    let (wet, lava_a, lava_b, well) = (GAUNTLET_POOL, GAUNTLET_LAVA_A, GAUNTLET_LAVA_B, GAUNTLET_WELL);
+    let base = -8.0;
+    let pit = 0x34383f;
+    let boxes = vec![
+        // walls and ceiling
+        r(-45.0, base, -44.0, 17.0, STONE),
+        r(44.0, base, 45.0, 17.0, STONE),
+        r(-44.0, 16.0, 44.0, 17.0, STONE),
+        // the lever's tower, and the column making a chimney beside it
+        // (3 m across, open underneath to walk in)
+        r(-44.0, base, -40.0, 8.0, STEEL),
+        r(-37.0, 3.0, -36.0, 8.0, STEEL),
+        r(-40.0, base, wet.0, 0.0, STONE),
+        // the pool, the wall, the first lava pit, and the dive ledge
+        r(wet.0, base, wet.1, wet.2, pit),
+        r(wet.1, base, lava_a.0, 0.0, STONE),
+        r(lava_a.0, base, lava_a.1, lava_a.2, pit),
+        walk(-32.5, -29.0, 4.0),
+        // open floor, crates, the low platform and the log's beam above it
+        r(lava_a.1, base, -11.0, 0.0, STONE),
+        r(-14.0, 0.0, -13.0, 1.0, WOODC),
+        r(-13.0, 0.0, -12.5, 0.5, WOODC),
+        walk(-19.5, -14.5, 3.5),
+        walk(-20.0, -13.0, 11.0),
+        // the spike trench and the walkway over it
+        r(-11.0, base, -6.0, -2.5, pit),
+        walk(-11.0, -6.0, 7.5),
+        // the stage, and the wrecking ball's beam
+        r(-6.0, base, 6.0, 0.0, STONE),
+        r(-3.5, 0.0, 3.5, 1.0, STEEL),
+        walk(-3.0, 3.0, 12.0),
+        // the acid trough, its two stones, and the walkway over it
+        r(6.0, base, 13.0, -1.2, pit),
+        r(8.0, -1.2, 9.0, 0.5, STONE),
+        r(10.0, -1.2, 11.0, 0.5, STONE),
+        walk(6.5, 12.5, 7.5),
+        // the saw's shaft between two walkways, the long one up top
+        r(13.0, base, lava_b.0, 0.0, STONE),
+        walk(13.0, 15.5, 4.0),
+        walk(17.5, lava_b.0, 4.0),
+        walk(15.0, 26.0, 11.0),
+        // the second lava pit and its bridge
+        r(lava_b.0, base, lava_b.1, lava_b.2, pit),
+        walk(22.5, 26.5, 2.5),
+        // the acid well, the walkway by it
+        r(lava_b.1, base, well.0, 0.0, STONE),
+        r(well.0, base, well.1, well.2, pit),
+        walk(27.5, 31.0, 7.5),
+        // the spiked ledge over the sunk saw, and the last tower
+        r(well.1, base, 40.0, 0.0, STONE),
+        walk(35.0, 39.5, 3.5),
+        r(40.0, base, 44.0, 7.0, STEEL),
+    ];
+    // the back wall: plain, with faint uprights and a rail (nothing to
+    // take the eye off the fighters)
+    let mut decor = vec![d(0.0, 4.0, 44.0, 12.0, 0x2a2e38, 0.0)];
+    for i in -5..=5 {
+        decor.push(d(i as f32 * 8.0, 4.0, 0.25, 12.0, 0x262a33, 0.0));
+    }
+    decor.push(d(0.0, 9.0, 44.0, 0.1, 0x262a33, 0.0));
+    // the sunk saw's slot: the floor in front of its lower half
+    decor.push(front(d(37.0, -0.6, 1.0, 0.6, STONE, 0.0)));
+    // a stripe on each tower
+    decor.push(front(d(-42.0, 6.0, 2.0, 0.12, 0xd8a530, 0.0)));
+    decor.push(front(d(42.0, 5.0, 2.0, 0.12, 0xd8a530, 0.0)));
+    let lamp_at = |x: f32, len: f32| LampDef { intensity: 1.6, radius: 10.0, ..lamp(x, 16.0, len, 0xffd8a0) };
+    LevelDef {
+        name: "Gauntlet",
+        boxes,
+        lamps: vec![lamp_at(-36.5, 3.0), lamp_at(-9.0, 2.5), lamp_at(9.5, 2.5), lamp_at(36.0, 3.0)],
+        // a long rope over the first lava pit, a short one over the
+        // spikes, one up to the high walkway, one over the acid well
+        ropes: vec![rope(-24.5, 16.0, 11.0), rope(-8.5, 7.06, 3.5), rope(13.75, 16.0, 6.0), rope(33.0, 16.0, 8.0)],
+        hazards: vec![
+            pool(HazardKind::Water, wet.0, wet.1, wet.2, wet.3),
+            pool(HazardKind::Lava, lava_a.0, lava_a.1, lava_a.2, lava_a.3),
+            spikes(-8.5, -2.5 + 0.1875, 2.5, 0.1875),
+            // (the trough in three, round its stones)
+            pool(HazardKind::Acid, 6.0, 8.0, -1.2, -0.45),
+            pool(HazardKind::Acid, 9.0, 10.0, -1.2, -0.45),
+            pool(HazardKind::Acid, 11.0, 13.0, -1.2, -0.45),
+            saw(v(16.5, 1.0), v(16.5, 6.5), 0.8, 0.03),
+            pool(HazardKind::Lava, lava_b.0, lava_b.1, lava_b.2, lava_b.3),
+            saw(v(22.9, 3.2), v(26.1, 3.2), 0.6, 0.02),
+            pool(HazardKind::Acid, well.0, well.1, well.2, well.3),
+            spikes(37.0, 3.5 + 0.1875, 1.0, 0.1875),
+            saw(v(37.0, -0.1), v(37.0, -0.1), 0.9, 0.0),
+        ],
+        // a light log over the low platform, a heavy ball through the stage
+        balls: vec![
+            BallDef { anchor: v(-16.5, 10.56), length: 5.2, radius: 0.45, mass: 8.0, swing: 5.0, color: 0x6b4a2e },
+            BallDef { anchor: v(0.0, 11.56), length: 8.6, radius: 0.75, mass: 40.0, swing: 7.0, color: 0x767c88 },
+        ],
+        lights: vec![
+            light(0.0, 15.0, 70.0, 0xe8ecff, 0.45),
+            light(-24.5, 0.5, 7.0, 0xff5a10, 1.5),
+            light(24.5, 0.5, 8.0, 0xff5a10, 1.6),
+            LightDef { spot: Some((v(0.5, -0.85), 0.6)), fixture: true, ..light(-43.4, 14.5, 22.0, 0xfff4e0, 0.9) },
+            LightDef { spot: Some((v(-0.5, -0.85), 0.6)), fixture: true, ..light(43.4, 14.5, 22.0, 0xfff4e0, 0.9) },
+        ],
+        decor,
+        art: vec![],
+        // (in turn, so the first few are spread out; in teams, one team
+        // fills them from the left end and the other from the right)
+        spawns: vec![v(-35.0, 1.5), v(19.5, 1.5), v(-8.5, 9.0), v(29.5, 9.0), v(-17.0, 1.5), v(42.0, 8.5), v(9.5, 9.0), v(-42.0, 9.5)],
+        weapon_spawns: vec![
+            v(-38.5, 0.5),
+            v(-31.0, 4.5),
+            v(-42.5, 8.5),
+            v(-21.0, 0.5),
+            v(-17.0, 4.0),
+            v(-16.5, 11.5),
+            v(-8.5, 8.0),
+            v(-4.5, 0.5),
+            v(4.5, 0.5),
+            v(0.0, 1.5),
+            v(9.5, 8.0),
+            v(14.0, 4.5),
+            v(19.0, 4.5),
+            v(20.0, 11.5),
+            v(24.5, 3.0),
+            v(29.5, 0.5),
+            v(29.5, 8.0),
+            v(35.5, 4.0),
+            v(42.0, 7.5),
+        ],
+        min: v(-45.0, base),
+        max: v(45.0, 17.0),
+        kill_y: -12.0,
+        training: false,
+        bg: 0x1d2028,
+        // the flood: the lever on the left tower, the hatch over the open
+        // floor. Online, a rollback runs up to 8 steps in one tick, so it's
+        // a flash flood, not the yard's: measured with eight AI fighters
+        // (`sim::feel::measure_gauntlet_step`), a step is 2.3 ms dry (2535
+        // drops in the pools), 3.2-3.6 ms (worst 4.8) at this cap; at the
+        // yard's 15000 it was 10 ms
+        // (water boiling off on the lava pours back in while it's open)
+        trap: Some(TrapDef { lever: v(-42.0, 8.0), hatch: v(-20.0, 16.0), hatch_half: 1.0, pour_rate: 600.0, max_drops: 3500 }),
+        ambient: [0.2, 0.21, 0.26],
     }
 }
 
@@ -487,9 +775,20 @@ pub const COURSE: [(f32, f32); 4] = [(-29.0, 7.0), (-34.5, 7.5), (-40.5, 7.0), (
 /// Top centre of the platform the course ends on.
 pub const COURSE_FINISH: Vec2 = Vec2::new(-52.0, 10.2);
 
+/// The practice yard's pool (water) and pit (lava), let into its floor:
+/// (left, right, bottom, surface).
+pub const YARD_POOL: (f32, f32, f32, f32) = (-20.6, -15.6, -2.5, -0.35);
+pub const YARD_LAVA: (f32, f32, f32, f32) = (14.4, 17.6, -2.0, -0.45);
+
 fn training_yard() -> LevelDef {
+    let (p, l) = (YARD_POOL, YARD_LAVA);
+    let floor = |x0: f32, x1: f32, top: f32| b((x0 + x1) * 0.5, (top - 3.0) * 0.5, (x1 - x0) * 0.5, (top + 3.0) * 0.5, STONE);
     let boxes = vec![
-        b(-13.0, -1.0, 43.0, 1.0, STONE),
+        floor(-56.0, p.0, 0.0),
+        floor(p.0, p.1, p.2),
+        floor(p.1, l.0, 0.0),
+        floor(l.0, l.1, l.2),
+        floor(l.1, 30.0, 0.0),
         b(-56.6, 8.0, 0.6, 10.0, STONE),
         b(30.6, 8.0, 0.6, 10.0, STONE),
         b(-13.0, 18.6, 44.2, 0.6, STONE),
@@ -520,7 +819,13 @@ fn training_yard() -> LevelDef {
         boxes,
         lamps: vec![lamp(-12.0, 18.0, 2.4, 0xfff0d0), lamp(0.0, 18.0, 2.4, 0xfff0d0), lamp(12.0, 18.0, 2.4, 0xfff0d0)],
         ropes,
-        hazards: vec![],
+        // a fall off the rope course lands on spikes; a pool to swim in,
+        // and a pit of lava
+        hazards: vec![
+            spikes(-38.0, 0.1875, 11.0, 0.1875),
+            pool(HazardKind::Water, p.0, p.1, p.2, p.3),
+            pool(HazardKind::Lava, l.0, l.1, l.2, l.3),
+        ],
         balls: vec![],
         lights: vec![
             light(0.0, 30.0, 60.0, 0xd8e4ff, 1.2),
@@ -541,6 +846,16 @@ fn training_yard() -> LevelDef {
         art: vec![],
         training: true,
         bg: 0x3a4152,
+        // up on the chimney, where the rope course starts: a lever that
+        // opens a hatch in the ceiling over the yard and floods it (the
+        // water can reach the 43 m of floor right of the chimney: 51 m from
+        // its wall to the yard's, less the 8 m ledge block, which stands
+        // taller than the flood)
+        // (15000 drops in all, measured: the yard right of the chimney under
+        // 4.7 m of water after 25 s pouring, a step 12.7 ms with the dummies
+        // about, a quarter of the sim thread's 16.7 ms spare; 18000 is 5.2 m
+        // at 13.8-15.5 ms, too near it; to the ceiling would be 103000)
+        trap: Some(TrapDef { lever: v(-21.6, 10.42), hatch: v(-6.0, 18.0), hatch_half: 1.0, pour_rate: 600.0, max_drops: 15000 }),
         ambient: [0.3, 0.31, 0.34],
     }
 }
@@ -739,10 +1054,7 @@ fn art_test() -> LevelDef {
     k.piece("barrel", v(-7.7, -14.0 / 256.0), v(0.75, 1.0));
     k.row("spike_strip", 9.0, 11.0, 0.0, v(1.0, 0.375));
 
-    // acid in front, so whoever falls in sinks into it
-    k.layer = ArtLayer::Front;
-    k.row("acid_body", -2.5, 2.5, -3.0, v(1.0, 1.0));
-    k.row("acid_surface", -2.5, 2.5, -2.0, v(1.0, 0.25));
+    // (the acid itself is drawn by the liquid shader, over whoever's in it)
 
     LevelDef {
         name: "Art Test",
@@ -767,6 +1079,7 @@ fn art_test() -> LevelDef {
         kill_y: -10.0,
         training: true,
         bg: 0x1d1a24,
+        trap: None,
         ambient: [0.62, 0.6, 0.64],
     }
 }
@@ -862,10 +1175,7 @@ fn brickworks() -> LevelDef {
     k.ledge(13.0, 17.0, 8.0);
     k.row("railing_tile", 13.0, 17.0, 8.0, v(1.0, 0.25));
 
-    // acid in front, so whoever falls in sinks into it
-    k.layer = ArtLayer::Front;
-    k.row("acid_body", 12.0, 16.0, -3.0, v(1.0, 1.0));
-    k.row("acid_surface", 12.0, 16.0, -2.0, v(1.0, 0.25));
+    // (the acid itself is drawn by the liquid shader, over whoever's in it)
 
     LevelDef {
         name: "Brickworks",
@@ -904,6 +1214,7 @@ fn brickworks() -> LevelDef {
         kill_y: -12.0,
         training: false,
         bg: 0x1d1a24,
+        trap: None,
         ambient: [0.62, 0.6, 0.64],
     }
 }

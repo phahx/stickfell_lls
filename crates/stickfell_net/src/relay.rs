@@ -20,6 +20,9 @@
 //! | S→C | `START` | players, your slot, seed u32 |
 //! | S→C | `DATA` | from-slot, payload |
 //!
+//! `RELAY` works in a room before the match starts too: the game uses it to
+//! send the host's match settings round (see `LobbyClient::send_data`).
+//!
 //! Lobby messages are idempotent and clients resend them until the state
 //! they expect arrives, so packet loss is harmless.
 
@@ -344,6 +347,9 @@ pub struct LobbyClient {
     created: Instant,
     last_heard: Instant,
     start_requested: bool,
+    /// Data from other players in the room (from-slot, payload), before the
+    /// match starts (the host's match settings): see `take_data`.
+    inbox: Vec<(usize, Vec<u8>)>,
 }
 
 impl LobbyClient {
@@ -365,6 +371,7 @@ impl LobbyClient {
             created: now,
             last_heard: now,
             start_requested: false,
+            inbox: Vec::new(),
         })
     }
 
@@ -396,6 +403,20 @@ impl LobbyClient {
         self.last_send = None;
     }
 
+    /// Sends `payload` to the player in `slot` of the room, through the relay.
+    pub fn send_data(&self, slot: u8, payload: &[u8]) {
+        let mut msg = Vec::with_capacity(payload.len() + 2);
+        msg.push(C_RELAY);
+        msg.push(slot);
+        msg.extend_from_slice(payload);
+        let _ = self.sock.send_to(&msg, self.server);
+    }
+
+    /// Data other players in the room have sent since last asked.
+    pub fn take_data(&mut self) -> Vec<(usize, Vec<u8>)> {
+        std::mem::take(&mut self.inbox)
+    }
+
     pub fn leave(&mut self) {
         let _ = self.sock.send_to(&[C_LEAVE], self.server);
     }
@@ -424,6 +445,10 @@ impl LobbyClient {
                         slot: m[2] as usize,
                         seed: u32::from_le_bytes([m[3], m[4], m[5], m[6]]),
                     };
+                }
+                // (only while in the room: once it's started, it's the match's)
+                S_DATA if n >= 2 && matches!(self.state, LobbyState::InRoom { .. }) && self.inbox.len() < 64 => {
+                    self.inbox.push((m[1] as usize, m[2..].to_vec()));
                 }
                 S_ERROR => {
                     let msg = String::from_utf8_lossy(&m[1..]).into_owned();
@@ -552,6 +577,25 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(2));
         }
+        // room data both ways before the start (the host's match settings,
+        // and the answer)
+        let (mut got, mut back) = (None, None);
+        for _ in 0..500 {
+            host.send_data(1, &[0xE1, 7]);
+            host.poll();
+            guest.poll();
+            if let Some((from, d)) = guest.take_data().into_iter().next() {
+                got = Some((from, d));
+                guest.send_data(0, &[0xE2, 7]);
+            }
+            if let Some(x) = host.take_data().into_iter().next() {
+                back = Some(x);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(got, Some((0, vec![0xE1, 7])), "the guest hears the host in the room");
+        assert_eq!(back, Some((1, vec![0xE2, 7])), "and the host hears back");
         host.start();
         let (mut hs, mut gs) = (None, None);
         while hs.is_none() || gs.is_none() {

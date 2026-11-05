@@ -20,6 +20,9 @@ pub enum LimbKind {
 
 /// The pin finisher's thrust lands on this finisher frame.
 pub const PIN_HIT: u16 = 100;
+/// The curb stomp's two stomps land on these finisher frames: the first
+/// flattens the head, the second bursts it.
+pub const STOMP_HITS: [u16; 2] = [52, 92];
 
 /// Finishers: one per weapon (and one for bare hands), plus ones that need
 /// the right surroundings (a sword with a wall behind the victim pins them).
@@ -46,6 +49,10 @@ pub enum Finish {
     /// Sword, with their back to a wall: shoved against it, run through the
     /// chest and pinned there by the blade, left hanging on it.
     Pin,
+    /// Any weapon (or none), right after throwing them over your shoulder:
+    /// they're left lying on their back; two stomps on the head, the second
+    /// bursts it.
+    Stomp,
 }
 
 impl Finish {
@@ -64,12 +71,13 @@ impl Finish {
             Finish::Spine => "SPINE RIPPED!",
             Finish::Hang => "STRUNG UP!",
             Finish::Pin => "PINNED!",
+            Finish::Stomp => "CURB STOMPED!",
         }
     }
 
     /// Grabs the victim by the neck with the free hand at the start.
     pub fn holds(self) -> bool {
-        !matches!(self, Finish::Smash)
+        !matches!(self, Finish::Smash | Finish::Stomp)
     }
 
     /// When the attacker lets go and the victim is left standing, swaying,
@@ -122,6 +130,7 @@ impl Finish {
             Finish::Hang => &[90],
             // shoved back against the wall, the sword drawn back, then driven home
             Finish::Pin => &[PIN_HIT],
+            Finish::Stomp => &STOMP_HITS,
         }
     }
 
@@ -678,7 +687,7 @@ pub struct Weapon {
     pub thrown: u8,
     /// Frames before a released weapon collides with its old owner again.
     pub grace: u8,
-    pub hit_cd: [u8; 4],
+    pub hit_cd: [u8; crate::sim::MAX_PLAYERS],
     pub active: bool,
     /// Severed limbs: whose body it came off (player id + 1; 0 = not a limb).
     pub owner: u8,
@@ -804,7 +813,7 @@ impl Weapon {
             last_holder: None,
             thrown: 0,
             grace: 0,
-            hit_cd: [0; 4],
+            hit_cd: [0; crate::sim::MAX_PLAYERS],
             active: true,
             owner: 0,
         }

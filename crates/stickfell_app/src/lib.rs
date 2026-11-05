@@ -4,7 +4,7 @@
 //! [`stickfell_render`]. Also provides [`capture_headless`] for rendering a game
 //! to a PNG without a window (screenshots, visual tests, CI).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
@@ -169,11 +169,6 @@ struct Gfx {
     renderer: Renderer,
 }
 
-/// How far back (seconds) `Frame::mouse_trail` reaches, and at most how many
-/// moves it keeps.
-const TRAIL_SECS: f32 = 0.05;
-const TRAIL_MAX: usize = 512;
-
 struct Runner<G: Game> {
     cfg: AppConfig,
     game: G,
@@ -193,8 +188,6 @@ struct Runner<G: Game> {
     blank_cursor: Option<CustomCursor>,
     /// The pointer shape last set.
     cursor_icon: CursorIcon,
-    /// Recent cursor moves (when, where), for `Frame::mouse_trail`.
-    trail: VecDeque<(Instant, Vec2)>,
     /// STICKFELL_PROFILE=1: (frames, acquire, render, present, game) seconds, reported every 3 s.
     profile: Option<(Instant, u32, f64, f64, f64, f64)>,
 }
@@ -361,17 +354,6 @@ impl<G: Game> Runner<G> {
         self.frame.clear_lists();
         self.frame.time = (now - self.start).as_secs_f32();
         self.frame.mouse = self.input.mouse;
-        while self.trail.front().is_some_and(|(t, _)| now.saturating_duration_since(*t).as_secs_f32() > TRAIL_SECS) {
-            self.trail.pop_front();
-        }
-        self.frame.mouse_trail.clear();
-        self.frame.mouse_trail.extend(self.trail.iter().map(|(t, p)| (*p, now.saturating_duration_since(*t).as_secs_f32())));
-        if let Some((last, _)) = self.frame.mouse_trail.last() {
-            // (always ending exactly where the cursor is now)
-            if *last != self.input.mouse {
-                self.frame.mouse_trail.push((self.input.mouse, 0.0));
-            }
-        }
         let alpha = (self.acc / step).clamp(0.0, 1.0) as f32;
         let was_ready = self.frame.shaders_ready;
         self.frame.shaders_ready = gfx.renderer.ready();
@@ -470,10 +452,6 @@ impl<G: Game> ApplicationHandler for Runner<G> {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.input.mouse = Vec2::new(position.x as f32, position.y as f32);
-                self.trail.push_back((Instant::now(), self.input.mouse));
-                if self.trail.len() > TRAIL_MAX {
-                    self.trail.pop_front();
-                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let idx = match button {
@@ -530,7 +508,6 @@ pub fn run<G: Game>(cfg: AppConfig, game: G) -> Result<(), Box<dyn Error>> {
         focused: true,
         blank_cursor: None,
         cursor_icon: CursorIcon::Default,
-        trail: VecDeque::new(),
         profile: std::env::var_os("STICKFELL_PROFILE").map(|_| (now, 0, 0.0, 0.0, 0.0, 0.0)),
     };
     el.run_app(&mut runner)?;

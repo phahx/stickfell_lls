@@ -154,6 +154,61 @@ pub(crate) const KIND_RING_CORNERS: f32 = 5.0;
 /// A rounded box whose edge fades out over `params.w` pixels (UI shadows).
 pub(crate) const KIND_SOFT_BOX: f32 = 6.0;
 
+/// How a liquid looks (see [`Frame::fluid_looks`]): water, acid, lava, or
+/// anything else made of these.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LiquidLook {
+    /// Colour (and opacity) just under the surface, and at `depth` down.
+    pub shallow: Color,
+    pub deep: Color,
+    /// How far down (m) it's all the deep colour.
+    pub depth: f32,
+    /// The foam along the surface, and how far down it reaches (m).
+    pub foam: Color,
+    pub foam_width: f32,
+    /// How much it glows (0: lit like anything else).
+    pub glow: f32,
+    /// How much brighter than that its bright parts glow (bubbles, cracks,
+    /// caustics, foam).
+    pub sparkle: f32,
+    /// Light through the surface rippling on the way down (0..1).
+    pub caustics: f32,
+    /// How thick the rising bubbles are (0..1).
+    pub bubbles: f32,
+    /// A cracked crust on it, glowing through the cracks (0..1).
+    pub crust: f32,
+    /// Height (m) of the fine ripples drawn on top of the surface it's
+    /// given, and how fast everything in it drifts.
+    pub ripple: f32,
+    pub flow: f32,
+    /// Sets its patterns apart from another liquid's.
+    pub seed: f32,
+    /// What it turns where it's dyed (blood in water, lava cooled to rock):
+    /// its shallow and deep colours then, how much it glows then, and how
+    /// quickly a little dye shows (1 - e^(-curve * share)).
+    pub dyed_shallow: Color,
+    pub dyed_deep: Color,
+    pub dyed_glow: f32,
+    pub dye_curve: f32,
+}
+
+impl Default for LiquidLook {
+    fn default() -> Self {
+        let clear = Color::linear(0.0, 0.0, 0.0, 0.0);
+        Self { shallow: clear, deep: clear, depth: 1.0, foam: clear, foam_width: 0.05, glow: 0.0, sparkle: 0.0, caustics: 0.0, bubbles: 0.0, crust: 0.0, ripple: 0.0, flow: 1.0, seed: 0.0, dyed_shallow: clear, dyed_deep: clear, dyed_glow: 0.0, dye_curve: 1.0 }
+    }
+}
+
+/// One drop of liquid as drawn: where, how big a blob, which of
+/// [`Frame::fluid_looks`], and how churned up (foam).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub(crate) struct FluidSplat {
+    pub pos: [f32; 2],
+    pub params: [f32; 4],
+    pub vel: [f32; 2],
+}
+
 /// An RGBA image (sRGB, straight alpha) that [`Frame::sprite`] draws from,
 /// with its mip chain (level 0 first, each half the size of the last).
 pub struct SpriteAtlas {
@@ -174,6 +229,23 @@ pub(crate) struct ShapeInstance {
     pub params: [f32; 4],
 }
 
+/// Vapour (steam, smoke) over the world: how thick it is in each cell of a
+/// grid (row-major, bottom row first; 1 = a cell full of it), drawn as one
+/// continuous volume (see shaders/vapour.wgsl).
+#[derive(Clone, Debug, Default)]
+pub struct VapourField {
+    /// The grid's bottom-left corner, and its cells' size (world units).
+    pub origin: Vec2,
+    pub cell: f32,
+    pub w: u32,
+    pub h: u32,
+    pub thick: Vec<f32>,
+    /// How dense it looks (opacity is 1 - e^(-density x thickness)), and the
+    /// most opaque it ever gets.
+    pub density: f32,
+    pub max_opacity: f32,
+}
+
 /// Everything to draw this frame.
 pub struct Frame {
     pub camera: Camera2D,
@@ -187,12 +259,13 @@ pub struct Frame {
     /// rendered frame rather than every tick, so a drawn cursor keeps up
     /// with the display.
     pub mouse: Vec2,
-    /// Where the cursor has been lately, oldest first, as (position, seconds
-    /// ago), ending at `mouse`. Every move the OS reported, so it holds the
-    /// positions between frames too (for drawing a motion-blurred cursor).
-    pub mouse_trail: Vec<(Vec2, f32)>,
     pub(crate) shapes: Vec<ShapeInstance>,
     pub(crate) ui: Vec<ShapeInstance>,
+    pub(crate) fluid: Vec<FluidSplat>,
+    /// How each kind of liquid drawn with [`Frame::fluid_drop`] looks.
+    pub fluid_looks: [LiquidLook; 3],
+    /// Vapour to draw over the scene this frame (steam), if any.
+    pub vapour: Option<VapourField>,
     pub(crate) lights: Vec<Light>,
     pub(crate) occluders: Vec<Occluder>,
     /// The image sprites come from. It's uploaded when a different one is
@@ -220,9 +293,11 @@ impl Frame {
             ambient: Color::linear(0.25, 0.25, 0.3, 1.0),
             time: 0.0,
             mouse: Vec2::ZERO,
-            mouse_trail: Vec::new(),
             shapes: Vec::new(),
             ui: Vec::new(),
+            fluid: Vec::new(),
+            fluid_looks: [LiquidLook::default(); 3],
+            vapour: None,
             lights: Vec::new(),
             occluders: Vec::new(),
             sprite_atlas: None,
@@ -234,6 +309,8 @@ impl Frame {
     pub fn clear_lists(&mut self) {
         self.shapes.clear();
         self.ui.clear();
+        self.fluid.clear();
+        self.vapour = None;
         self.lights.clear();
         self.occluders.clear();
     }
@@ -285,6 +362,15 @@ impl Frame {
             color: color.to_array(),
             params: [KIND_BOX, emissive, corner.min(half.x).min(half.y), 0.0],
         });
+    }
+
+    /// A drop of liquid (kind 0..3 of [`Frame::fluid_looks`]), a blob of
+    /// `radius` m; neighbouring drops run together into one body of liquid,
+    /// drawn over everything else in the world, stretched along `vel` so a
+    /// fast stream stays a stream. `foam` (0..1): how churned up; `dye`
+    /// (0..1): how far it's turned its look's dyed colours.
+    pub fn fluid_drop(&mut self, pos: Vec2, vel: Vec2, radius: f32, kind: u8, foam: f32, dye: f32) {
+        self.fluid.push(FluidSplat { pos: pos.into(), params: [radius, kind.min(2) as f32, foam.clamp(0.0, 1.0), dye.clamp(0.0, 1.0)], vel: vel.into() });
     }
 
     // ---- lighting -------------------------------------------------------

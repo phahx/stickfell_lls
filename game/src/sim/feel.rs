@@ -19,6 +19,7 @@ fn sandbox(boxes: &[(Vec2, Vec2)]) -> GameState {
         Fighter::spawn(&mut w, 1, Vec2::new(30.0, 0.02), -1.0),
     ];
     let mut s = GameState::new(2, 0, 1);
+    s.spike_pins = GameState::make_spike_pins(&mut w, 2);
     s.world = w;
     s.fighters = fighters;
     s.weapons.clear();
@@ -631,13 +632,14 @@ fn ropes_can_be_grabbed_and_swung_on() {
 #[test]
 fn hazards_hurt() {
     use crate::level::{HazardDef, HazardKind};
-    for (kind, name) in [(HazardKind::Spikes, "spikes"), (HazardKind::Acid, "acid"), (HazardKind::Saw, "saw")] {
+    // (spikes have their own: only their points really hurt, see landing_on_the_points_...)
+    for (kind, name) in [(HazardKind::Acid, "acid"), (HazardKind::Saw, "saw")] {
         let mut s = sandbox(&[]);
         let (a, size) = match kind {
             HazardKind::Saw => (Vec2::new(1.5, 1.0), Vec2::splat(0.9)),
             _ => (Vec2::new(2.0, 0.3), Vec2::new(1.0, 0.3)),
         };
-        s.hazards.push(HazardDef { kind, a, b: a, size, speed: 0.0 });
+        s.add_hazard(HazardDef { kind, a, b: a, size, speed: 0.0 });
         for _ in 0..30 {
             step(&mut s, 0, Vec2::new(0.6, 0.0));
         }
@@ -939,9 +941,9 @@ fn diagnose_stuck_jitter() {
 
 #[test]
 fn weapons_never_spawn_inside_the_level() {
-    for level in 0..3 {
+    for level in 0..crate::level::ARENAS {
         for seed in 0..6u32 {
-            let s = GameState::new(4, level, 300 + seed);
+            let s = GameState::new(if level == crate::level::GAUNTLET { 8 } else { 4 }, level, 300 + seed);
             for w in &s.weapons {
                 assert!(!w.touches_level(&s.world), "level {level} seed {seed}: {} spawned inside geometry", w.def().name);
             }
@@ -1801,7 +1803,7 @@ fn screenshot_faces() {
     struct Shot {
         game: GameState,
         levels: Vec<crate::level::LevelDef>,
-        talk: [Option<(Sfx, f32)>; 4],
+        talk: [Option<(Sfx, f32)>; MAX_PLAYERS],
     }
     impl stickfell_app::Game for Shot {
         fn tick(&mut self, _input: &stickfell_app::Input) {}
@@ -1824,10 +1826,10 @@ fn screenshot_faces() {
         let mut s = base.clone();
         match kind {
             1 => s.fighters[1].hit_flash = 6,
-            2 => s.finishers.push(Finisher { attacker: 0, victim: 1, mv: crate::weapon::Finish::Behead, t: 10, weapon: None, killed: false, wall: None }),
+            2 => s.finishers.push(Finisher { attacker: 0, victim: 1, mv: crate::weapon::Finish::Behead, t: 10, weapon: None, killed: false, wall: None, side: 1 }),
             _ => {}
         }
-        let mut shot = Shot { game: s, levels: crate::level::levels(), talk };
+        let mut shot = Shot { game: s, levels: crate::level::levels(), talk: std::array::from_fn(|i| talk.get(i).copied().flatten()) };
         stickfell_app::capture_headless(&mut shot, 0, (900, 520), format!("{dir}/face_{name}.png").as_ref()).unwrap();
     }
 }
@@ -3293,4 +3295,2729 @@ fn trace_shoulder_throw() {
             eprintln!("t{t} sh {} vel {:?} lowest {low:.2} pelvis y {:.2} flying {} hp {:.0}", s.fighters[0].shoulder, v.body_vel(&s.world), v.pos(&s.world, PELVIS).y, v.flying, v.health);
         }
     }
+}
+
+/// Shoulder-throws fighter 1 (weakened, so they can be finished), then presses
+/// FINISH `delay` frames after the slam. Returns once the finisher (if any)
+/// has started, with the frame count so far.
+fn shoulder_then_finish(s: &mut GameState, delay: u32) -> u32 {
+    s.fighters[1].health = 50.0;
+    let mut released = None;
+    for k in 0..400u32 {
+        let thrown = s.fighters[0].shoulder > 0;
+        let b = match released {
+            Some(r) if k == r + delay => input::encode(FINISH, Vec2::new(-0.6, 0.0)),
+            Some(_) => input::encode(0, Vec2::new(-0.6, 0.0)),
+            None => shoulder_throw_input(s, k),
+        };
+        s.step(&[b, input::encode(0, Vec2::new(-0.6, 0.0))]);
+        if released.is_none() && thrown && s.fighters[0].shoulder == 0 {
+            released = Some(k);
+        }
+        if released.is_some_and(|r| k >= r + delay) {
+            return k;
+        }
+    }
+    panic!("the shoulder throw never happened");
+}
+
+#[test]
+fn a_finisher_right_after_a_shoulder_throw_is_a_curb_stomp() {
+    let mut s = pair(0.9);
+    shoulder_then_finish(&mut s, 10);
+    assert_eq!(s.finishers.first().map(|x| x.mv), Some(Finish::Stomp), "a finisher within a second of the throw should be the stomp");
+    let floor_pelvis = s.fighters[1].pos(&s.world, PELVIS).y;
+    let (mut highest, mut squashed_alive, mut foot_gap) = (f32::MIN, false, [f32::MAX; 2]);
+    for _ in 0..200 {
+        s.step(&[input::encode(0, Vec2::new(-0.6, 0.0)), input::encode(0, Vec2::new(-0.6, 0.0))]);
+        let v = &s.fighters[1];
+        highest = highest.max(v.pos(&s.world, PELVIS).y - floor_pelvis);
+        if let Some(x) = s.finishers.first() {
+            for (i, &h) in crate::weapon::STOMP_HITS.iter().enumerate() {
+                if x.t + 3 >= h && x.t <= h + 3 {
+                    // on top of it: above, lined up, touching (head and heel radii apart)
+                    let d = s.fighters[0].pos(&s.world, fighter::FOOT_A) - v.pos(&s.world, HEAD);
+                    let touch = s.world.segments[(v.seg_base + fighter::S_HEAD) as usize].radius + s.world.particles[s.fighters[0].p(fighter::FOOT_A) as usize].radius;
+                    if d.y > 0.0 && d.x.abs() < 0.15 {
+                        foot_gap[i] = foot_gap[i].min(d.length() - touch);
+                    }
+                }
+            }
+            if x.t > crate::weapon::STOMP_HITS[0] && x.t < crate::weapon::STOMP_HITS[1] {
+                squashed_alive |= v.alive && v.head_squash > 0.3 && !v.head_popped;
+            }
+        }
+    }
+    let (me, them) = (&s.fighters[0], &s.fighters[1]);
+    let spatters = me.wounds.iter().filter(|w| w.kind == fighter::WoundKind::Spatter).count();
+    eprintln!("curb stomp: victim rose at most {highest:.2} m, heel to the top of the head at the stomps {:.3} / {:.3} m, {spatters} spatters on the stomper", foot_gap[0], foot_gap[1]);
+    assert!(highest < 0.15, "the victim stays on the ground ({highest:.2} m up)");
+    assert!(foot_gap[0] < 0.05 && foot_gap[1] < 0.05, "the heel comes down on top of the head both times ({foot_gap:?})");
+    assert!(squashed_alive, "the first stomp flattens the head and doesn't kill");
+    assert!(!them.alive && them.head_popped, "the second stomp bursts the head");
+    assert!(spatters >= 3, "the stomper's leg comes away bloody");
+    assert!(me.alive && me.down == 0, "the stomper stays on their feet");
+}
+
+#[test]
+fn a_finisher_more_than_a_second_after_the_throw_is_the_usual_one() {
+    let mut s = pair(0.9);
+    shoulder_then_finish(&mut s, 65);
+    let mv = s.finishers.first().map(|x| x.mv);
+    assert!(mv.is_some() && mv != Some(Finish::Stomp), "too late for the stomp: {mv:?}");
+}
+
+#[test]
+fn curb_stomps_are_deterministic_under_rollback() {
+    let mut s = pair(0.9);
+    let k = shoulder_then_finish(&mut s, 10);
+    // replay the same inputs from the start under the rollback checker
+    let mut st = stickfell_net::SyncTestSession::new(pair(0.9), 8);
+    st.game.fighters[1].health = 50.0;
+    let mut replay = pair(0.9);
+    replay.fighters[1].health = 50.0;
+    let mut released = None;
+    let mut stomped = false;
+    for i in 0..k + 160 {
+        let thrown = replay.fighters[0].shoulder > 0;
+        let b = match released {
+            Some(r) if i == r + 10 => input::encode(FINISH, Vec2::new(-0.6, 0.0)),
+            Some(_) => input::encode(0, Vec2::new(-0.6, 0.0)),
+            None => shoulder_throw_input(&replay, i),
+        };
+        let inputs = [b, input::encode(0, Vec2::new(-0.6, 0.0))];
+        replay.step(&inputs);
+        st.advance(&inputs).unwrap();
+        if released.is_none() && thrown && replay.fighters[0].shoulder == 0 {
+            released = Some(i);
+        }
+        stomped |= st.game.finishers.iter().any(|x| x.mv == Finish::Stomp);
+    }
+    assert!(stomped, "the curb stomp should happen under rollback too");
+    assert!(st.game.fighters[1].head_popped);
+}
+
+#[test]
+#[ignore]
+fn screenshot_curb_stomp() {
+    let dir = std::env::var("SHOT_DIR").unwrap_or_else(|_| ".".into());
+    let mut s = pair(0.9);
+    shoulder_then_finish(&mut s, 10);
+    for _ in 0..140 {
+        s.step(&[input::encode(0, Vec2::new(-0.6, 0.0)), input::encode(0, Vec2::new(-0.6, 0.0))]);
+        let t = s.finishers.first().map_or(0, |x| x.t);
+        if [20, 40, 50, 53, 70, 88, 93, 110].contains(&t) {
+            let mut sp = crate::Spectate { game: s.clone(), follow: 0, cam: Vec2::ZERO, levels: crate::level::levels() };
+            stickfell_app::capture_headless(&mut sp, 0, (900, 560), format!("{dir}/stomp_{t:03}.png").as_ref()).unwrap();
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn trace_curb_stomp() {
+    let mut s = pair(0.9);
+    shoulder_then_finish(&mut s, 10);
+    for _ in 0..130 {
+        s.step(&[input::encode(0, Vec2::new(-0.6, 0.0)), input::encode(0, Vec2::new(-0.6, 0.0))]);
+        let Some(x) = s.finishers.first() else { break };
+        if x.t % 4 == 0 || crate::weapon::STOMP_HITS.contains(&x.t) {
+            let (a, v) = (&s.fighters[0], &s.fighters[1]);
+            let p = |f: &Fighter, slot| f.pos(&s.world, slot);
+            let tgt = s.stomp_foot(x).map(|t| t.0);
+            eprintln!("    hip ({:5.2},{:4.2}) target {:?} foot vel {:?}", p(a, PELVIS).x, p(a, PELVIS).y, tgt.map(|t| (t.x * 100.0).round() / 100.0), s.world.particles[a.p(fighter::FOOT_A) as usize].vel);
+            eprintln!("t{:3} me x {:5.2} facing {:2} | foot ({:5.2},{:4.2}) knee ({:5.2},{:4.2}) | their head ({:5.2},{:4.2}) pelvis x {:5.2} | grounded {} down {}",
+                x.t, p(a, PELVIS).x, a.facing, p(a, fighter::FOOT_A).x, p(a, fighter::FOOT_A).y, p(a, fighter::KNEE_A).x, p(a, fighter::KNEE_A).y, p(v, HEAD).x, p(v, HEAD).y, p(v, PELVIS).x, a.grounded, a.down);
+        }
+    }
+}
+
+/// A close-up of the world around a point, nothing over it (for checking art).
+struct CloseUp {
+    game: GameState,
+    at: Vec2,
+}
+
+/// A wider view of the arena (`height` m tall) for screenshots.
+struct Wide {
+    game: GameState,
+    at: Vec2,
+    height: f32,
+}
+
+impl stickfell_app::Game for Wide {
+    fn tick(&mut self, _input: &stickfell_app::Input) {}
+    fn draw(&mut self, frame: &mut stickfell_render::Frame, screen: Vec2, _alpha: f32, _dt: f32) {
+        let levels = crate::level::levels();
+        let lv = &levels[self.game.level_index];
+        crate::draw::draw_game(&self.game, lv, frame, screen, self.at, &crate::draw::Hud { world_only: true, zoom: self.height, ..Default::default() });
+    }
+}
+
+impl stickfell_app::Game for CloseUp {
+    fn tick(&mut self, _input: &stickfell_app::Input) {}
+    fn draw(&mut self, frame: &mut stickfell_render::Frame, screen: Vec2, _alpha: f32, _dt: f32) {
+        let levels = crate::level::levels();
+        let lv = &levels[self.game.level_index];
+        crate::draw::draw_game(&self.game, lv, frame, screen, self.at, &crate::draw::Hud { world_only: true, zoom: 2.2, ..Default::default() });
+    }
+}
+
+#[test]
+#[ignore]
+fn screenshot_curb_stomp_close() {
+    let dir = std::env::var("SHOT_DIR").unwrap_or_else(|_| ".".into());
+    let mut s = pair(0.9);
+    shoulder_then_finish(&mut s, 10);
+    for _ in 0..140 {
+        s.step(&[input::encode(0, Vec2::new(-0.6, 0.0)), input::encode(0, Vec2::new(-0.6, 0.0))]);
+        let t = s.finishers.first().map_or(0, |x| x.t);
+        if [44, 53, 70, 92, 94, 100, 115].contains(&t) {
+            let at = s.fighters[1].pos(&s.world, fighter::NECK) + Vec2::new(0.4, 0.5);
+            let mut c = CloseUp { game: s.clone(), at };
+            stickfell_app::capture_headless(&mut c, 0, (640, 480), format!("{dir}/close_{t:03}.png").as_ref()).unwrap();
+        }
+    }
+}
+
+/// One fighter in an empty sandbox with a 2 m spike bed (0.375 m tall, the
+/// kit's) on the floor to the right, from x 1 to 3.
+fn spike_yard() -> GameState {
+    use crate::level::{HazardDef, HazardKind};
+    let mut s = sandbox(&[]);
+    let a = Vec2::new(2.0, 0.1875);
+    s.add_hazard(HazardDef { kind: HazardKind::Spikes, a, b: a, size: Vec2::new(1.0, 0.1875), speed: 0.0 });
+    s
+}
+
+fn teleport(s: &mut GameState, fi: usize, by: Vec2) {
+    for id in s.fighters[fi].particle_ids() {
+        let p = &mut s.world.particles[id as usize];
+        p.pos += by;
+        p.prev = p.pos;
+        p.vel = Vec2::ZERO;
+    }
+}
+
+#[test]
+fn spikes_only_hurt_where_the_teeth_are() {
+    // standing right up against the bed's edge: inside the old damage box, clear of every tooth
+    let mut s = spike_yard();
+    for _ in 0..30 {
+        step(&mut s, 0, Vec2::new(0.6, 0.0));
+    }
+    let first = s.hazards[0].teeth()[0];
+    let me = s.fighters[0].pos(&s.world, PELVIS).x;
+    teleport(&mut s, 0, Vec2::new(first.tip.x - first.half_width - 0.3 - me, 0.0));
+    for _ in 0..90 {
+        step(&mut s, 0, Vec2::new(0.6, 0.0));
+    }
+    let hp = s.fighters[0].health;
+    // how close any part came to the first tooth's shape (its nearest edge at that height)
+    let gap = s.fighters[0].particle_ids().map(|id| {
+        let p = s.world.particles[id as usize];
+        if p.pos.y > first.tip.y {
+            return (p.pos - first.tip).length() - p.radius;
+        }
+        let t = ((p.pos.y - first.base.y) / (first.tip.y - first.base.y)).clamp(0.0, 1.0);
+        (p.pos.x - first.tip.x).abs() - first.half_width * (1.0 - t) - p.radius
+    }).fold(f32::MAX, f32::min);
+    eprintln!("beside the bed (closest part {gap:.2} m clear of the first tooth): hp {hp:.0}");
+    assert!(gap < 0.3, "the test should have them close to the teeth ({gap:.2})");
+    assert_eq!(hp, MAX_HP, "nothing touching a tooth, nothing hurt");
+}
+
+/// Lays fighter `fi` flat on its back (head to the right), its pelvis at
+/// `at`, still.
+fn lay_flat(s: &mut GameState, fi: usize, at: Vec2) {
+    let pelvis = s.fighters[fi].pos(&s.world, PELVIS);
+    for id in s.fighters[fi].particle_ids() {
+        let p = &mut s.world.particles[id as usize];
+        let d = p.pos - pelvis;
+        p.pos = at + Vec2::new(d.y, -d.x * 0.3);
+        p.prev = p.pos;
+        p.vel = Vec2::ZERO;
+    }
+    // limp, so it comes down the way it was dropped
+    s.fighters[fi].down = 200;
+}
+
+/// A body dropped flat from `height` m over the middle of the spike bed.
+fn drop_flat_on_spikes(height: f32) -> GameState {
+    let mut s = spike_yard();
+    for _ in 0..30 {
+        step(&mut s, 0, Vec2::new(0.6, 0.0));
+    }
+    let tips = s.hazards[0].teeth()[0].tip.y;
+    lay_flat(&mut s, 0, Vec2::new(1.6, tips + 0.15 + height));
+    s
+}
+
+#[test]
+fn falling_flat_on_the_points_runs_you_through_and_you_stay_on_them() {
+    let mut s = drop_flat_on_spikes(1.0);
+    let tips = s.hazards[0].teeth()[0].tip.y;
+    let mut on = None;
+    for k in 0..60 {
+        step(&mut s, 0, Vec2::new(0.6, 0.0));
+        if on.is_none() && s.fighters[0].impaled > 0 {
+            on = Some((k, s.fighters[0].health));
+        }
+    }
+    let (k, hp) = on.expect("a 1 m fall flat onto the points should run them through");
+    let f = &s.fighters[0];
+    let sk = s.world.skewers[s.spike_pins[0][2] as usize];
+    let through = s.world.particles[sk.a as usize].pos.lerp(s.world.particles[sk.b as usize].pos, sk.s);
+    eprintln!("run through on frame {k} by part {}: hp {hp:.0} then; it's down the spike at {:.2} (points at {tips:.2})", f.impale_part, through.y);
+    assert!(f.alive, "a 1 m fall isn't instantly fatal");
+    assert!(through.y < tips - 0.05, "sunk down the spike, not resting on its point ({:.2})", through.y);
+    // left there, they stay on it and keep bleeding
+    let before = s.fighters[0].health;
+    for _ in 0..120 {
+        step(&mut s, 0, Vec2::new(0.6, 0.0));
+    }
+    let f = &s.fighters[0];
+    eprintln!("two seconds later: still on it {}, hp {:.0} -> {:.0}", f.impaled > 0, before, f.health);
+    assert!(f.impaled > 0, "they stay on the spike");
+    assert!(f.health < before - 10.0, "bleeding on it");
+}
+
+#[test]
+fn mashing_works_you_off_the_spike_before_you_bleed_out() {
+    let mut s = drop_flat_on_spikes(1.0);
+    for _ in 0..40 {
+        step(&mut s, 0, Vec2::new(0.6, 0.0));
+    }
+    assert!(s.fighters[0].impaled > 0);
+    let mut freed = None;
+    for k in 0..300 {
+        // alternating keys, as fast as anyone could (a fresh press every frame)
+        let b = if k % 2 == 0 { LEFT } else { RIGHT };
+        step(&mut s, b, Vec2::new(0.6, 0.0));
+        if s.fighters[0].impaled == 0 {
+            freed = Some(k);
+            break;
+        }
+    }
+    let k = freed.expect("mashing should get them off the spike");
+    eprintln!("struggled free after {k} frames, hp {:.0}", s.fighters[0].health);
+    // at a human rate (8 presses a second) it takes longer, but well inside the bleed-out
+    let mut h = drop_flat_on_spikes(1.0);
+    for _ in 0..40 {
+        step(&mut h, 0, Vec2::new(0.6, 0.0));
+    }
+    let human = (0..600).find(|k| {
+        let b = if k % 15 == 0 { LEFT } else if k % 15 == 7 { RIGHT } else { 0 };
+        step(&mut h, b, Vec2::new(0.6, 0.0));
+        h.fighters[0].impaled == 0
+    });
+    eprintln!("at 8 presses a second: free after {human:?} frames, hp {:.0}", h.fighters[0].health);
+    assert!(human.is_some_and(|k| k < 60 * 3) && h.fighters[0].alive, "a human mash gets off in time");
+    assert!(s.fighters[0].alive, "and alive");
+    assert!(k > 15, "not instantly ({k})");
+    // and they don't land straight back on it
+    for _ in 0..90 {
+        step(&mut s, 0, Vec2::new(0.6, 0.0));
+    }
+    assert_eq!(s.fighters[0].impaled, 0, "not run straight back through");
+}
+
+#[test]
+fn left_on_the_spike_you_bleed_out_and_stay_there() {
+    let mut s = drop_flat_on_spikes(1.0);
+    let mut died = None;
+    for k in 0..60 * 20 {
+        step(&mut s, 0, Vec2::new(0.6, 0.0));
+        if !s.fighters[0].alive {
+            died = Some(k);
+            break;
+        }
+    }
+    let k = died.expect("left on it, they bleed out");
+    for _ in 0..60 {
+        step(&mut s, 0, Vec2::new(0.6, 0.0));
+    }
+    eprintln!("bled out on the spike after {:.1} s", k as f32 / 60.0);
+    assert!(k > 60 * 4, "it takes a while, time enough to struggle ({k})");
+    assert!(s.fighters[0].impaled > 0, "the body stays on it");
+}
+
+#[test]
+fn coming_down_hard_head_or_heart_first_kills_on_the_spot() {
+    let mut s = drop_flat_on_spikes(4.0);
+    let mut on = None;
+    for k in 0..90 {
+        step(&mut s, 0, Vec2::new(0.6, 0.0));
+        if on.is_none() && s.fighters[0].impaled > 0 {
+            on = Some(k);
+        }
+    }
+    let k = on.expect("run through");
+    let f = &s.fighters[0];
+    eprintln!("4 m flat onto the points: run through on frame {k} by part {}, alive {}", f.impale_part, f.alive);
+    assert!(!f.alive, "a hard fall onto the points through the head or heart is fatal at once");
+    assert!(f.impaled > 0, "and they stay on it");
+}
+
+#[test]
+fn spike_impaling_is_deterministic_under_rollback() {
+    let mut st = stickfell_net::SyncTestSession::new(drop_flat_on_spikes(1.0), 8);
+    for k in 0..200 {
+        let b = if k > 60 { if k % 2 == 0 { LEFT } else { RIGHT } } else { 0 };
+        st.advance(&[input::encode(b, Vec2::new(0.6, 0.0)), 0]).unwrap();
+    }
+}
+
+#[test]
+#[ignore]
+fn trace_spike_drop() {
+    let mut s = spike_yard();
+    for _ in 0..30 {
+        step(&mut s, 0, Vec2::new(0.6, 0.0));
+    }
+    let me = s.fighters[0].pos(&s.world, PELVIS);
+    teleport(&mut s, 0, Vec2::new(2.0 - me.x, 2.0));
+    for k in 0..60 {
+        step(&mut s, 0, Vec2::new(0.6, 0.0));
+        let f = &s.fighters[0];
+        let low = f.particle_ids().map(|id| s.world.particles[id as usize].pos.y).fold(f32::MAX, f32::min);
+        let foot = f.pos(&s.world, fighter::FOOT_A);
+        eprintln!("k{k:2} lowest {low:.2} foot ({:.3},{:.2}) fall {:.2} hp {:.0} cd {}", foot.x, foot.y, s.fall[f.p(fighter::FOOT_A) as usize], f.health, s.hazard_cd[0]);
+    }
+}
+
+#[test]
+#[ignore]
+fn screenshot_spike_landing() {
+    let dir = std::env::var("SHOT_DIR").unwrap_or_else(|_| ".".into());
+    for (level, name) in [(3usize, "brickworks"), (2, "keep"), (crate::level::TRAINING, "yard")] {
+        let mut s = GameState::new(1, level, 7);
+        for _ in 0..20 {
+            s.step(&[0]);
+        }
+        let bed = s.hazards.iter().find(|h| h.kind == crate::level::HazardKind::Spikes).copied().unwrap();
+        let me = s.fighters[0].pos(&s.world, PELVIS);
+        teleport(&mut s, 0, Vec2::new(bed.a.x + 0.3 - me.x, bed.a.y + 2.5 - me.y));
+        for _ in 0..70 {
+            s.step(&[0]);
+        }
+        let mut c = CloseUp { game: s.clone(), at: bed.a + Vec2::new(0.3, 0.6) };
+        stickfell_app::capture_headless(&mut c, 0, (640, 480), format!("{dir}/spikes_{name}.png").as_ref()).unwrap();
+        eprintln!("{name}: hp {:.0}", s.fighters[0].health);
+    }
+}
+
+#[test]
+fn b_brings_a_dummy_right_in_front_of_you() {
+    let mut s = GameState::new(4, crate::level::TRAINING, 0x7EA1);
+    for _ in 0..40 {
+        let inputs: Vec<u32> = (0..4).map(|i| if i == 0 { input::encode(0, Vec2::new(0.6, 0.0)) } else { crate::bot::dummy_input(&s, i) }).collect();
+        s.step(&inputs);
+    }
+    // one dummy dead, mangled and with a knife in it first: it's the one that comes back
+    s.fighters[2].health = 0.0;
+    s.fighters[2].alive = false;
+    for round in 0..10 {
+        s.bring_dummy(0);
+        for _ in 0..60 {
+            let inputs: Vec<u32> = (0..4).map(|i| if i == 0 { input::encode(0, Vec2::new(0.6, 0.0)) } else { crate::bot::dummy_input(&s, i) }).collect();
+            s.step(&inputs);
+        }
+        let me = s.fighters[0].pos(&s.world, PELVIS);
+        let (i, d) = (1..4).map(|i| (i, s.fighters[i].pos(&s.world, PELVIS) - me)).min_by(|a, b| a.1.length().total_cmp(&b.1.length())).unwrap();
+        let f = &s.fighters[i];
+        eprintln!("round {round}: me at ({:.2}, {:.2}), dummies at {:?}", me.x, me.y, (1..4).map(|k| s.fighters[k].pos(&s.world, PELVIS)).collect::<Vec<_>>());
+        if round == 0 {
+            assert_eq!(i, 2, "the dead dummy is the one brought back");
+        }
+        assert!(f.alive && f.health == MAX_HP && f.down == 0, "whole and standing (round {round})");
+        assert!(d.x * s.fighters[0].facing > 0.6 && d.length() < 3.4, "a step in front ({:.2}, {:.2})", d.x, d.y);
+        assert!(f.facing * s.fighters[0].facing < 0.0, "facing you");
+        assert!(s.world.particles.iter().all(|p| p.pos.is_finite()), "nothing blew up");
+    }
+    assert!(s.hazards.iter().any(|h| h.kind == crate::level::HazardKind::Spikes), "spikes under the rope course");
+}
+
+#[test]
+#[ignore]
+fn trace_spike_impale() {
+    let mut s = drop_flat_on_spikes(std::env::var("DROP").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0));
+    for k in 0..400 {
+        step(&mut s, 0, Vec2::new(0.6, 0.0));
+        let f = &s.fighters[0];
+        let sk = s.world.skewers[s.spike_pins[0][2] as usize];
+        let p = |slot| f.pos(&s.world, slot);
+        if k % 4 == 0 || (f.impaled > 0 && f.impaled < 12) {
+            eprintln!("k{k:3} imp {:3} part {} | pelvis ({:.2},{:.2}) neck ({:.2},{:.2}) head y {:.2} | sk on {} u {:.2} umin {:.2} | hp {:.0} alive {} down {}",
+                f.impaled, f.impale_part, p(PELVIS).x, p(PELVIS).y, p(NECK).x, p(NECK).y, p(HEAD).y, sk.enabled, sk.u, sk.u_min, f.health, f.alive, f.down);
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn screenshot_spike_impale() {
+    let dir = std::env::var("SHOT_DIR").unwrap_or_else(|_| ".".into());
+    for (level, name) in [(crate::level::TRAINING, "yard"), (3usize, "brickworks")] {
+        let mut s = GameState::new(1, level, 7);
+        for _ in 0..20 {
+            s.step(&[0]);
+        }
+        let bed = s.hazards.iter().find(|h| h.kind == crate::level::HazardKind::Spikes).copied().unwrap();
+        let tips = bed.teeth()[0].tip.y;
+        lay_flat(&mut s, 0, Vec2::new(bed.a.x, tips + 1.2));
+        for _ in 0..50 {
+            s.step(&[0]);
+        }
+        eprintln!("{name}: impaled {} part {} hp {:.0}", s.fighters[0].impaled, s.fighters[0].impale_part, s.fighters[0].health);
+        let mut c = CloseUp { game: s.clone(), at: s.fighters[0].pos(&s.world, PELVIS) + Vec2::new(0.2, 0.4) };
+        stickfell_app::capture_headless(&mut c, 0, (640, 480), format!("{dir}/impale_{name}.png").as_ref()).unwrap();
+    }
+    // the rope course's ropes
+    let s = GameState::new(1, crate::level::TRAINING, 7);
+    let mut c = CloseUp { game: s, at: Vec2::new(-34.5, 13.0) };
+    stickfell_app::capture_headless(&mut c, 0, (640, 480), format!("{dir}/ropes_yard.png").as_ref()).unwrap();
+}
+
+/// The practice yard with one fighter dropped (limp) into its pool or lava
+/// pit from `height` m over the surface.
+fn dropped_in(kind: crate::level::HazardKind, height: f32) -> (GameState, crate::level::HazardDef) {
+    // (with its dummies: alone in the yard, a round is over at once)
+    let mut s = GameState::new(4, crate::level::TRAINING, 7);
+    for _ in 0..20 {
+        s.step(&[0]);
+    }
+    let h = *s.hazards.iter().find(|h| h.kind == kind).unwrap();
+    lay_flat(&mut s, 0, Vec2::new(h.a.x, h.a.y + h.size.y + height));
+    (s, h)
+}
+
+#[test]
+fn bodies_float_in_water() {
+    let (mut s, h) = dropped_in(crate::level::HazardKind::Water, 1.5);
+    let mut lowest = f32::MAX;
+    for _ in 0..240 {
+        // (limp throughout, like a body)
+        s.fighters[0].down = 200;
+        s.step(&[0]);
+        lowest = lowest.min(s.fighters[0].pos(&s.world, PELVIS).y);
+    }
+    let (top, bottom) = (h.a.y + h.size.y, h.a.y - h.size.y);
+    let pelvis = s.fighters[0].pos(&s.world, PELVIS).y;
+    eprintln!("water: pelvis went down to {lowest:.2}, settled at {pelvis:.2} (surface {top:.2}, bottom {bottom:.2})");
+    assert!(lowest > bottom + 0.3, "it shouldn't reach the bottom");
+    assert!((pelvis - top).abs() < 0.35, "it floats at the surface ({pelvis:.2})");
+}
+
+#[test]
+fn bodies_sink_in_acid_and_lava_and_burn() {
+    use crate::level::HazardKind;
+    for kind in [HazardKind::Lava] {
+        let (mut s, h) = dropped_in(kind, 1.0);
+        let mut died = None;
+        for k in 0..300 {
+            s.step(&[0]);
+            if !s.fighters[0].alive {
+                died = Some(k);
+                break;
+            }
+        }
+        // (a moment on, before the round starts over)
+        for _ in 0..40 {
+            s.step(&[0]);
+        }
+        let bottom = h.a.y - h.size.y;
+        let pelvis = s.fighters[0].pos(&s.world, PELVIS).y;
+        eprintln!("{kind:?}: died after {died:?} frames, pelvis at {pelvis:.2} (bottom {bottom:.2}), scorched {:.2}", s.fighters[0].scorch);
+        assert!(pelvis < bottom + 0.45, "sunk to the bottom ({pelvis:.2})");
+        assert!(died.is_some_and(|k| k < 240), "it kills");
+        assert!(s.fighters[0].scorch > 0.5, "and burns");
+    }
+    // acid: in the sandbox, a vat to sink into
+    use crate::level::HazardDef;
+    let mut s = sandbox(&[]);
+    s.add_hazard(HazardDef { kind: HazardKind::Acid, a: Vec2::new(3.0, 1.0), b: Vec2::new(3.0, 1.0), size: Vec2::new(1.5, 1.0), speed: 0.0 });
+    lay_flat(&mut s, 0, Vec2::new(3.0, 2.8));
+    let hp = s.fighters[0].health;
+    for _ in 0..90 {
+        step(&mut s, 0, Vec2::new(0.6, 0.0));
+    }
+    let pelvis = s.fighters[0].pos(&s.world, PELVIS).y;
+    eprintln!("acid: hp {hp:.0} -> {:.0}, pelvis at {pelvis:.2}", s.fighters[0].health);
+    assert!(s.fighters[0].health < hp - 20.0, "acid eats them");
+    assert!(pelvis < 0.6, "and they sink in it ({pelvis:.2})");
+}
+
+#[test]
+fn you_can_swim_in_water_and_drown_if_held_under() {
+    let (mut s, h) = dropped_in(crate::level::HazardKind::Water, 0.5);
+    s.fighters[0].down = 0;
+    for _ in 0..120 {
+        s.step(&[0]);
+    }
+    let x0 = s.fighters[0].pos(&s.world, PELVIS).x;
+    // paddle right, stroking up now and then
+    let mut highest = f32::MIN;
+    for k in 0..40 {
+        let b = RIGHT | if k % 20 == 0 { JUMP } else { 0 };
+        s.step(&[input::encode(b, Vec2::new(0.6, 0.0))]);
+        highest = highest.max(s.fighters[0].pos(&s.world, NECK).y);
+    }
+    let x1 = s.fighters[0].pos(&s.world, PELVIS).x;
+    let top = h.a.y + h.size.y;
+    eprintln!("before holding them under: hp {:.0}, breath {}", s.fighters[0].health, s.fighters[0].breath);
+    eprintln!("swam from x {x0:.2} to {x1:.2}; neck up to {highest:.2} (surface {top:.2})");
+    assert!(x1 > x0 + 1.0, "paddling moves them along");
+    assert!(highest > top, "strokes bring them up for air");
+    // held under (pushed down hard), they run out of breath and drown
+    let (mut s, _) = dropped_in(crate::level::HazardKind::Water, 0.5);
+    for _ in 0..60 {
+        s.step(&[0]);
+    }
+    let mut drowned = None;
+    for k in 0..60 * 40 {
+        for id in s.fighters[0].particle_ids() {
+            let p = &mut s.world.particles[id as usize];
+            p.vel.y = p.vel.y.min(0.0) - 0.8;
+            p.vel.x *= 0.9;
+        }
+        s.step(&[0]);
+        if !s.fighters[0].alive {
+            drowned = Some(k);
+            break;
+        }
+    }
+    eprintln!("held under: drowned after {drowned:?} frames (breath {})", s.fighters[0].breath);
+    let k = drowned.expect("held under, they drown");
+    assert!(k > crate::sim::AIR as usize, "not before their breath runs out ({k})");
+    assert!(k > 60 * 18, "it takes a while ({:.1} s)", k as f32 / 60.0);
+}
+
+/// The highest drop over a liquid hazard's span (its surface, roughly).
+fn liquid_top(s: &GameState, h: &crate::level::HazardDef) -> f32 {
+    s.fluid.drops.iter().filter(|d| (d.pos.x - h.a.x).abs() < h.size.x).map(|d| d.pos.y).fold(f32::MIN, f32::max)
+}
+
+#[test]
+fn falling_in_splashes_and_raises_the_level() {
+    let (mut s, h) = dropped_in(crate::level::HazardKind::Water, 3.0);
+    let before = s.fluid.drops.len();
+    let rest = h.a.y + h.size.y;
+    let mut flung = 0;
+    let mut level = f32::MIN;
+    for _ in 0..100 {
+        s.fighters[0].down = 200;
+        s.step(&[0]);
+        flung = flung.max(s.fluid.drops.iter().filter(|d| d.pos.y > rest + 0.4).count());
+    }
+    // and settles again with the body floating (limp) in it
+    for _ in 0..360 {
+        s.fighters[0].down = 200;
+        s.step(&[0]);
+    }
+    let mut ys: Vec<f32> = s.fluid.drops.iter().filter(|d| (d.pos.x - h.a.x).abs() < h.size.x).map(|d| d.pos.y).collect();
+    ys.sort_by(|a, b| a.total_cmp(b));
+    level = level.max(ys[ys.len() * 97 / 100]);
+    let mut speeds: Vec<f32> = s.fluid.drops.iter().filter(|d| (d.pos.x - h.a.x).abs() < h.size.x).map(|d| d.vel.length()).collect();
+    speeds.sort_by(|a, b| a.total_cmp(b));
+    let fastest = speeds[speeds.len() * 95 / 100];
+    eprintln!("splash: up to {flung} drops thrown over 0.4 m above the surface; settled level {level:.2} (filled to {rest:.2}), {} of {before} drops left, 95% of the pool under {fastest:.2} m/s", s.fluid.drops.len());
+    assert!(flung >= 5, "drops thrown up");
+    assert_eq!(s.fluid.drops.len(), before, "none lost");
+    assert!(fastest < 1.0, "settling down again");
+}
+
+#[test]
+fn liquids_are_deterministic_under_rollback() {
+    let (s, _) = dropped_in(crate::level::HazardKind::Water, 2.0);
+    let mut st = stickfell_net::SyncTestSession::new(s, 8);
+    for k in 0..240 {
+        let b = if k > 100 { RIGHT | if k % 20 == 0 { JUMP } else { 0 } } else { 0 };
+        st.advance(&[input::encode(b, Vec2::new(0.6, 0.0))]).unwrap();
+    }
+    let (s, _) = dropped_in(crate::level::HazardKind::Lava, 1.0);
+    let mut st = stickfell_net::SyncTestSession::new(s, 8);
+    for _ in 0..200 {
+        st.advance(&[0]).unwrap();
+    }
+}
+
+#[test]
+#[ignore]
+fn screenshot_liquids() {
+    let dir = std::env::var("SHOT_DIR").unwrap_or_else(|_| ".".into());
+    use crate::level::HazardKind;
+    for (kind, name, frames) in [(HazardKind::Water, "water", [8usize, 30, 150]), (HazardKind::Lava, "lava", [8, 30, 150])] {
+        let (mut s, h) = dropped_in(kind, 2.5);
+        let mut k = 0;
+        for &at in &frames {
+            while k < at {
+                s.step(&[0]);
+                k += 1;
+            }
+            let mut c = CloseUp { game: s.clone(), at: Vec2::new(h.a.x, h.a.y + h.size.y - 0.3) };
+            stickfell_app::capture_headless(&mut c, 0, (800, 520), format!("{dir}/liquid_{name}_{at:03}.png").as_ref()).unwrap();
+        }
+    }
+    // the arenas' acid
+    for (level, name) in [(5usize, "acid_art_test"), (3, "acid_brickworks")] {
+        let mut s = GameState::new(1, level, 7);
+        let h = *s.hazards.iter().find(|h| h.kind == HazardKind::Acid).unwrap();
+        lay_flat(&mut s, 0, Vec2::new(h.a.x, h.a.y + h.size.y + 2.0));
+        for k in 1..=120 {
+            s.step(&[0]);
+            if k == 40 || k == 120 {
+                let mut c = CloseUp { game: s.clone(), at: Vec2::new(h.a.x, h.a.y + h.size.y) };
+                stickfell_app::capture_headless(&mut c, 0, (800, 520), format!("{dir}/liquid_{name}_{k}.png").as_ref()).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn trace_float() {
+    let (mut s, h) = dropped_in(crate::level::HazardKind::Water, 1.5);
+    for k in 0..240 {
+        s.fighters[0].down = 200;
+        s.step(&[0]);
+        if k % 10 == 0 {
+            let f = &s.fighters[0];
+            let p = |slot| f.pos(&s.world, slot);
+            eprintln!("    sample pelvis {:?} head {:?}", s.fluid.sample(p(PELVIS)).amount, s.fluid.sample(p(HEAD)).amount);
+            eprintln!("k{k:3} pelvis ({:.2},{:.2}) neck ({:.2},{:.2}) head ({:.2},{:.2}) foot y {:.2} surface {:.2} swim {} grounded {} vel {:.2}", p(PELVIS).x, p(PELVIS).y, p(NECK).x, p(NECK).y, p(HEAD).x, p(HEAD).y, p(fighter::FOOT_A).y, liquid_top(&s, &h), f.swimming, f.grounded, f.body_vel(&s.world).y);
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn trace_acid_drop() {
+    let mut s = GameState::new(1, 3, 7);
+    let h = *s.hazards.iter().find(|h| h.kind == crate::level::HazardKind::Acid).unwrap();
+    lay_flat(&mut s, 0, Vec2::new(h.a.x, h.a.y + h.size.y + 2.0));
+    for k in 0..300 {
+        s.step(&[0]);
+        let (i, d) = s.fluid.drops.iter().enumerate().max_by(|a, b| a.1.vel.length().total_cmp(&b.1.vel.length())).unwrap();
+        let low = s.fighters[0].particle_ids().map(|id| s.world.particles[id as usize].pos.y).fold(f32::MAX, f32::min);
+        let high = s.fluid.drops.iter().filter(|d| d.pos.y > h.a.y + h.size.y + 0.5).count();
+        let wet = s.fighters[0].wet;
+        eprintln!("k{k:2} body low {low:.2} vy {:.2} wet {wet} | fastest drop #{i} at ({:.2},{:.2}) vel ({:.1},{:.1}) | {high} drops 0.5 m up", s.fighters[0].body_vel(&s.world).y, d.pos.x, d.pos.y, d.vel.x, d.vel.y);
+        if [0, 30, 44, 60, 90, 150, 240, 299].contains(&k) {
+            // the level: median height of the top drop in each 0.24 m column across the pit
+            let mut tops = Vec::new();
+            let mut x = h.a.x - h.size.x + 0.12;
+            while x < h.a.x + h.size.x {
+                if let Some(t) = s.fluid.drops.iter().filter(|d| (d.pos.x - x).abs() < 0.12).map(|d| d.pos.y).reduce(f32::max) {
+                    tops.push(t);
+                }
+                x += 0.24;
+            }
+            tops.sort_by(|a, b| a.total_cmp(b));
+            eprintln!("k{k}: median surface {:.3} m over {} columns (rect top {:.3}), mean density {:.3} of rest", tops[tops.len() / 2], tops.len(), h.a.y + h.size.y, s.fluid.mean_density());
+        }
+        if k == 39 {
+            let mut up: Vec<(i32, i32)> = s.fluid.drops.iter().filter(|d| d.pos.y > h.a.y + h.size.y + 0.3).map(|d| ((d.pos.x * 10.0) as i32, (d.pos.y * 10.0) as i32)).collect();
+            up.sort();
+            eprintln!("drops 0.3+ up (x10): {up:?}");
+            let total = s.fluid.drops.len();
+            let under = s.fluid.drops.iter().filter(|d| d.pos.y < h.a.y + h.size.y).count();
+            eprintln!("{total} drops, {under} under the old surface; x range {:.2}..{:.2}", s.fluid.drops.iter().map(|d| d.pos.x).fold(f32::MAX, f32::min), s.fluid.drops.iter().map(|d| d.pos.x).fold(f32::MIN, f32::max));
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_body_displacement() {
+    // the area liquid can't get into around a standing fighter, on a 5 mm grid,
+    // for the drops' clearance around each capsule (0.4 and 1.0 of a drop's radius)
+    let s = sandbox(&[]);
+    let f = &s.fighters[0];
+    let drop_r = crate::liquid::DROP_SPACING * 0.5;
+    let segs: Vec<(Vec2, Vec2, f32)> = (0..fighter::BONES.len() as u32)
+        .map(|k| {
+            let sg = s.world.segments[(f.seg_base + k) as usize];
+            (s.world.particles[sg.a as usize].pos, s.world.particles[sg.b as usize].pos, sg.radius)
+        })
+        .collect();
+    let (lo, hi) = (Vec2::new(-1.5, -0.5), Vec2::new(1.5, 2.5));
+    let step = 0.005;
+    for clear in [0.0f32, 0.4, 1.0] {
+        let mut n = 0u64;
+        let (nx, ny) = (((hi.x - lo.x) / step) as i32, ((hi.y - lo.y) / step) as i32);
+        for iy in 0..ny {
+            for ix in 0..nx {
+                let p = lo + Vec2::new(ix as f32 + 0.5, iy as f32 + 0.5) * step;
+                if segs.iter().any(|&(a, b, r)| stickfell_physics::collide::point_segment(p, a, b).0 < r + drop_r * clear) {
+                    n += 1;
+                }
+            }
+        }
+        eprintln!("clearance {clear} x drop radius ({:.3} m): body keeps {:.3} m^2 clear of liquid", drop_r * clear, n as f64 * (step * step) as f64);
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_sim_cost() {
+    // the real per-frame simulation cost (release build), liquids included
+    for (level, players, name) in [(crate::level::TRAINING, 4usize, "training yard"), (3, 2, "brickworks"), (0, 2, "foundry")] {
+        let mut s = GameState::new(players, level, 7);
+        let drops = s.fluid.drops.len();
+        let inputs = vec![0u32; players];
+        for _ in 0..60 {
+            s.step(&inputs);
+        }
+        let n = 600;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            s.step(&inputs);
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        eprintln!("{name}: {drops} drops, {ms:.3} ms per simulated frame");
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_splash() {
+    for strength in [1.0f32, 1.05] {
+        let (mut s, h) = dropped_in(crate::level::HazardKind::Water, 3.0);
+        s.fluid.splash_strength = strength;
+        let rest = h.a.y + h.size.y;
+        let (mut over4, mut over8, mut peak) = (0, 0, f32::MIN);
+        for _ in 0..100 {
+            s.fighters[0].down = 200;
+            s.step(&[0]);
+            over4 = over4.max(s.fluid.drops.iter().filter(|d| d.pos.y > rest + 0.4).count());
+            over8 = over8.max(s.fluid.drops.iter().filter(|d| d.pos.y > rest + 0.8).count());
+            peak = peak.max(s.fluid.drops.iter().map(|d| d.pos.y).fold(f32::MIN, f32::max));
+        }
+        eprintln!("strength {strength}: up to {over4} drops 0.4 m up, {over8} 0.8 m up, highest {:.2} m above the surface", peak - rest);
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_settling() {
+    let (mut s, h) = dropped_in(crate::level::HazardKind::Water, 3.0);
+    for k in 1..=900 {
+        s.fighters[0].down = 200;
+        s.step(&[0]);
+        if k % 100 == 0 {
+            let mut v: Vec<f32> = s.fluid.drops.iter().filter(|d| (d.pos.x - h.a.x).abs() < h.size.x).map(|d| d.vel.length()).collect();
+            v.sort_by(|a, b| a.total_cmp(b));
+            let b = s.fighters[0].body_vel(&s.world);
+            let limb = s.fighters[0].particle_ids().map(|id| (s.world.particles[id as usize].vel - b).length()).fold(0.0f32, f32::max);
+            eprintln!("frame {k}: pool speed median {:.3}, 95% {:.3}, max {:.3} m/s | body vel ({:.2},{:.2}), fastest limb vs body {limb:.2}", v[v.len() / 2], v[v.len() * 95 / 100], v[v.len() - 1], b.x, b.y);
+        }
+    }
+    // the same pool with nobody in it
+    let (mut s, h) = dropped_in(crate::level::HazardKind::Water, 0.0);
+    let me = s.fighters[0].pos(&s.world, PELVIS);
+    teleport(&mut s, 0, Vec2::new(-12.0 - me.x, 1.0 - me.y));
+    for k in 1..=600 {
+        s.step(&[0]);
+        if k % 200 == 0 {
+            let mut v: Vec<f32> = s.fluid.drops.iter().filter(|d| (d.pos.x - h.a.x).abs() < h.size.x).map(|d| d.vel.length()).collect();
+            v.sort_by(|a, b| a.total_cmp(b));
+            eprintln!("empty pool frame {k}: median {:.3}, 95% {:.3}, max {:.3} m/s", v[v.len() / 2], v[v.len() * 95 / 100], v[v.len() - 1]);
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_floating_body() {
+    // how much a limp body keeps moving in the pool, against the drops' push-back
+    for push in [0.5f32] {
+        let (mut s, _) = dropped_in(crate::level::HazardKind::Water, 1.0);
+        s.fluid.push_back = push;
+        let (mut vy, mut limb, mut ax, mut ay) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        let mut n = 0.0;
+        for k in 1..=600 {
+            s.fighters[0].down = 200;
+            s.step(&[0]);
+            if k > 300 {
+                let b = s.fighters[0].body_vel(&s.world);
+                vy += b.length();
+                ax += b.x.abs();
+                ay += b.y.abs();
+                limb += s.fighters[0].particle_ids().map(|id| (s.world.particles[id as usize].vel - b).length()).sum::<f32>() / fighter::PARTICLES as f32;
+                n += 1.0;
+            }
+        }
+        eprintln!("push_back {push}: frames 300-600, mean body speed {:.3} m/s (|vx| {:.3}, |vy| {:.3}), mean limb speed vs body {:.3} m/s, pelvis x {:.2}", vy / n, ax / n, ay / n, limb / n, s.fighters[0].pos(&s.world, PELVIS).x);
+    }
+}
+
+/// The yard's pool, settled, with a fighter standing well clear of it.
+fn still_pool() -> (GameState, crate::level::HazardDef) {
+    let (mut s, h) = dropped_in(crate::level::HazardKind::Water, 0.0);
+    let me = s.fighters[0].pos(&s.world, PELVIS);
+    teleport(&mut s, 0, Vec2::new(-12.0 - me.x, 1.0 - me.y));
+    for _ in 0..60 {
+        s.step(&[0]);
+    }
+    (s, h)
+}
+
+/// How far from `at` the dye has reached (drops with at least `min` of it),
+/// and how many drops that is.
+fn stain(s: &GameState, at: Vec2, min: f32) -> (f32, usize) {
+    let dyed: Vec<f32> = s.fluid.drops.iter().filter(|d| d.dye >= min).map(|d| (d.pos - at).length()).collect();
+    (dyed.iter().copied().fold(0.0, f32::max), dyed.len())
+}
+
+#[test]
+#[ignore]
+fn measure_blood_in_water() {
+    let (mut s, h) = still_pool();
+    let at = Vec2::new(h.a.x, h.a.y);
+    // a burst of blood right in the middle of the pool
+    s.spawn_blood(at, Vec2::Y, 30, 1.0);
+    let sparks = s.sparks.iter().filter(|sp| sp.blood).count();
+    s.step(&[0]);
+    let left = s.sparks.iter().filter(|sp| sp.blood).count();
+    let total = s.fluid.total_dye();
+    eprintln!("{sparks} blood sparks in the water, {left} still flying after a frame; dye in the water {total:.3} (each spark {})", crate::liquid::BLOOD_DYE);
+    for k in 1..=900 {
+        s.step(&[0]);
+        if [60, 180, 300, 600, 900].contains(&k) {
+            let (r1, n1) = stain(&s, at, 0.01);
+            let (r10, n10) = stain(&s, at, 0.1);
+            let peak = s.fluid.drops.iter().map(|d| d.dye).fold(0.0f32, f32::max);
+            eprintln!("{:.0} s: dye {:.3} total; >=0.01 in {n1} drops out to {r1:.2} m, >=0.1 in {n10} drops out to {r10:.2} m; strongest {peak:.3}", k as f32 / 60.0, s.fluid.total_dye());
+        }
+    }
+}
+
+#[test]
+fn blood_mixes_into_water_and_spreads_without_vanishing() {
+    let (mut s, h) = still_pool();
+    let at = Vec2::new(h.a.x, h.a.y);
+    s.spawn_blood(at, Vec2::Y, 20, 1.0);
+    s.step(&[0]);
+    assert_eq!(s.sparks.iter().filter(|sp| sp.blood).count(), 0, "blood in the water is taken in by it");
+    let total = s.fluid.total_dye();
+    let (_, near) = stain(&s, at, 0.01);
+    for _ in 0..300 {
+        s.step(&[0]);
+    }
+    let (reach, wide) = stain(&s, at, 0.01);
+    let after = s.fluid.total_dye();
+    eprintln!("blood: {total:.3} dye in {near} drops, 5 s later {after:.3} in {wide} drops out to {reach:.2} m");
+    assert!((after - total).abs() < 1e-3 * total, "none made or lost spreading");
+    assert!(wide > near * 2 && reach > 1.0, "it spreads through the water");
+    assert!(s.fluid.drops.iter().filter(|d| d.kind != crate::liquid::WATER_DROP).all(|d| d.dye == 0.0), "only water takes it");
+}
+
+#[test]
+fn bleeding_into_water_is_deterministic_under_rollback() {
+    let (mut s, h) = still_pool();
+    s.spawn_blood(Vec2::new(h.a.x, h.a.y), Vec2::Y, 20, 1.0);
+    let mut st = stickfell_net::SyncTestSession::new(s, 8);
+    for _ in 0..120 {
+        st.advance(&[0, 0, 0, 0]).unwrap();
+    }
+}
+
+#[test]
+#[ignore]
+fn screenshot_blood_in_water() {
+    let dir = std::env::var("SHOT_DIR").unwrap_or_else(|_| ".".into());
+    let (mut s, h) = still_pool();
+    let at = Vec2::new(h.a.x - 0.8, h.a.y + 0.4);
+    for k in 1..=360 {
+        // a wound pouring into the water for the first two seconds
+        if k <= 120 && k % 6 == 0 {
+            s.spawn_blood(at, Vec2::Y, 3, 0.5);
+        }
+        s.step(&[0]);
+        if [60, 180, 360].contains(&k) {
+            let mut c = CloseUp { game: s.clone(), at: Vec2::new(h.a.x, h.a.y + 0.3) };
+            stickfell_app::capture_headless(&mut c, 0, (800, 520), format!("{dir}/blood_water_{k}.png").as_ref()).unwrap();
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_flood_cost() {
+    use crate::level::{HazardDef, HazardKind};
+    for depth in [1.0f32, 1.5, 2.0] {
+        let mut s = GameState::new(4, crate::level::TRAINING, 7);
+        let before = s.fluid.drops.len();
+        let a = Vec2::new(-13.0, depth * 0.5);
+        s.add_hazard(HazardDef { kind: HazardKind::Water, a, b: a, size: Vec2::new(42.5, depth * 0.5), speed: 0.0 });
+        let drops = s.fluid.drops.len();
+        for _ in 0..120 {
+            s.step(&[0, 0, 0, 0]);
+        }
+        let n = 300;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            s.step(&[0, 0, 0, 0]);
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        eprintln!("flood {depth} m deep over the yard floor: {} more drops ({drops} in all): {ms:.3} ms per frame", drops - before);
+    }
+}
+
+/// The practice yard with you up on the chimney, by the flood lever.
+fn at_the_lever() -> GameState {
+    let mut s = GameState::new(4, crate::level::TRAINING, 7);
+    let def = s.trap.def.expect("the yard has a flood trap");
+    let me = s.fighters[0].pos(&s.world, PELVIS);
+    teleport(&mut s, 0, Vec2::new(def.lever.x - 0.45 - me.x, def.lever.y + 1.0 - me.y));
+    for _ in 0..40 {
+        s.step(&[input::encode(0, Vec2::new(0.6, 0.0))]);
+    }
+    s
+}
+
+/// Works the lever (E) from where `at_the_lever` left you.
+fn throw_lever(s: &mut GameState) {
+    for k in 0..10 {
+        let b = if k == 5 { PICKUP } else { 0 };
+        let mut inputs = vec![0; s.fighters.len()];
+        inputs[0] = input::encode(b, Vec2::new(0.6, 0.2));
+        s.step(&inputs);
+    }
+}
+
+#[test]
+fn the_lever_up_top_opens_and_shuts_the_flood_hatch() {
+    let mut s = at_the_lever();
+    let def = s.trap.def.unwrap();
+    let before = s.fluid.drops.len();
+    throw_lever(&mut s);
+    assert!(s.trap.open, "pressing E by the lever throws it open");
+    // pouring at its rate once the doors are open
+    let secs = 3.0;
+    for _ in 0..(secs * 60.0) as u32 {
+        s.step(&[0, 0, 0, 0]);
+    }
+    let poured = s.fluid.drops.len() - before;
+    let want = def.pour_rate * secs;
+    eprintln!("open {secs} s: {poured} drops in (pouring {} a second; {want:.0} over {secs} s less the doors opening)", def.pour_rate);
+    assert!(poured as f32 > want * 0.5 && poured as f32 <= want, "it pours while open ({poured})");
+    assert!(s.trap.hatch(s.round_frame) == 1.0);
+    // thrown back: it shuts, and no more comes
+    throw_lever(&mut s);
+    assert!(!s.trap.open, "pressing E again shuts it");
+    let shut = s.fluid.drops.len();
+    for _ in 0..120 {
+        s.step(&[0, 0, 0, 0]);
+    }
+    assert_eq!(s.fluid.drops.len(), shut, "shut, no more water comes in");
+    assert_eq!(s.trap.hatch(s.round_frame), 0.0, "the doors are shut");
+    // and open again
+    throw_lever(&mut s);
+    assert!(s.trap.open);
+    for _ in 0..60 {
+        s.step(&[0, 0, 0, 0]);
+    }
+    assert!(s.fluid.drops.len() > shut, "opened again, it pours again");
+}
+
+#[test]
+#[ignore]
+fn measure_full_flood() {
+    let caps: Vec<u32> = std::env::var("FLOOD_CAPS").ok().map_or(vec![0], |v| v.split(',').map(|c| c.parse().unwrap()).collect());
+    for cap in caps {
+    let mut s = at_the_lever();
+    if cap > 0 {
+        s.trap.def = Some(crate::level::TrapDef { max_drops: cap, ..s.trap.def.unwrap() });
+    }
+    let def = s.trap.def.unwrap();
+    throw_lever(&mut s);
+    let mut frames = 0;
+    while (s.fluid.drops.len() as u32) < def.max_drops && frames < 60 * 90 {
+        s.step(&[0, 0, 0, 0]);
+        frames += 1;
+    }
+    for _ in 0..60 * 10 {
+        s.step(&[0, 0, 0, 0]);
+    }
+    let n = 120;
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        s.step(&[0, 0, 0, 0]);
+    }
+    let ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+    let mut tops: Vec<f32> = (-50..=28)
+        .step_by(4)
+        .filter_map(|x| s.fluid.drops.iter().filter(|d| (d.pos.x - x as f32).abs() < 0.3 && d.kind == crate::liquid::WATER_DROP).map(|d| d.pos.y).reduce(f32::max))
+        .collect();
+    tops.sort_by(|a, b| a.total_cmp(b));
+    eprintln!("full ({} drops, cap {}) after {:.1} s pouring; water surface across the yard: lowest {:.2}, median {:.2}, highest {:.2} m; {ms:.2} ms a frame settled", s.fluid.drops.len(), def.max_drops, frames as f32 / 60.0, tops[0], tops[tops.len() / 2], tops[tops.len() - 1]);
+    assert!(s.fluid.drops.len() as u32 <= def.max_drops);
+    }
+}
+
+#[test]
+fn the_flood_is_deterministic_under_rollback() {
+    let mut s = at_the_lever();
+    for k in 0..10 {
+        let b = if k == 5 { PICKUP } else { 0 };
+        s.step(&[input::encode(b, Vec2::new(0.6, 0.2))]);
+    }
+    assert!(s.trap.open);
+    let mut st = stickfell_net::SyncTestSession::new(s, 8);
+    for _ in 0..150 {
+        st.advance(&[0, 0, 0, 0]).unwrap();
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_lever_reach() {
+    let mut s = at_the_lever();
+    let def = s.trap.def.unwrap();
+    let handle = def.handle(0.0);
+    for k in 0..10 {
+        let b = if k == 5 { PICKUP } else { 0 };
+        s.step(&[input::encode(b, Vec2::new(0.6, 0.2))]);
+        let f = &s.fighters[0];
+        let (a, bb) = (f.pos(&s.world, HAND_A), f.pos(&s.world, fighter::HAND_B));
+        eprintln!("k{k}: pelvis {:?} hands {:?} {:?}, handle {:?}: {:.2} / {:.2} m; pressed {} down {} alive {}", f.pos(&s.world, PELVIS), a, bb, handle, (a - handle).length(), (bb - handle).length(), f.pressed(PICKUP), f.down, f.alive);
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_flood_level() {
+    let mut s = at_the_lever();
+    for k in 0..10 {
+        let b = if k == 5 { PICKUP } else { 0 };
+        s.step(&[input::encode(b, Vec2::new(0.6, 0.2))]);
+    }
+    for k in 1..=60 * 40 {
+        s.step(&[0]);
+        if k % (60 * 8) == 0 {
+            let mut cols = String::new();
+            for x in [-50.0f32, -40.0, -30.0, -18.0, -10.0, -6.0, 0.0, 6.0, 16.0, 25.0] {
+                let top = s.fluid.drops.iter().filter(|d| (d.pos.x - x).abs() < 0.3).map(|d| d.pos.y).fold(f32::MIN, f32::max);
+                cols += &format!(" x{x}:{top:.2}");
+            }
+            eprintln!("{:.0} s ({} drops, density {:.3}):{cols}", k as f32 / 60.0, s.fluid.drops.len(), s.fluid.mean_density());
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_flooded_cost() {
+    let mut s = at_the_lever();
+    for k in 0..10 {
+        let b = if k == 5 { PICKUP } else { 0 };
+        s.step(&[input::encode(b, Vec2::new(0.6, 0.2))]);
+    }
+    for _ in 0..60 * 30 {
+        s.step(&[0, 0, 0, 0]);
+    }
+    let n = 300;
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        s.step(&[0, 0, 0, 0]);
+    }
+    eprintln!("flooded yard: {} drops, {:.3} ms per simulated frame", s.fluid.drops.len(), t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+    let follow = 1;
+    eprintln!("camera on fighter {follow} at {:?}", s.fighters[follow].pos(&s.world, PELVIS));
+    let mut sp = crate::Spectate { game: s, follow, cam: Vec2::ZERO, levels: crate::level::levels() };
+    stickfell_app::bench_headless(&mut sp, 1, (1920, 1080), 200).unwrap();
+}
+
+#[test]
+#[ignore]
+fn screenshot_flood() {
+    let dir = std::env::var("SHOT_DIR").unwrap_or_else(|_| ".".into());
+    let mut s = at_the_lever();
+    let def = s.trap.def.unwrap();
+    for k in 0..10 {
+        let b = if k == 5 { PICKUP } else { 0 };
+        s.step(&[input::encode(b, Vec2::new(0.6, 0.2))]);
+    }
+    let mut c = CloseUp { game: s.clone(), at: def.lever + Vec2::new(0.0, 0.8) };
+    stickfell_app::capture_headless(&mut c, 0, (640, 420), format!("{dir}/flood_lever.png").as_ref()).unwrap();
+    for k in 1..=60 * 30 {
+        s.step(&[0, 0, 0, 0]);
+        if [120, 600, 1800].contains(&k) {
+            let mut sp = crate::Spectate { game: s.clone(), follow: 1, cam: Vec2::ZERO, levels: crate::level::levels() };
+            stickfell_app::capture_headless(&mut sp, 0, (1100, 620), format!("{dir}/flood_{k}.png").as_ref()).unwrap();
+        }
+    }
+}
+
+#[test]
+fn water_poured_on_lava_boils_off_and_cools_it_to_rock() {
+    use crate::liquid::{LAVA_DROP, WATER_DROP};
+    let mut s = GameState::new(4, crate::level::TRAINING, 7);
+    let h = *s.hazards.iter().find(|h| h.kind == crate::level::HazardKind::Lava).unwrap();
+    let lava = s.fluid.drops.iter().filter(|d| d.kind == LAVA_DROP).count();
+    let top = h.a.y + h.size.y;
+    // a stream of water onto the middle of the pit
+    let mut poured = 0;
+    for k in 0..600 {
+        if k < 300 && k % 2 == 0 {
+            for i in 0..6 {
+                let x = h.a.x - 0.36 + i as f32 * 0.12;
+                s.fluid.pour(Vec2::new(x, top + 1.5), Vec2::new(0.0, -3.0), WATER_DROP);
+                poured += 1;
+            }
+        }
+        s.step(&[0, 0, 0, 0]);
+    }
+    let water = s.fluid.drops.iter().filter(|d| d.kind == WATER_DROP && (d.pos.x - h.a.x).abs() < h.size.x + 2.0 && d.pos.y > h.a.y - h.size.y - 0.5).count();
+    let lava_now = s.fluid.drops.iter().filter(|d| d.kind == LAVA_DROP).count();
+    let rock = s.fluid.drops.iter().filter(|d| d.kind == LAVA_DROP && d.dye >= 1.0).count();
+    let warm = s.fluid.drops.iter().filter(|d| d.kind == LAVA_DROP && d.dye > 0.0 && d.dye < 1.0).count();
+    let steam = s.sparks.iter().filter(|sp| sp.steam).count();
+    eprintln!("lava pit: {poured} water drops poured, {water} still there; lava {lava} -> {lava_now} drops, {rock} cooled to rock, {warm} cooling; {steam} steam puffs flying");
+    assert_eq!(lava_now, lava, "lava doesn't vanish, it cools");
+    assert!(water < poured, "water boils off it");
+    assert!(rock > 0, "and cools it to rock");
+}
+
+#[test]
+#[ignore]
+fn measure_water_on_lava_layers() {
+    use crate::liquid::{LAVA_DROP, WATER_DROP};
+    let mut s = GameState::new(4, crate::level::TRAINING, 7);
+    let h = *s.hazards.iter().find(|h| h.kind == crate::level::HazardKind::Lava).unwrap();
+    let top = h.a.y + h.size.y;
+    for k in 0..600 {
+        if k < 300 && k % 2 == 0 {
+            for i in 0..6 {
+                s.fluid.pour(Vec2::new(h.a.x - 0.36 + i as f32 * 0.12, top + 1.5), Vec2::new(0.0, -3.0), WATER_DROP);
+            }
+        }
+        s.step(&[0, 0, 0, 0]);
+    }
+    let mean_y = |kind: u8, rock: Option<bool>| {
+        let ys: Vec<f32> = s.fluid.drops.iter().filter(|d| d.kind == kind && (d.pos.x - h.a.x).abs() < h.size.x && rock.is_none_or(|r| (d.dye >= 1.0) == r)).map(|d| d.pos.y).collect();
+        (ys.iter().sum::<f32>() / ys.len().max(1) as f32, ys.len())
+    };
+    let (w, wn) = mean_y(WATER_DROP, None);
+    let (hot, hn) = mean_y(LAVA_DROP, Some(false));
+    let (rock, rn) = mean_y(LAVA_DROP, Some(true));
+    eprintln!("over the pit: water mean y {w:.2} ({wn} drops), hot lava {hot:.2} ({hn}), rock {rock:.2} ({rn}); pit bottom {:.2}, top {top:.2}", h.a.y - h.size.y);
+}
+
+/// Both fighters standing in a walled tank of water `depth` m deep (they're
+/// 0.9 m apart, as for a shoulder throw).
+fn wading(depth: f32) -> GameState {
+    use crate::level::{HazardDef, HazardKind};
+    let mut s = sandbox(&[(Vec2::new(-6.5, 0.0), Vec2::new(-6.0, 4.0)), (Vec2::new(6.0, 0.0), Vec2::new(6.5, 4.0))]);
+    let off = Vec2::new(0.9 - 30.0, 0.0);
+    for id in s.fighters[1].particle_ids() {
+        let p = &mut s.world.particles[id as usize];
+        p.pos += off;
+        p.prev += off;
+    }
+    let a = Vec2::new(0.0, depth * 0.5);
+    s.add_hazard(HazardDef { kind: HazardKind::Water, a, b: a, size: Vec2::new(6.0, depth * 0.5), speed: 0.0 });
+    s
+}
+
+#[test]
+#[ignore]
+fn measure_wading_depth() {
+    for depth in [0.3f32, 0.6, 0.9, 1.2, 1.6] {
+        let s = &mut wading(depth);
+        for _ in 0..120 {
+            step(s, 0, Vec2::new(0.6, 0.0));
+        }
+        let f = &s.fighters[0];
+        let pelvis = f.pos(&s.world, PELVIS);
+        let at = s.fluid.sample(pelvis).total();
+        let top = s.fluid.drops.iter().filter(|d| d.pos.x.abs() < 3.0).map(|d| d.pos.y).fold(f32::MIN, f32::max);
+        eprintln!("water {depth} m deep (surface now {top:.2}): pelvis at {:.2} m, liquid there {at:.3}, grounded {}", pelvis.y, f.grounded);
+    }
+}
+
+/// The torso's angle from straight up (radians, 0 upright, pi/2 flat).
+fn torso_tilt(s: &GameState, fi: usize) -> f32 {
+    let f = &s.fighters[fi];
+    let d = f.pos(&s.world, NECK) - f.pos(&s.world, PELVIS);
+    stickfell_physics::dmath::angle_diff(stickfell_physics::dmath::angle(d), core::f32::consts::FRAC_PI_2).abs()
+}
+
+#[test]
+fn swimmers_swim_laid_out_the_way_they_go_and_tread_water_upright() {
+    // a tank 12 m wide and 2.5 m deep, the other fighter well out of it
+    let mut s = wading(2.5);
+    teleport(&mut s, 1, Vec2::new(20.0, 0.0));
+    let surface = 2.5;
+    for _ in 0..90 {
+        s.step(&[0, 0]);
+    }
+    let tread = torso_tilt(&s, 0);
+    let swimming = s.fighters[0].swimming;
+    // swim right along the pool
+    let x0 = s.fighters[0].pos(&s.world, PELVIS).x;
+    let mut flat = 0.0;
+    for k in 0..60 {
+        s.step(&[input::encode(RIGHT, Vec2::new(0.6, 0.0)), 0]);
+        if k >= 30 {
+            flat += torso_tilt(&s, 0) / 30.0;
+        }
+    }
+    let x1 = s.fighters[0].pos(&s.world, PELVIS).x;
+    // dive, then come back up
+    let y0 = s.fighters[0].pos(&s.world, PELVIS).y;
+    for _ in 0..60 {
+        s.step(&[input::encode(CROUCH, Vec2::new(0.6, 0.0)), 0]);
+    }
+    let deep = s.fighters[0].pos(&s.world, PELVIS).y;
+    for _ in 0..60 {
+        s.step(&[input::encode(JUMP, Vec2::new(0.6, 0.0)), 0]);
+    }
+    let up = s.fighters[0].pos(&s.world, PELVIS).y;
+    eprintln!("swim: swimming {swimming}, treading tilt {tread:.2} rad; swam {:.2} m right in 1 s, mean tilt {flat:.2} rad; dived {y0:.2} -> {deep:.2}, back up to {up:.2} (surface {surface:.2})", x1 - x0);
+    assert!(swimming, "in out of their depth, they swim");
+    assert!(tread < 0.6, "treading water upright ({tread:.2})");
+    assert!(x1 - x0 > 1.5, "swimming gets them along ({:.2} m)", x1 - x0);
+    assert!(flat > 0.9, "laid out swimming ({flat:.2} rad from upright)");
+    // (measured 0.45 m in the first second: the water pushes back on the head going down)
+    assert!(deep < y0 - 0.35, "crouch dives ({:.2} m)", y0 - deep);
+    assert!(up > deep + 0.5, "jump swims back up");
+}
+
+#[test]
+fn no_shoulder_throws_waist_deep_in_water() {
+    for (depth, can) in [(0.0f32, true), (1.2, false)] {
+        let mut s = if depth > 0.0 { wading(depth) } else { pair(0.9) };
+        for _ in 0..60 {
+            s.step(&[input::encode(0, Vec2::new(0.6, 0.0)), input::encode(0, Vec2::new(-0.6, 0.0))]);
+        }
+        let (mut thrown, mut held, mut peak) = (false, false, f32::MIN);
+        for k in 0..90 {
+            let b = shoulder_throw_input(&s, k);
+            s.step(&[b, input::encode(0, Vec2::new(-0.6, 0.0))]);
+            thrown |= s.fighters[0].shoulder > 0;
+            held |= s.fighters[0].hold.is_some();
+            peak = peak.max(s.fighters[1].pos(&s.world, NECK).y);
+        }
+        eprintln!("water {depth} m: wade {:.2}, got hold of them {held}, shoulder throw {thrown}, their neck went up to {peak:.2} m", s.fighters[0].wade);
+        assert!(held, "the grab itself works ({depth} m of water)");
+        assert_eq!(thrown, can, "{depth} m of water");
+    }
+}
+
+#[test]
+#[ignore]
+fn trace_swim() {
+    let (mut s, _) = dropped_in(crate::level::HazardKind::Water, 0.3);
+    s.fighters[0].down = 0;
+    for _ in 0..90 {
+        s.step(&[0]);
+    }
+    for k in 0..150 {
+        let b = if k < 60 { RIGHT } else if k < 105 { CROUCH } else { JUMP };
+        s.step(&[input::encode(b, Vec2::new(0.6, 0.0))]);
+        if k % 8 == 0 {
+            let f = &s.fighters[0];
+            eprintln!("k{k:3} key {b:3}: swimming {} wade {:.2} grounded {} down {} dir {:?} tilt {:.2} pelvis {:?} vel {:?} strength {:.2}", f.swimming, f.wade, f.grounded, f.down, f.swim_dir(), torso_tilt(&s, 0), f.pos(&s.world, PELVIS), f.body_vel(&s.world), f.strength());
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_standing_underwater() {
+    let mut s = wading(2.5);
+    teleport(&mut s, 1, Vec2::new(20.0, 0.0));
+    let mut bob = 0.0f32;
+    for k in 0..240 {
+        s.step(&[0, 0]);
+        if k >= 120 {
+            bob = bob.max(s.fighters[0].body_vel(&s.world).y.abs());
+        }
+        if k % 30 == 29 {
+            let f = &s.fighters[0];
+            let subs: Vec<String> = f.particle_ids().map(|id| format!("{:.2}", s.fluid.sample(s.world.particles[id as usize].pos).total())).collect();
+            eprintln!("k{k}: pelvis {:?} grounded {} swimming {} wade {:.2} vel {:?}; liquid at each part {:?}", f.pos(&s.world, PELVIS), f.grounded, f.swimming, f.wade, f.body_vel(&s.world), subs);
+            let _ = &subs;
+        }
+    }
+    eprintln!("treading, seconds 2-4: fastest bob {bob:.2} m/s");
+}
+
+#[test]
+#[ignore]
+fn trace_grab_in_water() {
+    let mut s = wading(1.2);
+    for _ in 0..60 {
+        s.step(&[input::encode(0, Vec2::new(0.6, 0.0)), input::encode(0, Vec2::new(-0.6, 0.0))]);
+    }
+    for k in 0..40 {
+        let b = shoulder_throw_input(&s, k);
+        s.step(&[b, input::encode(0, Vec2::new(-0.6, 0.0))]);
+        if k % 4 == 0 {
+            let (a, v) = (&s.fighters[0], &s.fighters[1]);
+            eprintln!("k{k}: me {:?} swimming {} wade {:.2} grabbing {} hold {:?} | them {:?} swimming {} | hand B {:?} their neck {:?}", a.pos(&s.world, PELVIS), a.swimming, a.wade, a.grabbing, a.hold, v.pos(&s.world, PELVIS), v.swimming, a.pos(&s.world, fighter::HAND_B), v.pos(&s.world, NECK));
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn screenshot_swimming() {
+    let dir = std::env::var("SHOT_DIR").unwrap_or_else(|_| ".".into());
+    let mut s = wading(2.5);
+    teleport(&mut s, 1, Vec2::new(20.0, 0.0));
+    for _ in 0..90 {
+        s.step(&[0, 0]);
+    }
+    let shot = |s: &GameState, name: &str| {
+        let at = s.fighters[0].pos(&s.world, PELVIS) + Vec2::new(0.0, 0.2);
+        let mut c = CloseUp { game: s.clone(), at };
+        stickfell_app::capture_headless(&mut c, 0, (640, 420), format!("{dir}/swim_{name}.png").as_ref()).unwrap();
+    };
+    shot(&s, "tread");
+    for k in 0..40 {
+        s.step(&[input::encode(RIGHT, Vec2::new(0.6, 0.0)), 0]);
+        if k == 25 || k == 32 {
+            shot(&s, &format!("crawl_{k}"));
+        }
+    }
+    for _ in 0..30 {
+        s.step(&[input::encode(CROUCH, Vec2::new(0.6, 0.0)), 0]);
+    }
+    shot(&s, "dive");
+}
+
+#[test]
+#[ignore]
+fn measure_sword_in_water() {
+    for with_sword in [false, true] {
+        let (mut s, h) = still_pool();
+        let at = Vec2::new(h.a.x, h.a.y + h.size.y + 1.0);
+        let wi = if with_sword {
+            s.spawn_weapon(0, at);
+            Some(s.weapons.len() - 1)
+        } else {
+            None
+        };
+        let mut last_ang = 0.0f32;
+        for k in 1..=1200u32 {
+            s.step(&[0]);
+            if k % 120 != 0 {
+                if let Some(wi) = wi {
+                    let w = &s.weapons[wi];
+                    let (a, b) = (s.world.particles[w.particle(0) as usize].pos, s.world.particles[w.particle(w.n - 1) as usize].pos);
+                    last_ang = dmath::angle(b - a);
+                }
+                continue;
+            }
+            let (centre, sword) = match wi {
+                Some(wi) => {
+                    let w = &s.weapons[wi];
+                    let (a, b) = (s.world.particles[w.particle(0) as usize].pos, s.world.particles[w.particle(w.n - 1) as usize].pos);
+                    let spin = dmath::angle_diff(dmath::angle(b - a), last_ang) * 60.0;
+                    let (vmax, vmean) = weapon_speeds(&s, wi);
+                    ((a + b) * 0.5, format!("sword mid ({:+.2},{:+.2}) ang {:+.2} spin {:+.2} rad/s, speed max {vmax:.3} mean {vmean:.3}", (a + b).x * 0.5, (a + b).y * 0.5, dmath::angle(b - a), spin))
+                }
+                None => (Vec2::new(h.a.x, h.a.y - h.size.y + 0.3), String::from("no sword")),
+            };
+            let near: Vec<f32> = s.fluid.drops.iter().filter(|d| (d.pos - centre).length() < 0.6).map(|d| d.vel.length()).collect();
+            let far: Vec<f32> = s.fluid.drops.iter().filter(|d| (d.pos.x - h.a.x).abs() < h.size.x && (d.pos - centre).length() > 1.5).map(|d| d.vel.length()).collect();
+            let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
+            let mx = |v: &[f32]| v.iter().copied().fold(0.0f32, f32::max);
+            eprintln!("{:4.1} s: {sword} | drops within 0.6 m: {} mean {:.3} max {:.3} | far: mean {:.3} max {:.3}", k as f32 / 60.0, near.len(), mean(&near), mx(&near), mean(&far), mx(&far));
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn trace_sword_in_water() {
+    let (mut s, h) = still_pool();
+    s.spawn_weapon(0, Vec2::new(h.a.x, h.a.y + h.size.y + 1.0));
+    let wi = s.weapons.len() - 1;
+    let ids: Vec<usize> = (0..s.weapons[wi].n).map(|k| s.weapons[wi].particle(k) as usize).collect();
+    let segs: Vec<usize> = (0..s.weapons[wi].nseg as usize).map(|k| s.weapons[wi].seg_base as usize + k).collect();
+    eprintln!("sword particles {ids:?} segs {segs:?}");
+    for &sg in &segs {
+        let g = s.world.segments[sg];
+        eprintln!("  seg {sg}: {}-{} radius {:.3} enabled {}", g.a, g.b, g.radius, g.enabled);
+    }
+    for &id in &ids {
+        let p = s.world.particles[id];
+        eprintln!("  particle {id}: inv_mass {:.3} radius {:.3}", p.inv_mass, p.radius);
+    }
+    let ke = |s: &GameState| ids.iter().map(|&i| { let p = s.world.particles[i]; if p.inv_mass > 0.0 { 0.5 / p.inv_mass * p.vel.length_squared() } else { 0.0 } }).sum::<f32>();
+    for k in 1..=900u32 {
+        // what each stage does to the sword's energy, this frame
+        let mut a = s.clone();
+        let e0 = ke(&a);
+        a.update_liquids(DT);
+        let e1 = ke(&a);
+        a.world.step(DT);
+        let e2 = ke(&a);
+        a.fluid.step(DT, &mut a.world);
+        let e3 = ke(&a);
+        s.step(&[0]);
+        if k % 30 == 0 || (k > 60 && k < 140 && k % 5 == 0) {
+            let mid = (s.world.particles[ids[0]].pos + s.world.particles[ids[ids.len() - 1]].pos) * 0.5;
+            let near: Vec<&stickfell_physics::Drop> = s.fluid.drops.iter().filter(|d| (d.pos - mid).length() < 0.7).collect();
+            let fast = near.iter().filter(|d| d.vel.length() > 2.0).count();
+            eprintln!("{:5.2}s mid ({:+.2},{:+.2}) KE {e0:.3} -> liquids {e1:.3} -> world {e2:.3} -> fluid {e3:.3} | {} drops near, {fast} over 2 m/s", k as f32 / 60.0, mid.x, mid.y, near.len());
+        }
+    }
+    let mid = (s.world.particles[ids[0]].pos + s.world.particles[ids[ids.len() - 1]].pos) * 0.5;
+    for d in s.fluid.drops.iter().filter(|d| (d.pos - mid).length() < 0.7) {
+        let inside = s.world.statics.iter().any(|o| o.collide_circle(d.pos, s.fluid.radius).is_some());
+        let near_seg = segs.iter().map(|&sg| { let g = s.world.segments[sg]; let (pa, pb) = (s.world.particles[g.a as usize].pos, s.world.particles[g.b as usize].pos); stickfell_physics::collide::point_segment(d.pos, pa, pb).0 - g.radius }).fold(f32::MAX, f32::min);
+        eprintln!("  drop ({:+.3},{:+.3}) vel ({:+.2},{:+.2}) touching static {inside} gap to sword {near_seg:+.3}", d.pos.x, d.pos.y, d.vel.x, d.vel.y);
+    }
+    for &id in &ids {
+        let p = s.world.particles[id];
+        eprintln!("  sword particle ({:+.3},{:+.3}) vel ({:+.2},{:+.2})", p.pos.x, p.pos.y, p.vel.x, p.vel.y);
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_sword_rest_in_water() {
+    for def in [0u8, 1, 2, KNIFE] {
+        let (mut s, h) = still_pool();
+        s.spawn_weapon(def, Vec2::new(h.a.x, h.a.y + h.size.y + 1.0));
+        let wi = s.weapons.len() - 1;
+        let ids: Vec<usize> = (0..s.weapons[wi].n).map(|k| s.weapons[wi].particle(k) as usize).collect();
+        let (mut a_lo, mut a_hi, mut x_lo, mut x_hi, mut y_lo, mut y_hi) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        let mut reached = None;
+        for k in 1..=900u32 {
+            s.step(&[0]);
+            let low = ids.iter().map(|&i| s.world.particles[i].pos.y - s.world.particles[i].radius).fold(f32::MAX, f32::min);
+            if reached.is_none() && low < h.a.y - h.size.y + 0.05 {
+                reached = Some(k);
+            }
+            if k > 600 {
+                let (a, b) = (s.world.particles[ids[0]].pos, s.world.particles[ids[ids.len() - 1]].pos);
+                let ang = dmath::angle(b - a);
+                let m = (a + b) * 0.5;
+                a_lo = a_lo.min(ang);
+                a_hi = a_hi.max(ang);
+                x_lo = x_lo.min(m.x);
+                x_hi = x_hi.max(m.x);
+                y_lo = y_lo.min(m.y);
+                y_hi = y_hi.max(m.y);
+            }
+        }
+        let low = ids.iter().map(|&i| s.world.particles[i].pos.y - s.world.particles[i].radius).fold(f32::MAX, f32::min);
+        eprintln!("{:12}: bottom {:.2}, lowest point {low:.3}, reached the bottom at {:?} s; last 5 s: angle range {:.4} rad, mid moved x {:.4} y {:.4} m", s.weapons[wi].def().name, h.a.y - h.size.y, reached.map(|k| k as f32 / 60.0), a_hi - a_lo, x_hi - x_lo, y_hi - y_lo);
+    }
+}
+
+#[test]
+#[ignore]
+fn trace_weapon_rest_in_water() {
+    for def in [2u8, KNIFE] {
+        let (mut s, h) = still_pool();
+        s.spawn_weapon(def, Vec2::new(h.a.x, h.a.y + h.size.y + 1.0));
+        let wi = s.weapons.len() - 1;
+        let ids: Vec<usize> = (0..s.weapons[wi].n).map(|k| s.weapons[wi].particle(k) as usize).collect();
+        eprintln!("{} ({} particles, mass {:.2} kg)", s.weapons[wi].def().name, ids.len(), ids.iter().map(|&i| 1.0 / s.world.particles[i].inv_mass).sum::<f32>());
+        let segs: Vec<usize> = (0..s.weapons[wi].nseg as usize).map(|k| s.weapons[wi].seg_base as usize + k).collect();
+        for &sg in &segs {
+            let g = s.world.segments[sg];
+            eprintln!("  seg {}-{} radius {:.3} (particle radii {:.3} {:.3})", g.a, g.b, g.radius, s.world.particles[g.a as usize].radius, s.world.particles[g.b as usize].radius);
+        }
+        for k in 1..=900u32 {
+            s.step(&[0]);
+            if k >= 480 && k % 15 == 0 {
+                let (a, b) = (s.world.particles[ids[0]].pos, s.world.particles[ids[ids.len() - 1]].pos);
+                let low = ids.iter().map(|&i| s.world.particles[i].pos.y - s.world.particles[i].radius).fold(f32::MAX, f32::min);
+                let under = s.fluid.drops.iter().filter(|d| d.pos.x > a.x.min(b.x) && d.pos.x < a.x.max(b.x) && d.pos.y < low).count();
+                let v = s.fluid.sample((a + b) * 0.5);
+                eprintln!("  {:5.2}s ends ({:+.3},{:+.3}) ({:+.3},{:+.3}) ang {:+.3} low {low:+.3} drops under {under} liquid {:.2} vel ({:+.3},{:+.3})", k as f32 / 60.0, a.x, a.y, b.x, b.y, dmath::angle(b - a), v.total(), v.vel.x, v.vel.y);
+                if k == 900 {
+                    for d in s.fluid.drops.iter().filter(|d| d.pos.x > a.x.min(b.x) && d.pos.x < a.x.max(b.x) && d.pos.y < low) {
+                        let gap = segs.iter().map(|&sg| { let g = s.world.segments[sg]; stickfell_physics::collide::point_segment(d.pos, s.world.particles[g.a as usize].pos, s.world.particles[g.b as usize].pos).0 - g.radius }).fold(f32::MAX, f32::min);
+                        eprintln!("    drop ({:+.3},{:+.3}) gap to spear {gap:+.3} vel ({:+.2},{:+.2})", d.pos.x, d.pos.y, d.vel.x, d.vel.y);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn trace_dive_forces() {
+    let mut s = wading(2.5);
+    teleport(&mut s, 1, Vec2::new(20.0, 0.0));
+    for _ in 0..90 {
+        s.step(&[0, 0]);
+    }
+    let ids: Vec<usize> = s.fighters[0].particle_ids().map(|i| i as usize).collect();
+    let mass: f32 = ids.iter().map(|&i| { let w = s.world.particles[i].inv_mass; if w > 0.0 { 1.0 / w } else { 0.0 } }).sum();
+    let mom = |s: &GameState| ids.iter().map(|&i| { let p = s.world.particles[i]; if p.inv_mass > 0.0 { p.vel.y / p.inv_mass } else { 0.0 } }).sum::<f32>();
+    eprintln!("body mass {mass:.2} kg, weight {:.1} N", mass * 9.81);
+    let (mut liq, mut wld, mut fl) = (0.0, 0.0, 0.0);
+    for k in 0..60 {
+        let inp = [input::encode(CROUCH, Vec2::new(0.6, 0.0)), 0];
+        let mut a = s.clone();
+        let m0 = mom(&a);
+        a.update_liquids(DT);
+        let m1 = mom(&a);
+        a.world.step(DT);
+        let m2 = mom(&a);
+        a.fluid.step(DT, &mut a.world);
+        let m3 = mom(&a);
+        s.step(&inp);
+        if k >= 10 {
+            liq += (m1 - m0) * 60.0 / 50.0;
+            wld += (m2 - m1) * 60.0 / 50.0;
+            fl += (m3 - m2) * 60.0 / 50.0;
+        }
+    }
+    eprintln!("mean vertical force while diving: liquids pass {liq:+.1} N, world (gravity, joints) {wld:+.1} N, drops {fl:+.1} N; pelvis y {:.2}", s.fighters[0].pos(&s.world, PELVIS).y);
+}
+
+#[test]
+#[ignore]
+fn measure_body_holes() {
+    let mut s = wading(2.5);
+    teleport(&mut s, 1, Vec2::new(20.0, 0.0));
+    for _ in 0..90 {
+        s.step(&[0, 0]);
+    }
+    let ids: Vec<u32> = s.fighters[0].particle_ids().collect();
+    let r = s.fluid.radius;
+    for g in s.world.segments.iter().filter(|g| ids.contains(&g.a) && ids.contains(&g.b)) {
+        let len = (s.world.particles[g.a as usize].pos - s.world.particles[g.b as usize].pos).length();
+        eprintln!("segment {}-{}: radius {:.3}, length {len:.3}; drops kept {:.3} from its axis", g.a, g.b, g.radius, g.radius + r * 0.4);
+    }
+    // the widest gap in the liquid across the body (rows through it, 1 cm steps)
+    let pelvis = s.fighters[0].pos(&s.world, PELVIS);
+    let mut widest: f32 = 0.0;
+    for row in -60..=60 {
+        let y = pelvis.y + row as f32 * 0.01;
+        let mut xs: Vec<f32> = s.fluid.drops.iter().filter(|d| (d.pos.y - y).abs() < r).map(|d| d.pos.x).collect();
+        xs.sort_by(|a, b| a.total_cmp(b));
+        for w in xs.windows(2) {
+            if w[0] < pelvis.x + 0.6 && w[1] > pelvis.x - 0.6 {
+                widest = widest.max(w[1] - w[0]);
+            }
+        }
+    }
+    eprintln!("widest gap between drop centres across the body (rows within {r:.2} m): {widest:.3} m; drop spacing {:.3}", s.fluid.spacing);
+}
+
+#[test]
+#[ignore]
+fn measure_swim_depth_hold() {
+    let mut s = wading(2.5);
+    teleport(&mut s, 1, Vec2::new(20.0, 0.0));
+    for _ in 0..90 {
+        s.step(&[0, 0]);
+    }
+    // under a little first, so the surface doesn't hold them up
+    for _ in 0..20 {
+        s.step(&[input::encode(CROUCH, Vec2::new(0.6, 0.0)), 0]);
+    }
+    let mut ys = Vec::new();
+    for k in 0..120 {
+        s.step(&[input::encode(RIGHT, Vec2::new(0.6, 0.0)), 0]);
+        if k >= 30 {
+            ys.push(s.fighters[0].pos(&s.world, PELVIS).y);
+        }
+    }
+    let drift = (ys[ys.len() - 1] - ys[0]) / (ys.len() as f32 / 60.0);
+    let y0 = s.fighters[0].pos(&s.world, PELVIS).y;
+    for _ in 0..60 {
+        s.step(&[input::encode(CROUCH, Vec2::new(0.6, 0.0)), 0]);
+    }
+    let y1 = s.fighters[0].pos(&s.world, PELVIS).y;
+    for _ in 0..60 {
+        s.step(&[input::encode(JUMP, Vec2::new(0.6, 0.0)), 0]);
+    }
+    let y2 = s.fighters[0].pos(&s.world, PELVIS).y;
+    eprintln!("lift {SWIM_BUOYANCY}: swimming across drifts {drift:+.3} m/s (from y {:.2}); dive {:.2} m in 1 s, up {:.2} m in 1 s", ys[0], y0 - y1, y2 - y1);
+}
+
+#[test]
+#[ignore]
+fn trace_dive() {
+    let mut s = wading(2.5);
+    teleport(&mut s, 1, Vec2::new(20.0, 0.0));
+    for _ in 0..90 {
+        s.step(&[0, 0]);
+    }
+    for _ in 0..60 {
+        s.step(&[input::encode(RIGHT, Vec2::new(0.6, 0.0)), 0]);
+    }
+    for k in 0..60 {
+        s.step(&[input::encode(CROUCH, Vec2::new(0.6, 0.0)), 0]);
+        if k % 5 == 4 {
+            let f = &s.fighters[0];
+            let (p, h) = (f.pos(&s.world, PELVIS), f.pos(&s.world, HEAD));
+            let d = f.pos(&s.world, NECK) - p;
+            let b = f.body_vel(&s.world);
+            eprintln!("  {k:2}: pelvis {:.2} head {:.2} torso ang {:+.2} body vel ({:+.2},{:+.2}) swimming {} wade {:.2} grounded {} down {}", p.y, h.y, dmath::angle(d), b.x, b.y, f.swimming, f.wade, f.grounded, f.down);
+        }
+    }
+}
+
+#[test]
+fn they_scream_burning_in_lava_and_acid_but_not_in_water() {
+    use crate::level::HazardKind;
+    for (kind, burns) in [(HazardKind::Lava, true), (HazardKind::Acid, true), (HazardKind::Water, false)] {
+        let mut s = if kind == HazardKind::Acid {
+            // (the yard has no acid: a tank of it, them dropped in)
+            let mut s = wading(1.6);
+            teleport(&mut s, 1, Vec2::new(20.0, 0.0));
+            s.fluid.drops.clear();
+            let a = Vec2::new(0.0, 0.8);
+            s.fluid.fill(a - Vec2::new(6.0, 0.8), a + Vec2::new(6.0, 0.8), crate::liquid::ACID_DROP);
+            for _ in 0..30 {
+                s.step(&[0, 0]);
+            }
+            lay_flat(&mut s, 0, Vec2::new(0.0, 2.1));
+            s
+        } else {
+            dropped_in(kind, 0.5).0
+        };
+        let (mut screams, mut first, mut burning_frames, mut alive_frames) = (0, None, 0, 0);
+        for k in 0..300u32 {
+            s.fighters[0].down = 200;
+            let inputs = vec![0; s.fighters.len()];
+            s.step(&inputs);
+            let n = s.events.iter().filter(|e| e.kind == Sfx::Burning && e.speaker == 0).count();
+            screams += n;
+            if n > 0 && first.is_none() {
+                first = Some(k);
+            }
+            if s.fighters[0].alive {
+                alive_frames += 1;
+                burning_frames += s.fighters[0].burning as u32;
+            } else {
+                assert!(!s.fighters[0].burning, "the dead don't scream");
+            }
+        }
+        eprintln!("{kind:?}: {screams} screams, first on frame {first:?}, burning {burning_frames} of {alive_frames} frames alive");
+        if burns {
+            assert!(screams > 0 && burning_frames > 0, "{kind:?}: screaming in it");
+        } else {
+            assert_eq!(screams, 0, "water doesn't burn");
+        }
+    }
+}
+
+/// A swimmer at the surface of the yard's pool, `from` m short of its right
+/// edge, facing it.
+fn swimmer_by_the_edge(from: f32) -> (GameState, crate::level::HazardDef) {
+    let (mut s, h) = still_pool();
+    let edge = h.a.x + h.size.x;
+    let me = s.fighters[0].pos(&s.world, PELVIS);
+    teleport(&mut s, 0, Vec2::new(edge - from, h.a.y + h.size.y - 0.3) - me);
+    // (`still_pool` left them laid out flat: up and about)
+    s.fighters[0].down = 0;
+    for _ in 0..90 {
+        s.step(&[input::encode(0, Vec2::new(0.6, 0.0))]);
+    }
+    (s, h)
+}
+
+#[test]
+#[ignore]
+fn measure_climbing_out_of_water() {
+    let (_, h) = still_pool();
+    let edge = h.a.x + h.size.x;
+    let ground = s_ground(&h);
+    eprintln!("pool edge x {edge:.2}, water top {:.2}, ground beside it {ground:.2}", h.a.y + h.size.y);
+    let plans: [(&str, fn(u32) -> u16); 6] = [
+        ("hold right", |_| RIGHT),
+        ("hold right, jump once (0.5 s in)", |k| RIGHT | if k == 30 { JUMP } else { 0 }),
+        ("hold right, jump at once", |k| RIGHT | if k == 0 { JUMP } else { 0 }),
+        ("hold right, jump every 20 frames", |k| RIGHT | if k % 20 == 0 { JUMP } else { 0 }),
+        ("hold right + jump", |_| RIGHT | JUMP),
+        ("hold right + jump for 1 s, let go", |k| if k < 60 { RIGHT | JUMP } else { 0 }),
+    ];
+    for (name, plan) in plans {
+        let (mut s, _) = swimmer_by_the_edge(1.0);
+        let f = &s.fighters[0];
+        let start = (f.pos(&s.world, PELVIS), f.swimming);
+        let mut out = None;
+        let mut best_y = f32::MIN;
+        for k in 0..600u32 {
+            s.step(&[input::encode(plan(k), Vec2::new(0.6, 0.0))]);
+            let f = &s.fighters[0];
+            let p = f.pos(&s.world, PELVIS);
+            let lowest_foot = f.pos(&s.world, fighter::FOOT_A).y.min(f.pos(&s.world, fighter::FOOT_B).y);
+            best_y = best_y.max(lowest_foot);
+            if out.is_none() && p.x > edge + 0.2 && lowest_foot > ground - 0.1 && f.grounded {
+                out = Some(k);
+            }
+        }
+        let f = &s.fighters[0];
+        let landed = s.fighters[0].pos(&s.world, PELVIS).x - edge;
+        eprintln!("{name:34}: {landed:+.2} m past the edge at the end; started pelvis ({:.2},{:.2}) swimming {}; out on frame {out:?}; highest the lower foot got {best_y:+.2}; ended pelvis {:?} grounded {} swimming {}", start.0.x, start.0.y, start.1, f.pos(&s.world, PELVIS), f.grounded, f.swimming);
+    }
+}
+
+/// The top of the floor just right of the pool.
+fn s_ground(h: &crate::level::HazardDef) -> f32 {
+    let (s, _) = still_pool();
+    let x = h.a.x + h.size.x + 0.5;
+    s.world.raycast(Vec2::new(x, 5.0), Vec2::NEG_Y, 20.0).map_or(f32::NAN, |hit| hit.point.y)
+}
+
+#[test]
+#[ignore]
+fn trace_climbing_out_of_water() {
+    let (mut s, h) = swimmer_by_the_edge(1.0);
+    let edge = h.a.x + h.size.x;
+    for k in 0..280u32 {
+        let jump = k % 20 == 0;
+        s.step(&[input::encode(RIGHT | if jump { JUMP } else { 0 }, Vec2::new(0.6, 0.0))]);
+        let f = &s.fighters[0];
+        if jump || k % 20 == 6 || k % 20 == 12 {
+            let (p, hd) = (f.pos(&s.world, PELVIS), f.pos(&s.world, HEAD));
+            let head_liq = s.fluid.sample(hd).total();
+            eprintln!("{k:3}{} pelvis ({:+.2},{:+.2}) head ({:+.2},{:+.2}) head liquid {head_liq:.2} swimming {} wade {:.2} stroke {} grounded {} body vel ({:+.2},{:+.2}) to edge {:+.2}", if jump { "J" } else { " " }, p.x, p.y, hd.x, hd.y, f.swimming, f.wade, f.stroke, f.grounded, f.body_vel(&s.world).x, f.body_vel(&s.world).y, edge - hd.x);
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_yard_volume() {
+    let (s, _) = still_pool();
+    let trap = s.trap.def.unwrap();
+    let cell = 0.05f32;
+    let (lo, hi) = (s.min - Vec2::splat(1.0), s.max + Vec2::splat(1.0));
+    let (w, h) = (((hi.x - lo.x) / cell) as usize, ((hi.y - lo.y) / cell) as usize);
+    let solid = |x: usize, y: usize| {
+        let p = lo + Vec2::new((x as f32 + 0.5) * cell, (y as f32 + 0.5) * cell);
+        s.world.statics.iter().any(|o| o.collide_circle(p, 0.001).is_some())
+    };
+    let mut grid = vec![false; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            grid[y * w + x] = solid(x, y);
+        }
+    }
+    // the open space the water from the hatch can get to (falls, then spreads: everything connected below the hatch)
+    let start = (((trap.hatch.x - lo.x) / cell) as usize, ((trap.hatch.y - 0.3 - lo.y) / cell) as usize);
+    let mut seen = vec![false; w * h];
+    let mut stack = vec![start];
+    while let Some((x, y)) = stack.pop() {
+        if x >= w || y >= h || seen[y * w + x] || grid[y * w + x] {
+            continue;
+        }
+        seen[y * w + x] = true;
+        stack.extend([(x + 1, y), (x.wrapping_sub(1), y), (x, y + 1), (x, y.wrapping_sub(1))]);
+    }
+    eprintln!("level bounds {:?} .. {:?}; hatch {:?}; drop spacing {} m", s.min, s.max, trap.hatch, crate::liquid::DROP_SPACING);
+    let a = cell * cell;
+    let per = crate::liquid::DROP_SPACING * crate::liquid::DROP_SPACING;
+    let lowest = (0..h).find(|&y| (0..w).any(|x| seen[y * w + x])).unwrap();
+    let mut total = 0.0;
+    for y in lowest..h {
+        let row = (0..w).filter(|&x| seen[y * w + x]).count() as f32 * a;
+        total += row;
+        let top = lo.y + (y + 1) as f32 * cell;
+        if ((top * 20.0).round() as i32) % 20 == 0 {
+            eprintln!("  up to y {top:+.1}: {total:.1} m^2 = {:.0} drops", total / per);
+        }
+    }
+    eprintln!("all the open space the hatch reaches: {total:.1} m^2 = {:.0} drops (the yard's settled pool already {} drops)", total / per, s.fluid.drops.len());
+}
+
+#[test]
+#[ignore]
+fn measure_fluid_cost_by_drops() {
+    use crate::level::{HazardDef, HazardKind};
+    for depth in [1.0f32, 2.0, 4.0, 6.0] {
+        let mut s = sandbox(&[(Vec2::new(-30.5, 0.0), Vec2::new(-30.0, 9.0)), (Vec2::new(30.0, 0.0), Vec2::new(30.5, 9.0))]);
+        let a = Vec2::new(0.0, depth * 0.5);
+        s.add_hazard(HazardDef { kind: HazardKind::Water, a, b: a, size: Vec2::new(30.0, depth * 0.5), speed: 0.0 });
+        let inputs = vec![0; s.fighters.len()];
+        for _ in 0..120 {
+            s.step(&inputs);
+        }
+        let n = 120;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            s.step(&inputs);
+        }
+        let all = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        let mut w = s.world.clone();
+        let mut f = s.fluid.clone();
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            f.step(DT, &mut w);
+        }
+        let fl = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        eprintln!("{} drops ({depth} m deep, 60 m wide): {all:.2} ms a game frame, {fl:.2} ms of it the liquid", s.fluid.drops.len());
+    }
+}
+
+#[test]
+#[ignore]
+fn trace_haul_out() {
+    let (mut s, h) = swimmer_by_the_edge(1.0);
+    let edge = h.a.x + h.size.x;
+    for k in 0..60u32 {
+        let jump = k == 30;
+        let before = s.ledge_ahead(0, 1.0);
+        s.step(&[input::encode(RIGHT | if jump { JUMP } else { 0 }, Vec2::new(0.6, 0.0))]);
+        let f = &s.fighters[0];
+        if k % 5 == 0 || (28..40).contains(&k) {
+            let (p, n) = (f.pos(&s.world, PELVIS), f.pos(&s.world, NECK));
+            eprintln!("{k:3}{} pelvis ({:+.2},{:+.2}) neck ({:+.2},{:+.2}) swimming {} wade {:.2} grounded {} down {} stroke {} ledge {before:?} vel ({:+.2},{:+.2}) edge {edge}", if jump { "J" } else { " " }, p.x, p.y, n.x, n.y, f.swimming, f.wade, f.grounded, f.down, f.stroke, f.body_vel(&s.world).x, f.body_vel(&s.world).y);
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn trace_going_in_down() {
+    let (mut s, h) = still_pool();
+    let edge = h.a.x + h.size.x;
+    let me = s.fighters[0].pos(&s.world, PELVIS);
+    teleport(&mut s, 0, Vec2::new(edge - 1.0, h.a.y + h.size.y - 0.3) - me);
+    let mut last = 0;
+    for k in 0..120u32 {
+        let hp = s.fighters[0].health;
+        s.step(&[input::encode(0, Vec2::new(0.6, 0.0))]);
+        let f = &s.fighters[0];
+        if f.down > last || k % 15 == 0 {
+            let d = f.pos(&s.world, NECK) - f.pos(&s.world, PELVIS);
+            eprintln!("{k:3}: down {} (was {last}) grounded {} swimming {} wade {:.2} tilt {:.2} health {:.1} -> {:.1} pelvis {:?}", f.down, f.grounded, f.swimming, f.wade, dmath::angle_diff(dmath::angle(d), core::f32::consts::FRAC_PI_2), hp, f.health, f.pos(&s.world, PELVIS));
+        }
+        last = f.down;
+    }
+}
+
+#[test]
+#[ignore]
+fn trace_haul_arc() {
+    let (mut s, h) = swimmer_by_the_edge(1.0);
+    let edge = h.a.x + h.size.x;
+    let mut hauled = None;
+    for k in 0..120u32 {
+        let stroke = s.fighters[0].stroke;
+        s.step(&[input::encode(RIGHT | JUMP, Vec2::new(0.6, 0.0))]);
+        let f = &s.fighters[0];
+        if hauled.is_none() && f.stroke == 18 && stroke == 0 {
+            hauled = Some(k);
+        }
+        if hauled.is_some_and(|h| k >= h && k < h + 45) {
+            let feet = f.pos(&s.world, fighter::FOOT_A).y.min(f.pos(&s.world, fighter::FOOT_B).y);
+            let fx = f.pos(&s.world, fighter::FOOT_A).x.min(f.pos(&s.world, fighter::FOOT_B).x);
+            eprintln!("{k:3} pelvis ({:+.2},{:+.2}) lowest foot y {feet:+.2} rearmost foot x {:+.2} (edge {edge}) vel ({:+.2},{:+.2}) grounded {} swimming {} wade {:.2}", f.pos(&s.world, PELVIS).x, f.pos(&s.world, PELVIS).y, fx, f.body_vel(&s.world).x, f.body_vel(&s.world).y, f.grounded, f.swimming, f.wade);
+        }
+    }
+    eprintln!("hauled on frame {hauled:?}");
+}
+
+#[test]
+fn swimmers_climb_out_at_the_side_holding_toward_it_and_jump() {
+    for from in [1.0f32, 3.0] {
+        let (mut s, h) = swimmer_by_the_edge(from);
+        let edge = h.a.x + h.size.x;
+        let mut out = None;
+        for k in 0..180u32 {
+            // (let go once they're out: holding right, they'd walk on)
+            let b = if out.is_none() && k < 120 { RIGHT | JUMP } else { 0 };
+            s.step(&[input::encode(b, Vec2::new(0.6, 0.0))]);
+            let f = &s.fighters[0];
+            if out.is_none() && f.grounded && f.pos(&s.world, PELVIS).x > edge + 0.1 {
+                out = Some(k);
+            }
+        }
+        let f = &s.fighters[0];
+        let p = f.pos(&s.world, PELVIS);
+        eprintln!("{from} m out: up on the side on frame {out:?}; 1.5 s later pelvis {p:?} grounded {} swimming {}", f.grounded, f.swimming);
+        assert!(out.is_some_and(|k| (k as f32) < 60.0 * (0.5 + from / 2.8)), "{from} m out: out onto the side in time ({out:?})");
+        assert!(f.grounded && !f.swimming && p.x > edge && p.x < edge + 1.5, "{from} m out: standing on the side, not flung across the yard ({p:?})");
+    }
+}
+
+#[test]
+#[ignore]
+fn trace_after_haul() {
+    let (mut s, h) = swimmer_by_the_edge(1.0);
+    let edge = h.a.x + h.size.x;
+    let mut out = None;
+    for k in 0..300u32 {
+        let b = if out.is_none() { RIGHT | JUMP } else { 0 };
+        s.step(&[input::encode(b, Vec2::new(0.6, 0.0))]);
+        let f = &s.fighters[0];
+        if out.is_none() && f.grounded && f.pos(&s.world, PELVIS).x > edge + 0.1 {
+            out = Some(k);
+        }
+        if out.is_some() && k % 15 == 0 {
+            let (fa, fb) = (f.pos(&s.world, fighter::FOOT_A), f.pos(&s.world, fighter::FOOT_B));
+            eprintln!("{k:3}: pelvis {:?} feet {fa:?} {fb:?} grounded {} down {} getup {} swimming {} wade {:.2} edge {edge}", f.pos(&s.world, PELVIS), f.grounded, f.down, f.getup, f.swimming, f.wade);
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_haul_landing() {
+    for from in [0.6f32, 1.0, 2.0, 3.0] {
+        let (mut s, h) = swimmer_by_the_edge(from);
+        let edge = h.a.x + h.size.x;
+        let mut out = None;
+        let mut top_foot = f32::MIN;
+        for k in 0..240u32 {
+            let b = if out.is_none() { RIGHT | JUMP } else { 0 };
+            s.step(&[input::encode(b, Vec2::new(0.6, 0.0))]);
+            let f = &s.fighters[0];
+            if f.stroke == 18 {
+                top_foot = f32::MIN;
+            }
+            top_foot = top_foot.max(f.pos(&s.world, fighter::FOOT_A).y.min(f.pos(&s.world, fighter::FOOT_B).y));
+            if out.is_none() && f.grounded && f.pos(&s.world, PELVIS).x > edge + 0.1 {
+                out = Some(k);
+            }
+        }
+        let f = &s.fighters[0];
+        let feet = f.pos(&s.world, fighter::FOOT_A).y.min(f.pos(&s.world, fighter::FOOT_B).y);
+        eprintln!("loss {HAUL_LOSS}: from {from} m: out frame {out:?}, lower foot peaked {top_foot:+.2} after the last haul, end pelvis ({:+.2},{:+.2}) lower foot {feet:+.2} (lip 0.00, edge {edge}) swimming {}", f.pos(&s.world, PELVIS).x, f.pos(&s.world, PELVIS).y, f.swimming);
+    }
+}
+
+#[test]
+#[ignore]
+fn hunt_bad_sound_events() {
+    // every weapon, both fighters mashing attack / throw / alt as fast as the
+    // keys go, aiming all over: any sound with a position or volume that isn't
+    // a number (one such sample silences all audio)
+    let mut bad = 0;
+    for def in 0..crate::weapon::WEAPONS.len() as u8 {
+        for gap in [1.2f32, 3.0] {
+            let (mut s, _) = duel_setup(def, gap);
+            for k in 0..900u32 {
+                let ang = k as f32 * 0.37;
+                let aim = Vec2::new(dmath::cos(ang), dmath::sin(ang) * 0.8) * 0.6;
+                let b = [ATTACK, ATTACK | THROW, ALT, ATTACK | ALT][(k % 4) as usize] | if k % 30 < 3 { JUMP } else { 0 };
+                s.step(&[input::encode(b, aim), input::encode(b, -aim)]);
+                for e in &s.events {
+                    if !e.pos.is_finite() || !e.volume.is_finite() {
+                        bad += 1;
+                        if bad <= 10 {
+                            eprintln!("{} gap {gap} frame {k}: {:?} at {:?} volume {}", crate::weapon::WEAPONS[def as usize].name, e.kind, e.pos, e.volume);
+                        }
+                    }
+                }
+                if let Some((i, p)) = s.world.particles.iter().enumerate().find(|(_, p)| !p.pos.is_finite() || !p.vel.is_finite()) {
+                    eprintln!("{} gap {gap} frame {k}: particle {i} not finite {:?} {:?}", crate::weapon::WEAPONS[def as usize].name, p.pos, p.vel);
+                    bad += 1;
+                    break;
+                }
+            }
+        }
+    }
+    eprintln!("{bad} bad events/particles");
+}
+
+/// A tank 12 m wide with 2 m of water held up in its left 5 m, let go
+/// against fighter 0 standing at x -0.6 (braced against a step behind them,
+/// or not).
+fn dam(braced: bool) -> GameState {
+    let mut walls = vec![(Vec2::new(-6.5, 0.0), Vec2::new(-6.0, 4.0)), (Vec2::new(6.0, 0.0), Vec2::new(6.5, 4.0))];
+    if braced {
+        walls.push((Vec2::new(-0.25, 0.0), Vec2::new(0.25, 0.35)));
+    }
+    let mut s = sandbox(&walls);
+    // (the other one well out of it, on the floor: x 35)
+    teleport(&mut s, 1, Vec2::new(5.0, 0.0));
+    let me = s.fighters[0].pos(&s.world, PELVIS);
+    teleport(&mut s, 0, Vec2::new(-0.6 - me.x, 0.0));
+    for _ in 0..60 {
+        s.step(&[input::encode(0, Vec2::new(-0.6, 0.0)), 0]);
+    }
+    s.fluid.fill(Vec2::new(-6.0, 0.0), Vec2::new(-1.1, 2.0), crate::liquid::WATER_DROP);
+    s
+}
+
+#[test]
+#[ignore]
+fn measure_dam() {
+    for braced in [false, true] {
+        let mut s = dam(braced);
+        let total = s.fluid.drops.len();
+        let start = s.fighters[0].pos(&s.world, PELVIS);
+        let (mut downs, mut max_flow) = (0u32, 0.0f32);
+        for k in 1..=300u32 {
+            s.step(&[input::encode(0, Vec2::new(-0.6, 0.0)), 0]);
+            let f = &s.fighters[0];
+            downs += (f.down > 0) as u32;
+            max_flow = max_flow.max(s.fluid.sample(f.pos(&s.world, PELVIS)).vel.length());
+            if k % 60 == 0 {
+                if s.round_frame < k {
+                    eprintln!("  (round over at {k}: phase {:?}, alive {} {}, hp {:.0} {:.0})", s.phase, s.fighters[0].alive, s.fighters[1].alive, s.fighters[0].health, s.fighters[1].health);
+                    break;
+                }
+                let p = f.pos(&s.world, PELVIS);
+                let past = s.fluid.drops.iter().filter(|d| d.pos.x > p.x + 0.4).count();
+                let top = |x0: f32, x1: f32| s.fluid.drops.iter().filter(|d| d.pos.x > x0 && d.pos.x < x1).map(|d| d.pos.y).fold(0.0f32, f32::max);
+                eprintln!("porous {} grip {} braced {braced} (standing) {:.0} s: {:.0}% of the water past them; surface behind {:.2} m, in front {:.2} m; pelvis moved ({:+.2},{:+.2}); down {downs} frames; fastest flow at the pelvis {max_flow:.2} m/s", fighter::BODY_POROUS, std::env::var("GRIP").unwrap_or_default(), k as f32 / 60.0, 100.0 * past as f32 / total as f32, top(-6.0, p.x - 0.4), top(p.x + 0.4, 6.0), p.x - start.x, p.y - start.y);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_surge() {
+    // how hard moving water pushes (`Fighter::surge`) in the places it can:
+    // per case, the peak and the 90th percentile over the frames it's wet
+    let report = |name: &str, v: &mut Vec<f32>| {
+        v.sort_by(|a, b| a.total_cmp(b));
+        let at = |q: f32| v.get(((v.len() as f32 - 1.0) * q) as usize).copied().unwrap_or(0.0);
+        eprintln!("{name:46}: peak {:.2}, 90% {:.2}, median {:.2} ({} frames)", at(1.0), at(0.9), at(0.5), v.len());
+    };
+    for braced in [false, true] {
+        let mut s = dam(braced);
+        let mut v = Vec::new();
+        for _ in 0..180 {
+            s.step(&[input::encode(LEFT, Vec2::new(-0.6, 0.0)), 0]);
+            v.push(s.fighters[0].surge);
+        }
+        report(&format!("dam break 2 m (braced {braced})"), &mut v);
+    }
+    // walking back and forth in still water, waist deep and chest deep
+    for depth in [0.9f32, 1.3] {
+        let mut s = wading(depth);
+        let mut v = Vec::new();
+        for k in 0..360u32 {
+            let b = if (k / 90) % 2 == 0 { RIGHT } else { LEFT };
+            s.step(&[input::encode(b, Vec2::new(0.6, 0.0)), 0]);
+            if k > 30 && s.fighters[0].wade > 0.05 {
+                v.push(s.fighters[0].surge);
+            }
+        }
+        report(&format!("walking in still water {depth} m deep"), &mut v);
+    }
+    // swimming across a pool
+    let mut s = wading(2.5);
+    let mut v = Vec::new();
+    for k in 0..240u32 {
+        let b = if (k / 60) % 2 == 0 { RIGHT } else { LEFT };
+        s.step(&[input::encode(b, Vec2::new(0.6, 0.0)), 0]);
+        if k > 60 {
+            v.push(s.fighters[0].surge);
+        }
+    }
+    report("swimming back and forth", &mut v);
+    // standing under the hatch as it pours, and out in the yard as it floods
+    let mut s = at_the_lever();
+    let def = s.trap.def.unwrap();
+    throw_lever(&mut s);
+    let me = s.fighters[0].pos(&s.world, PELVIS);
+    teleport(&mut s, 0, Vec2::new(def.hatch.x - me.x, 0.6 - me.y));
+    let mut v = Vec::new();
+    for _ in 0..300 {
+        s.step(&[0, 0, 0, 0]);
+        if s.fighters[0].wade > 0.05 {
+            v.push(s.fighters[0].surge);
+        }
+    }
+    report("under the hatch while it pours", &mut v);
+    let me = s.fighters[0].pos(&s.world, PELVIS);
+    teleport(&mut s, 0, Vec2::new(def.hatch.x + 8.0 - me.x, 0.6 - me.y));
+    let mut v = Vec::new();
+    for _ in 0..600 {
+        s.step(&[0, 0, 0, 0]);
+        if s.fighters[0].wade > 0.05 {
+            v.push(s.fighters[0].surge);
+        }
+    }
+    report("8 m from the hatch as the yard floods", &mut v);
+}
+
+#[test]
+fn a_wall_of_water_sweeps_fighters_off_their_feet_but_wading_doesnt() {
+    // 2 m of water let go against someone standing in its way (braced
+    // against a step, too): they're knocked down and carried, and the water
+    // gets past them
+    for braced in [false, true] {
+        let mut s = dam(braced);
+        let x0 = s.fighters[0].pos(&s.world, PELVIS).x;
+        let mut down_at = None;
+        for k in 0..120u32 {
+            s.step(&[0, 0]);
+            if down_at.is_none() && s.fighters[0].down > 0 {
+                down_at = Some(k);
+            }
+        }
+        let x = s.fighters[0].pos(&s.world, PELVIS).x;
+        let ahead = s.fluid.drops.iter().filter(|d| d.pos.x > x0 + 0.5).count() as f32 / s.fluid.drops.len() as f32;
+        eprintln!("braced {braced}: knocked down on frame {down_at:?}, carried {:.2} m; after 2 s {:.0}% of the water past where they stood", x - x0, ahead * 100.0);
+        assert!(down_at.is_some_and(|k| k < 60), "braced {braced}: swept off their feet");
+        assert!(x - x0 > 1.0, "braced {braced}: carried along ({:.2} m)", x - x0);
+        assert!(ahead > 0.3, "braced {braced}: the water isn't held back ({:.0}%)", ahead * 100.0);
+    }
+    // walking about in still water, and swimming, never knocks anyone down
+    for (depth, what) in [(0.9f32, "wading waist deep"), (1.3, "wading chest deep"), (2.5, "swimming")] {
+        let mut s = wading(depth);
+        let mut most: f32 = 0.0;
+        // (back and forth well clear of the tank's ends)
+        let mut downs = 0;
+        for k in 0..360u32 {
+            let b = if (k / 45) % 2 == 0 { RIGHT } else { LEFT };
+            s.step(&[input::encode(b, Vec2::new(0.6, 0.0)), 0]);
+            most = most.max(s.fighters[0].surge);
+            downs += (s.fighters[0].down > 0) as u32;
+        }
+        eprintln!("{what}: the water shoved them at most {most:.2} of their weight; down {downs} frames; ended at x {:.2}", s.fighters[0].pos(&s.world, PELVIS).x);
+        assert_eq!(downs, 0, "{what}: never knocked down");
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_wading_parts() {
+    for depth in [0.9f32, 1.3] {
+    let mut s = wading(depth);
+    for _ in 0..90 {
+        s.step(&[input::encode(0, Vec2::new(0.6, 0.0)), 0]);
+    }
+    let f = &s.fighters[0];
+    let names = ["head", "neck", "pelvis", "elbow a", "hand a", "elbow b", "hand b", "knee a", "foot a", "knee b", "foot b"];
+    let mut line = format!("porous {}: ", fighter::BODY_POROUS);
+    for (k, id) in f.particle_ids().enumerate() {
+        let p = s.world.particles[id as usize];
+        line += &format!("{} y {:.2} liquid {:.2}; ", names.get(k).unwrap_or(&"?"), p.pos.y, s.fluid.sample(p.pos).total());
+    }
+    eprintln!("{line}");
+    let mut tilts = Vec::new();
+    for k in 0..240u32 {
+        let b = if (k / 45) % 2 == 0 { RIGHT } else { LEFT };
+        let was = s.fighters[0].down;
+        s.step(&[input::encode(b, Vec2::new(0.6, 0.0)), 0]);
+        let f = &s.fighters[0];
+        if f.down > was + 1 {
+            eprintln!("  frame {k}: knocked down for {} (surge {:.2}, swimming {}, grounded {}, wade {:.2})", f.down, f.surge, f.swimming, f.grounded, f.wade);
+        }
+        if k % 15 == 0 {
+            let d = f.pos(&s.world, NECK) - f.pos(&s.world, PELVIS);
+            tilts.push(format!("{k}:{:+.2}{}{}", dmath::angle_diff(dmath::angle(d), core::f32::consts::FRAC_PI_2), if f.down > 0 { format!("D{}", f.down) } else { String::new() }, if f.swimming { "S" } else { "" }));
+        }
+    }
+    let speed = s.fighters[0].body_vel(&s.world).x.abs();
+    eprintln!("  {depth} m: walking, tilt: {} (speed at the end {speed:.2} m/s)", tilts.join(" "));
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_flood_on_lava() {
+    use crate::liquid::{COOLED_LAVA, LAVA_DROP, WATER_DROP};
+    let mut s = at_the_lever();
+    let count = |s: &GameState, k: u8| s.fluid.drops.iter().filter(|d| d.kind == k).count();
+    let lava = |s: &GameState| {
+        let l: Vec<f32> = s.fluid.drops.iter().filter(|d| d.kind == LAVA_DROP).map(|d| d.dye).collect();
+        (l.len(), l.iter().filter(|&&d| d >= COOLED_LAVA).count(), l.iter().filter(|&&d| d > 0.0 && d < COOLED_LAVA).count())
+    };
+    let (w0, l0) = (count(&s, WATER_DROP), count(&s, LAVA_DROP));
+    let (lp0, lp1, ly0, ly1) = crate::level::YARD_LAVA;
+    eprintln!("before: {w0} water drops, {l0} lava drops (pit {:.2} m wide, {:.2} m deep = {:.2} m^2; a drop stands for {:.4} m^2)", lp1 - lp0, ly1 - ly0, (lp1 - lp0) * (ly1 - ly0), crate::liquid::DROP_SPACING * crate::liquid::DROP_SPACING);
+    throw_lever(&mut s);
+    let mut poured = 0u32;
+    let mut last = s.fluid.drops.len();
+    for k in 1..=60 * 90u32 {
+        s.step(&[0, 0, 0, 0]);
+        let now = s.fluid.drops.len();
+        poured += (now as i64 - last as i64).max(0) as u32;
+        last = now;
+        if k % (60 * 10) == 0 {
+            let (n, rock, warm) = lava(&s);
+            eprintln!("{:3} s: water {} drops, lava {n} ({rock} rock, {warm} part-cooled, {} hot); level holds {}", k / 60, count(&s, WATER_DROP), n - rock - warm, s.fluid.drops.len());
+        }
+    }
+    let w1 = count(&s, WATER_DROP);
+    eprintln!("water boiled off over the 90 s: {} drops (poured in about {poured} net-of-boiling growth)", (w0 as i64 + s.trap.poured as i64 - w1 as i64));
+    eprintln!("hatch poured {} drops since opened", s.trap.poured);
+}
+
+#[test]
+#[ignore]
+fn measure_steam_flood() {
+    // the yard flooded onto its lava pit: the steam, the bursts, and what
+    // they do to someone up by the lever and to the dummies down in it
+    use crate::liquid::{LAVA_DROP, WATER_DROP};
+    let mut s = at_the_lever();
+    throw_lever(&mut s);
+    let hp0: Vec<f32> = s.fighters.iter().map(|f| f.health).collect();
+    let (mut bursts, mut peak_cells, mut peak_thick, mut boiled) = (0, 0usize, 0.0f32, 0i64);
+    let mut worst_at_lever = 0.0f32;
+    let (mut peak_seen, mut sum_seen) = (0usize, 0usize);
+    let water0 = s.fluid.drops.iter().filter(|d| d.kind == WATER_DROP).count() as i64;
+    for k in 1..=60 * 90u32 {
+        let cd = s.burst_cd;
+        s.step(&[0, 0, 0, 0]);
+        if s.burst_cd > cd {
+            bursts += 1;
+        }
+        let cells: Vec<f32> = s.steam.clouds(0.3).map(|c| c.1).collect();
+        peak_cells = peak_cells.max(cells.len());
+        // (visible: at least 5% opaque, 1 - e^-1.3t >= 0.05)
+        let seen = s.steam.clouds(0.0395).count();
+        peak_seen = peak_seen.max(seen);
+        sum_seen += seen;
+        peak_thick = peak_thick.max(cells.iter().copied().fold(0.0, f32::max));
+        let head = s.fighters[0].pos(&s.world, HEAD);
+        worst_at_lever = worst_at_lever.max(s.steam.at(head));
+        if k % (60 * 15) == 0 {
+            let lo = s.steam.clouds(0.03).map(|c| c.0.y).fold(f32::MAX, f32::min);
+            let water = s.fluid.drops.iter().filter(|d| d.kind == WATER_DROP).count() as i64;
+            boiled = water0 + s.trap.poured as i64 - water;
+            let hot = s.fluid.drops.iter().filter(|d| d.kind == LAVA_DROP && d.dye < crate::liquid::COOLED_LAVA).count();
+            eprintln!("{:3} s: steam {} cells thick enough to scald (of {} with any; lowest at y {lo:.1}); {bursts} bursts so far; {boiled} drops boiled; {hot} hot lava drops; hp {:?}", k / 60, cells.len(), s.steam.clouds(0.03).count(), s.fighters.iter().map(|f| f.health.round()).collect::<Vec<_>>());
+        }
+    }
+    eprintln!("visible steam (>= 5% opaque): peak {peak_seen} m^2, mean {:.0} m^2 over the 90 s (per drop {}, condense {} s)", sum_seen as f32 / (60.0 * 90.0), crate::steam::STEAM_PER_DROP, crate::steam::CONDENSE);
+    eprintln!("peak: {peak_cells} cells (m^2) scalding, thickest {peak_thick:.2}; at the lever (head) thickest {worst_at_lever:.2}; {bursts} bursts; {boiled} drops boiled of a real-heat budget {:.0}; hp lost {:?}", 312.0 * crate::liquid::LAVA_BOILS, hp0.iter().zip(&s.fighters).map(|(a, f)| (a - f.health).round()).collect::<Vec<_>>());
+}
+
+#[test]
+#[ignore]
+fn measure_water_under_lava() {
+    let mut s = at_the_lever();
+    throw_lever(&mut s);
+    let mut when = Vec::new();
+    for k in 0..60 * 60u32 {
+        let n = s.hot_contacts.len();
+        s.step(&[0, 0, 0, 0]);
+        if s.hot_contacts.len() > n {
+            when.push(k);
+        }
+    }
+    let c = &s.hot_contacts;
+    let mut under: Vec<f32> = c.iter().map(|x| x.0).collect();
+    let mut into: Vec<f32> = c.iter().map(|x| x.1).collect();
+    under.sort_by(|a, b| a.total_cmp(b));
+    into.sort_by(|a, b| a.total_cmp(b));
+    let q = |v: &Vec<f32>, f: f32| v[((v.len() as f32 - 1.0) * f) as usize];
+    eprintln!("{} water drops met hot lava in 60 s, over {} frames (first {:?}, last {:?})", c.len(), when.len(), when.first(), when.last());
+    eprintln!("  how far under the lava drop (m): max {:.3}, 99% {:.3}, 90% {:.3}, median {:.3}", q(&under, 1.0), q(&under, 0.99), q(&under, 0.9), q(&under, 0.5));
+    eprintln!("  how fast into it (m/s): max {:.2}, 99% {:.2}, 90% {:.2}, median {:.2}", q(&into, 1.0), q(&into, 0.99), q(&into, 0.9), q(&into, 0.5));
+    for v in [2.0f32, 3.0, 4.0, 5.0] {
+        let hits: Vec<u32> = c.iter().zip(0..).filter(|(x, _)| x.1 > v).map(|(_, i)| i).collect();
+        eprintln!("  faster than {v} m/s: {} contacts", hits.len());
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_bursts_falling_into_flooded_lava() {
+    let mut s = at_the_lever();
+    throw_lever(&mut s);
+    for _ in 0..60 * 40 {
+        s.step(&[0, 0, 0, 0]);
+    }
+    let (lx0, lx1, _, ly1) = crate::level::YARD_LAVA;
+    let surface = s.fluid.drops.iter().filter(|d| d.pos.x > lx0 && d.pos.x < lx1).map(|d| d.pos.y).fold(f32::MIN, f32::max);
+    eprintln!("flooded: water over the pit up to y {surface:.2} (pit top {ly1:.2})");
+    for (who, height) in [(1usize, 4.0f32), (2, 8.0)] {
+        lay_flat(&mut s, who, Vec2::new((lx0 + lx1) * 0.5, surface + height));
+        let hp = s.fighters[who].health;
+        let mut bursts = Vec::new();
+        for k in 0..60 * 8u32 {
+            let cd = s.burst_cd;
+            s.step(&[0, 0, 0, 0]);
+            if s.burst_cd > cd {
+                bursts.push(k);
+            }
+        }
+        let f = &s.fighters[who];
+        eprintln!("fighter {who} dropped from {height} m over the water: {} bursts at frames {bursts:?}; hp {hp:.0} -> {:.0} (alive {})", bursts.len(), f.health, f.alive);
+    }
+}
+
+#[test]
+fn steam_scalds_slowly_and_bursts_hurt_but_dont_kill() {
+    // standing with their head in steam, thick and thin, for 5 s
+    let rates: Vec<(f32, f32)> = [0.2f32, 0.6, 1.0, 3.0]
+        .into_iter()
+        .map(|thick| {
+            let mut s = GameState::new(4, crate::level::TRAINING, 7);
+            for _ in 0..30 {
+                s.step(&[0, 0, 0, 0]);
+            }
+            let hp = s.fighters[0].health;
+            for _ in 0..300 {
+                // (kept topped up round their head)
+                let head = s.fighters[0].pos(&s.world, HEAD);
+                for dy in [-1.0f32, 0.0, 1.0] {
+                    let p = head + Vec2::new(0.0, dy);
+                    let now = s.steam.at(p);
+                    s.steam.add(p, (thick - now).max(0.0));
+                }
+                s.step(&[0, 0, 0, 0]);
+            }
+            (thick, (hp - s.fighters[0].health) / 5.0)
+        })
+        .collect();
+    for (thick, rate) in &rates {
+        eprintln!("steam {thick} thick round the head: {rate:.2} health a second");
+    }
+    assert_eq!(rates[0].1, 0.0, "thin steam is harmless");
+    assert!(rates.iter().all(|r| r.1 <= SCALD_RATE + 0.05), "never faster than {SCALD_RATE} a second (time to get out)");
+    assert!(rates[3].1 > 2.0, "thick steam does hurt");
+    // a burst going off right by them
+    let mut s = GameState::new(4, crate::level::TRAINING, 7);
+    for _ in 0..30 {
+        s.step(&[0, 0, 0, 0]);
+    }
+    let (hp, at) = (s.fighters[0].health, s.fighters[0].pos(&s.world, PELVIS));
+    let v0 = s.fighters[0].body_vel(&s.world);
+    s.steam_burst(at + Vec2::new(-0.4, -0.3));
+    let thrown = s.fighters[0].body_vel(&s.world) - v0;
+    for _ in 0..60 {
+        s.step(&[0, 0, 0, 0]);
+    }
+    let lost = hp - s.fighters[0].health;
+    eprintln!("a burst 0.5 m off: {lost:.1} health, thrown at {:.2} m/s, down {}", thrown.length(), s.fighters[0].down);
+    assert!(lost > 5.0 && lost <= BURST_DAMAGE + 0.01, "it hurts, a bit ({lost:.1})");
+    assert!(s.fighters[0].alive && thrown.length() > 2.0, "and throws them, not kills them");
+}
+
+#[test]
+#[ignore]
+fn screenshot_steam() {
+    let dir = std::env::var("SHOT_DIR").unwrap_or_else(|_| ".".into());
+    let mut s = at_the_lever();
+    throw_lever(&mut s);
+    let (lx0, lx1, _, ly1) = crate::level::YARD_LAVA;
+    let mut shots = 0;
+    for k in 0..60 * 30u32 {
+        let cd = s.burst_cd;
+        s.step(&[0, 0, 0, 0]);
+        let burst = s.burst_cd > cd;
+        if (burst && shots < 2) || k == 60 * 12 || k == 60 * 25 {
+            let mut c = Wide { game: s.clone(), at: Vec2::new((lx0 + lx1) * 0.5 - 3.0, ly1 + 5.0), height: 16.0 };
+            let name = if burst { format!("steam_burst_{shots}") } else { format!("steam_{}s", k / 60) };
+            stickfell_app::capture_headless(&mut c, 0, (800, 520), format!("{dir}/{name}.png").as_ref()).unwrap();
+            if burst {
+                shots += 1;
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_swim_legs() {
+    // where the legs point while swimming across and diving: how far off
+    // straight back along the body, how bent the knees are, how big the kick
+    for (what, b) in [("across", RIGHT), ("diving", CROUCH)] {
+        let mut s = wading(4.0);
+        teleport(&mut s, 1, Vec2::new(20.0, 0.0));
+        for _ in 0..90 {
+            s.step(&[0, 0]);
+        }
+        let (mut off, mut bend, mut swing) = (Vec::new(), Vec::new(), Vec::new());
+        for k in 0..90u32 {
+            s.step(&[input::encode(b, Vec2::new(0.6, 0.0)), 0]);
+            if k < 30 {
+                continue;
+            }
+            let f = &s.fighters[0];
+            let (pelvis, neck) = (f.pos(&s.world, PELVIS), f.pos(&s.world, NECK));
+            let back = dmath::angle(pelvis - neck);
+            for (knee, foot) in [(fighter::KNEE_A, fighter::FOOT_A), (fighter::KNEE_B, fighter::FOOT_B)] {
+                let (kp, fp) = (f.pos(&s.world, knee), f.pos(&s.world, foot));
+                let thigh = dmath::angle(kp - pelvis);
+                let shin = dmath::angle(fp - kp);
+                off.push(dmath::angle_diff(dmath::angle(fp - pelvis), back).abs());
+                bend.push(dmath::angle_diff(shin, thigh).abs());
+                swing.push(dmath::angle_diff(thigh, back));
+            }
+        }
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+        let range = swing.iter().copied().fold(f32::MIN, f32::max) - swing.iter().copied().fold(f32::MAX, f32::min);
+        eprintln!("{what}: legs off straight back along the body {:.2} rad (mean), knees bent {:.2} rad (mean), thighs swing over {range:.2} rad", mean(&off), mean(&bend));
+    }
+}
+
+#[test]
+#[ignore]
+fn trace_dive_legs() {
+    let mut s = wading(4.0);
+    teleport(&mut s, 1, Vec2::new(20.0, 0.0));
+    for _ in 0..90 {
+        s.step(&[0, 0]);
+    }
+    for k in 0..90u32 {
+        s.step(&[input::encode(CROUCH, Vec2::new(0.6, 0.0)), 0]);
+        if k % 6 != 0 {
+            continue;
+        }
+        let f = &s.fighters[0];
+        let (pelvis, neck) = (f.pos(&s.world, PELVIS), f.pos(&s.world, NECK));
+        let back = dmath::angle(pelvis - neck);
+        let (kp, fp) = (f.pos(&s.world, fighter::KNEE_A), f.pos(&s.world, fighter::FOOT_A));
+        eprintln!("{k:2}: back {:+.2} thigh {:+.2} shin {:+.2} | pelvis y {:.2} swimming {} grounded {} wade {:.2} facing {} vel ({:+.2},{:+.2})",
+            back, dmath::angle(kp - pelvis), dmath::angle(fp - kp), pelvis.y, f.swimming, f.grounded, f.wade, f.facing, f.body_vel(&s.world).x, f.body_vel(&s.world).y);
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_swimming_without_limbs() {
+    use crate::fighter::{S_FORE_A, S_THIGH_A, S_UPPER_A, S_UPPER_B};
+    let cases: [(&str, &[u32]); 6] = [
+        ("all four limbs", &[]),
+        ("a forearm gone", &[S_FORE_A]),
+        ("an arm gone", &[S_UPPER_A]),
+        ("a leg gone", &[S_THIGH_A]),
+        ("an arm and a leg gone", &[S_UPPER_A, S_THIGH_A]),
+        ("both arms gone", &[S_UPPER_A, S_UPPER_B]),
+    ];
+    for (what, parts) in cases {
+        let mut s = wading(4.0);
+        teleport(&mut s, 1, Vec2::new(20.0, 0.0));
+        for &p in parts {
+            s.sever(0, p);
+        }
+        s.fighters[0].health = 1000.0;
+        for _ in 0..60 {
+            s.step(&[0, 0]);
+        }
+        let (x0, y0) = { let p = s.fighters[0].pos(&s.world, PELVIS); (p.x, p.y) };
+        for _ in 0..60 {
+            s.step(&[input::encode(RIGHT, Vec2::new(0.6, 0.0)), 0]);
+        }
+        let p1 = s.fighters[0].pos(&s.world, PELVIS);
+        // then let go: float, tread, or go down
+        for _ in 0..180 {
+            s.step(&[0, 0]);
+        }
+        let p2 = s.fighters[0].pos(&s.world, PELVIS);
+        let f = &s.fighters[0];
+        eprintln!("{what:22}: power {:.2}; swam {:.2} m in 1 s (depth change {:+.2} m); then 3 s idle: depth change {:+.2} m (pelvis y {:.2}, surface 4.0); swimming {}", f.swim_power(), p1.x - x0, p1.y - y0, p2.y - p1.y, p2.y, f.swimming);
+    }
+}
+
+#[test]
+fn losing_limbs_makes_swimming_hard_and_two_gone_they_sink() {
+    use crate::fighter::{S_THIGH_A, S_UPPER_A};
+    let swim = |parts: &[u32]| {
+        let mut s = wading(4.0);
+        teleport(&mut s, 1, Vec2::new(20.0, 0.0));
+        for &p in parts {
+            s.sever(0, p);
+        }
+        s.fighters[0].health = 1000.0;
+        for _ in 0..60 {
+            s.step(&[0, 0]);
+        }
+        let x0 = s.fighters[0].pos(&s.world, PELVIS).x;
+        for _ in 0..60 {
+            s.step(&[input::encode(RIGHT, Vec2::new(0.6, 0.0)), 0]);
+        }
+        let x1 = s.fighters[0].pos(&s.world, PELVIS).x;
+        for _ in 0..180 {
+            s.step(&[0, 0]);
+        }
+        (x1 - x0, s.fighters[0].pos(&s.world, PELVIS).y, s.fighters[0].swimming)
+    };
+    let (all, all_y, _) = swim(&[]);
+    let (arm, _, arm_swims) = swim(&[S_UPPER_A]);
+    let (_, both_y, both_swims) = swim(&[S_UPPER_A, S_THIGH_A]);
+    eprintln!("swam in 1 s: all limbs {all:.2} m, an arm gone {arm:.2} m; afloat at y {all_y:.2}; an arm and a leg gone: ended at y {both_y:.2} (the tank's 4 m deep)");
+    assert!(arm_swims && arm < all * 0.8, "one limb gone, slower ({arm:.2} vs {all:.2})");
+    assert!(!both_swims && both_y < 1.5 && all_y > 3.0, "two gone, they can't swim and go down");
+}
+
+/// A fall: off a ledge `h` high (0: flat ground), running right, jumping as
+/// they go over (and again at the top of it, `double`). How hard they hit
+/// the ground (the most any part touching it was stopped, m/s) and whether
+/// they went down for it.
+fn landing(h: f32, jump: bool, double: bool) -> (f32, bool) {
+    let boxes: Vec<(Vec2, Vec2)> = if h > 0.0 { vec![(Vec2::new(-8.0, 0.0), Vec2::new(0.0, h))] } else { vec![] };
+    let mut s = sandbox(&boxes);
+    let lift = s.fighters[0].pos(&s.world, PELVIS).y;
+    warp(&mut s, 0, Vec2::new(-1.5, h + lift + 0.05));
+    for _ in 0..40 {
+        step(&mut s, 0, Vec2::new(0.6, 0.0));
+    }
+    let (mut hardest, mut down, mut left, mut jumped) = (0.0f32, false, None, 0);
+    for k in 0..200 {
+        let x = s.fighters[0].pos(&s.world, PELVIS).x;
+        let mut b = RIGHT;
+        if jump && jumped == 0 && x > -0.4 {
+            b |= JUMP;
+            jumped = k;
+        }
+        if double && jumped > 0 && k == jumped + 22 {
+            b |= JUMP;
+        }
+        step(&mut s, b, Vec2::new(0.6, 0.0));
+        if left.is_none() && (x > 0.2 || h == 0.0 && jumped > 0) {
+            left = Some(k);
+        }
+        if left.is_some_and(|l| k > l + 3) {
+            hardest = hardest.max(s.landing_speed(0));
+            down |= s.fighters[0].down > 0;
+        }
+    }
+    (hardest, down)
+}
+
+#[test]
+fn big_falls_floor_you_and_small_ones_dont() {
+    for (name, h, jump, double) in [
+        ("flat, jump", 0.0, true, false),
+        ("flat, double jump", 0.0, true, true),
+        ("walk off 1 m", 1.0, false, false),
+        ("walk off 2 m", 2.0, false, false),
+        ("walk off 3.5 m", 3.5, false, false),
+        ("jump off 3.5 m", 3.5, true, false),
+        ("double jump off 3.5 m", 3.5, true, true),
+        ("walk off 5 m", 5.0, false, false),
+        ("walk off 7 m", 7.0, false, false),
+        ("jump off 7 m", 7.0, true, false),
+        ("walk off 8 m", 8.0, false, false),
+        ("walk off 9 m", 9.0, false, false),
+        ("jump off 5 m", 5.0, true, false),
+        ("walk off 10 m", 10.0, false, false),
+        ("walk off 14 m", 14.0, false, false),
+    ] {
+        let (v, down) = landing(h, jump, double);
+        eprintln!("{name}: landed at {v:.1} m/s{}", if down { ", knocked down" } else { "" });
+        // (jumping about, and dropping a level or two, keeps you up; a
+        // real height doesn't)
+        if h <= 7.0 && !(jump && h >= 5.0) {
+            assert!(!down, "{name}: shouldn't knock them down ({v:.1} m/s)");
+        }
+        if h >= 10.0 || (jump && h >= 7.0) {
+            assert!(down, "{name}: should knock them down ({v:.1} m/s)");
+        }
+    }
+}
+
+/// The Gauntlet with eight AI fighters at it: the whole level, then each
+/// half closer (SHOT_DIR, default here).
+#[test]
+#[ignore]
+fn screenshot_gauntlet() {
+    struct Shot {
+        game: GameState,
+        levels: Vec<crate::level::LevelDef>,
+        at: Vec2,
+        zoom: f32,
+    }
+    impl stickfell_app::Game for Shot {
+        fn tick(&mut self, _input: &stickfell_app::Input) {}
+        fn draw(&mut self, frame: &mut stickfell_render::Frame, screen: Vec2, _alpha: f32, _dt: f32) {
+            let hud = crate::draw::Hud { zoom: self.zoom, world_only: true, ..Default::default() };
+            crate::draw::draw_game(&self.game, &self.levels[self.game.level_index], frame, screen, self.at, &hud);
+        }
+    }
+    let dir = std::env::var("SHOT_DIR").unwrap_or_else(|_| ".".into());
+    let mut s = GameState::new_match(8, 0, 0, crate::level::GAUNTLET, 11);
+    for _ in 0..240 {
+        s.step(&[]);
+    }
+    for (name, at, zoom, size) in [("all", Vec2::new(0.0, 4.5), 26.0, (2400, 700)), ("left", Vec2::new(-23.0, 4.0), 17.0, (1600, 900)), ("right", Vec2::new(23.0, 4.0), 17.0, (1600, 900))] {
+        let mut shot = Shot { game: s.clone(), levels: crate::level::levels(), at, zoom };
+        stickfell_app::capture_headless(&mut shot, 0, size, format!("{dir}/gauntlet_{name}.png").as_ref()).unwrap();
+    }
+}
+
+/// What a step of the Gauntlet costs with eight AI fighters in it: as it
+/// starts, and as the flood comes in (ms, the mean and the worst of each
+/// second's steps), and how many drops there are by then.
+#[test]
+#[ignore]
+fn measure_gauntlet_step() {
+    let mut s = GameState::new_match(8, 0, 0, crate::level::GAUNTLET, 5);
+    let mut second = |s: &mut GameState| {
+        let (mut sum, mut worst) = (0.0f64, 0.0f64);
+        for _ in 0..60 {
+            let t = std::time::Instant::now();
+            s.step(&[]);
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            sum += ms;
+            worst = worst.max(ms);
+        }
+        (sum / 60.0, worst)
+    };
+    for k in 0..3 {
+        let (mean, worst) = second(&mut s);
+        eprintln!("dry, second {k}: {mean:.2} ms a step, worst {worst:.2} ({} drops)", s.fluid.drops.len());
+    }
+    s.trap.open = true;
+    s.trap.toggled = s.round_frame.max(1);
+    for k in 0..40 {
+        let (mean, worst) = second(&mut s);
+        if k % 4 == 3 {
+            eprintln!("flooding, second {k}: {mean:.2} ms a step, worst {worst:.2} ({} drops, steam {:.1})", s.fluid.drops.len(), s.steam.total());
+        }
+    }
+}
+
+/// A step's cost in each arena (AI fighters, no flood): mean and worst over
+/// 3 s after the first, and the drops of liquid in it.
+#[test]
+#[ignore]
+fn measure_arena_steps() {
+    for level in 0..crate::level::ARENAS {
+        for n in [4usize, 8] {
+            let mut s = GameState::new_match(n, 0, 0, level, 5);
+            s.trap.def = None;
+            for _ in 0..60 {
+                s.step(&[]);
+            }
+            let (mut sum, mut worst) = (0.0f64, 0.0f64);
+            for _ in 0..180 {
+                let t = std::time::Instant::now();
+                s.step(&[]);
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                sum += ms;
+                worst = worst.max(ms);
+            }
+            let name = crate::level::levels()[level].name;
+            eprintln!("{name}, {n} fighters: {:.2} ms a step, worst {worst:.2} ({} drops)", sum / 180.0, s.fluid.drops.len());
+        }
+    }
+}
+
+#[test]
+fn teams_start_apart_never_hurt_each_other_and_win_together() {
+    let mut s = GameState::new_match(4, 4, 2, crate::level::GAUNTLET, 3);
+    let x = |s: &GameState, i: usize| s.fighters[i].pos(&s.world, PELVIS).x;
+    assert!(x(&s, 0) < 0.0 && x(&s, 2) < 0.0 && x(&s, 1) > 0.0 && x(&s, 3) > 0.0, "one team each end");
+    let at = s.fighters[2].pos(&s.world, PELVIS);
+    let hp = s.fighters[2].health;
+    s.damage(2, S_TORSO, 30.0, at, Vec2::X, 10.0, Kind::Blade, Some(0));
+    assert_eq!(s.fighters[2].health, hp, "a teammate's hit doesn't hurt");
+    let hp = s.fighters[1].health;
+    s.damage(1, S_TORSO, 30.0, at, Vec2::X, 10.0, Kind::Blade, Some(0));
+    assert!(s.fighters[1].health < hp, "the other team's does");
+    assert!(s.finish_target(0) != Some(2));
+    s.kill_fighter(1);
+    s.kill_fighter(3);
+    for _ in 0..20 {
+        s.step(&[0; 4]);
+    }
+    assert!(matches!(s.phase, Phase::RoundOver { .. }), "over once one team's left");
+    assert_eq!(s.scores, [1, 0, 1, 0], "the win counts for the whole team");
+}
+
+#[test]
+fn ai_fighters_play_themselves() {
+    // one player standing still, three AI
+    let mut s = GameState::new_match(4, 1, 0, crate::level::GAUNTLET, 9);
+    let start: Vec<Vec2> = s.fighters.iter().map(|f| f.pos(&s.world, PELVIS)).collect();
+    for _ in 0..240 {
+        s.step(&[0]);
+    }
+    let moved: Vec<f32> = s.fighters.iter().zip(&start).map(|(f, p)| (f.pos(&s.world, PELVIS) - *p).length()).collect();
+    eprintln!("moved in 4 s: {moved:.1?}");
+    assert!(moved[1..].iter().all(|&m| m > 2.0), "the AI get going");
 }

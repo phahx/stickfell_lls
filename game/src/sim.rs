@@ -7,13 +7,13 @@ use stickfell_physics::{Distance, Obb, Particle, Vec2, World, WorldConfig};
 
 use crate::fighter::{self, Fighter, HAND_A, HAND_B, PELVIS, S_FORE_A, S_HEAD, S_TORSO};
 use crate::input::{self, *};
-use crate::level::{ARENAS, BallDef, HazardDef, HazardKind, levels};
+use crate::level::{BallDef, HazardDef, HazardKind, LevelDef, levels};
 use crate::sfx::{Sfx, SfxEvent};
 use crate::weapon::{self, ARM, DROPS, Finish, GRAPPLE, KNIFE, Kind, LEG, PIN_HIT, RACK, STUMP, Weapon};
 use crate::fighter::HandScript;
 
 pub const DT: f32 = 1.0 / 60.0;
-pub const MAX_PLAYERS: usize = 4;
+pub const MAX_PLAYERS: usize = 8;
 const ROUND_OVER_FRAMES: u16 = 180;
 const DROP_INTERVAL: u32 = 420;
 const MAX_WEAPONS: usize = 14;
@@ -79,6 +79,35 @@ const SHOULDER_OVER: f32 = 1.05;
 const SHOULDER_LAND: f32 = 1.25;
 const SHOULDER_SLAM: Vec2 = Vec2::new(2.0, -11.0);
 const SHOULDER_DAMAGE: f32 = 18.0;
+/// After a shoulder throw slams them down, how long (frames) the thrower's
+/// finisher on them is a curb stomp.
+const SHOULDER_COMBO: u8 = 60;
+/// Frames a level's liquid is left to settle before a round (see `settled_liquid`).
+const LIQUID_SETTLE: u32 = 150;
+/// Spikes: how fast a body has to come down on a point to be run through on
+/// it, and how hard head or heart first to die on it there and then.
+const IMPALE_SPIKE_SPEED: f32 = 3.0;
+const IMPALE_SPIKE_VITAL: f32 = 7.0;
+/// The parts a spike runs through (not hands and feet).
+const SPIKE_IMPALES: [u32; 6] = [S_HEAD, S_TORSO, fighter::S_UPPER_A, fighter::S_UPPER_B, fighter::S_THIGH_A, fighter::S_THIGH_B];
+/// How far down a spike a body sinks (share of it up from the plate), the
+/// damage going on, bleeding on it (per frame), and the struggle per key press.
+const SPIKE_DEPTH: f32 = 0.3;
+const SPIKE_IMPALE_DAMAGE: f32 = 20.0;
+const SPIKE_BLEED: f32 = 0.14;
+const SPIKE_STRUGGLE: u8 = 10;
+/// Frames after being run through when a harder point (head or heart) can
+/// still finish them, and the fewest frames between struggles that count.
+const SPIKE_SETTLE: u16 = 8;
+const SPIKE_BEAT: u8 = 4;
+/// How fast (share of a spike a frame) a body above the point is drawn down onto it.
+const SPIKE_DRAW: f32 = 0.15;
+/// The curb stomp: how far past their head (away from their body) the
+/// stomper stands, and how flat the first stomp leaves the head.
+const STOMP_STAND: f32 = 0.42;
+/// How far (m a frame) the stomper shuffles to get there.
+const STOMP_SHUFFLE: f32 = 0.02;
+const STOMP_SQUASH: f32 = 0.9;
 /// A hit at least this hard makes the one hitting you let go.
 const HOLD_BREAK_DAMAGE: f32 = 5.0;
 /// Thrown bodies: losing more speed than this in a frame (hitting a wall,
@@ -170,7 +199,146 @@ pub struct Spark {
     pub life: u8,
     pub max_life: u8,
     pub blood: bool,
+    /// A drop of liquid (its colour; 0: a spark or blood), or a puff of steam.
+    pub tint: u32,
+    pub steam: bool,
 }
+
+/// The practice yard's flood trap: its layout (if the level has one), when
+/// the lever was pulled (round frame; 0: not yet), and how much water has
+/// come in.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Trap {
+    pub def: Option<crate::level::TrapDef>,
+    /// The lever's thrown (the hatch open, or opening).
+    pub open: bool,
+    /// The round frame it was last thrown either way (0: never).
+    pub toggled: u32,
+    /// Drops poured in since it was last opened.
+    pub poured: u32,
+}
+
+impl Trap {
+    /// Frames since the lever was last thrown either way (None: never).
+    pub fn since(&self, round_frame: u32) -> Option<u32> {
+        (self.toggled > 0).then(|| round_frame.saturating_sub(self.toggled))
+    }
+
+    /// How far over the lever is (0 up and back, 1 thrown).
+    pub fn lever(&self, round_frame: u32) -> f32 {
+        let Some(t) = self.since(round_frame) else { return 0.0 };
+        let moved = (t as f32 / LEVER_FRAMES as f32).min(1.0);
+        if self.open { moved } else { 1.0 - moved }
+    }
+
+    /// How far open the hatch is (0 shut, 1 doors hanging straight down):
+    /// it starts to open once the lever's over, and shuts as it comes back.
+    pub fn hatch(&self, round_frame: u32) -> f32 {
+        let Some(t) = self.since(round_frame) else { return 0.0 };
+        if self.open {
+            (t.saturating_sub(LEVER_FRAMES) as f32 / HATCH_FRAMES as f32).clamp(0.0, 1.0)
+        } else {
+            1.0 - (t as f32 / HATCH_FRAMES as f32).clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// Frames the lever takes to throw, the hatch to swing open (or shut), and
+/// before the water comes (after it's thrown open).
+pub const LEVER_FRAMES: u32 = 8;
+pub const HATCH_FRAMES: u32 = 30;
+const POUR_AFTER: u32 = 24;
+/// How far to the side of the lever you can stand and still pull it (m).
+const LEVER_REACH: f32 = 1.0;
+
+/// Swimming: from how much liquid round the pelvis they swim (waist deep;
+/// measured 0.39 standing in 1.2 m of water), and swim even with their
+/// feet on the bottom (chest deep: 0.56 in 1.6 m); how fast (m/s).
+const SWIM_DEPTH: f32 = 0.35;
+const SWIM_DEPTH_STANDING: f32 = 0.5;
+const SWIM_SPEED: f32 = 2.8;
+/// Once swimming, they keep swimming down to this much liquid round the
+/// pelvis (laid flat at the surface it's measured 0.31..0.35); how hard
+/// swimming steers them (1/s); and their buoyancy while stroking (water's
+/// own 1.8 g of lift would beat any stroke: measured, they couldn't dive).
+const SWIM_KEEP: f32 = 0.12;
+/// A fall that ends with a body part stopped from more than this (m/s,
+/// down) knocks them down: see `hard_landings`. Measured
+/// (`sim::feel::big_falls_floor_you_and_small_ones_dont`): a double jump on
+/// the flat lands at 12.7, a jump off a 3.5 m ledge 19.2, walking off 7 m
+/// 19.1, 8 m 20.4, 9 m 20.3; jumping off 7 m 22.6, 10 m 25.0, 14 m 27.2.
+const FALL_DOWN_SPEED: f32 = 20.5;
+/// Frames down after such a fall, and more per m/s over it (up to the most).
+const FALL_DOWN_FRAMES: u16 = 50;
+const FALL_DOWN_MORE: f32 = 6.0;
+const FALL_DOWN_MAX: u16 = 110;
+
+/// Steam: from how thick (around the head) it scalds, and how hard at its
+/// thickest (health a second: at least 33 s to kill, time to get out).
+const SCALD_FROM: f32 = 0.3;
+const SCALD_RATE: f32 = 3.0;
+/// A steam burst (water trapped under hot lava): how far it throws the
+/// liquid (m) and how fast at its middle (m/s); the steam it makes (cells'
+/// worth); how far it reaches fighters (m), how hard it knocks them back
+/// (m/s) and hurts them at the closest; and the frames before another.
+const BURST_REACH: f32 = 1.2;
+const BURST_SPEED: f32 = 7.0;
+const BURST_STEAM: f32 = 2.0;
+const BURST_HIT: f32 = 1.6;
+const BURST_PUSH: f32 = 6.0;
+const BURST_DAMAGE: f32 = 15.0;
+const BURST_COOLDOWN: u32 = 45;
+/// How fast water has to hit hot lava to go off (m/s): measured over a
+/// flood, the fastest 17 of 210 meetings (all as the front arrives, or
+/// fresh lava breaks through the crust).
+const BURST_IMPACT: f32 = 3.0;
+
+/// How long the water's shove on a fighter is averaged over (s); how hard
+/// (a share of their weight, sideways and down) knocks them off their feet,
+/// and for how long (frames). Measured: walking in still water peaks at
+/// 0.19, swimming 0.23; a 2 m dam breaking on them 0.36-0.38, standing under
+/// the hatch's stream 0.55, the flood's front 0.65.
+const SURGE_EASE: f32 = 0.25;
+const SURGE_KNOCK: f32 = 0.3;
+const SURGE_DOWN: u16 = 40;
+/// Climbing out at the side: how far up over the neck the hands reach (the
+/// arm's two bones, 0.38 + 0.35 m), looked for every HAUL_STEP m out to
+/// HAUL_LOOK steps ahead; how far the feet clear the lip, how far onto it
+/// they land (m), and how much faster than v = sqrt(2 g h) they go up to
+/// make up for the water dragging at their legs (measured: at 1.0 the feet
+/// came up 0.28 m short from 1 m out; at 1.2 they cleared the lip by
+/// 0.25-0.31 m from 0.6-3 m out, landing standing 0.5-0.7 m onto it).
+const ARM_REACH: f32 = 0.73;
+const HAUL_STEP: f32 = 0.1;
+const HAUL_LOOK: u32 = 10;
+const HAUL_CLEAR: f32 = 0.15;
+const HAUL_ONTO: f32 = 0.4;
+const HAUL_LOSS: f32 = 1.2;
+/// The least time a haul out takes (s).
+const HAUL_TIME: f32 = 0.3;
+const SWIM_STEER: f32 = 6.0;
+const SWIM_BUOYANCY: f32 = 1.0;
+/// Treading water, how fast the bobbing dies away (1/s).
+const TREAD_DAMP: f32 = 4.0;
+/// Liquid round the pelvis from which a shoulder throw won't go: hip deep
+/// (measured 0.18 in 0.9 m of water; knee deep, 0.6 m, is 0.0).
+const THROW_WADE: f32 = 0.15;
+/// A heave throw in water: what's left of it (share) once the thrower's in
+/// this much liquid round the pelvis (waist deep), less in between.
+const WATER_THROW_DEPTH: f32 = 0.5;
+const WATER_THROW: f32 = 0.25;
+
+/// Drowning: health lost every 8 frames once their breath is gone (with
+/// AIR 600, held under they last 10 s, then 12 s more).
+const DROWN_DAMAGE: f32 = 1.1;
+/// Buoyancy (of g) for someone alive who can't swim (two limbs gone): they
+/// go down.
+const SINKING_BUOYANCY: f32 = 0.8;
+
+/// Breath (frames) a fighter can hold under water.
+pub const AIR: u16 = 600;
+/// How much liquid round the head is having it under (breath held, drowning).
+pub const HEAD_UNDER: f32 = 0.4;
 
 /// A bullet in flight (simulated; hits are found by sweeping its path).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -220,6 +388,9 @@ pub struct Finisher {
     /// The wall behind the victim, for finishers that use one: where it is
     /// at their chest height when the finisher starts.
     pub wall: Option<Vec2>,
+    /// A curb stomp: which way their head lay from their body when it started
+    /// (+1: to the right); the stomper stands beyond it, facing back.
+    pub side: i8,
 }
 
 /// Where a noose's hook is.
@@ -356,6 +527,12 @@ pub struct GameState {
     pub round_frame: u32,
     pub round: u32,
     pub num_players: usize,
+    /// Fighters from this one on are played by the computer (worked out in
+    /// the sim, so every player's copy does the same); none in practice.
+    pub humans: usize,
+    /// Team size (2 for 2v2), or 0: every one for themselves. Fighters are
+    /// on alternate teams, the even ones and the odd ones.
+    pub teams: u8,
     pub level_index: usize,
     pub world: World,
     pub fighters: Vec<Fighter>,
@@ -381,6 +558,24 @@ pub struct GameState {
     clash_cd: u16,
     /// Per fighter: frames before a hazard can hurt them again.
     hazard_cd: Vec<u8>,
+    /// How fast each particle was falling just before this frame's physics
+    /// (m/s down): a landing is over by the time hazards are checked.
+    fall: Vec<f32>,
+    /// Per fighter: two fixed particles (a spike's base and point) and a
+    /// skewer slot, for being run through on a spike bed.
+    pub spike_pins: Vec<[u32; 3]>,
+    /// Every liquid in the arena: a volume of drops (see `stickfell_physics::fluid`).
+    pub fluid: stickfell_physics::Fluid,
+    /// The flood trap, if the level has one.
+    pub trap: Trap,
+    /// Steam off water boiling on lava, and frames until the next steam
+    /// burst can go off.
+    pub steam: crate::steam::Steam,
+    pub burst_cd: u32,
+    /// (Tests: every water drop meeting hot lava, how far under it and how
+    /// fast into it.)
+    #[cfg(test)]
+    pub hot_contacts: Vec<(f32, f32)>,
     pub sparks: Vec<Spark>,
     pub decals: Vec<Decal>,
     pub bullets: Vec<Bullet>,
@@ -451,6 +646,13 @@ pub(crate) fn build_rope(w: &mut World, anchor: Vec2, length: f32) -> Vec<u32> {
 
 impl GameState {
     pub fn new(num_players: usize, level_index: usize, seed: u32) -> Self {
+        Self::new_match(num_players, num_players, 0, level_index, seed)
+    }
+
+    /// A match of `num_players` fighters, the first `humans` of them played
+    /// by people and the rest by the computer, in teams of `teams` (0: every
+    /// one for themselves).
+    pub fn new_match(num_players: usize, humans: usize, teams: u8, level_index: usize, seed: u32) -> Self {
         let num_players = num_players.clamp(1, MAX_PLAYERS);
         let mut s = Self {
             joint_limits: true,
@@ -458,6 +660,8 @@ impl GameState {
             round_frame: 0,
             round: 0,
             num_players,
+            humans: humans.min(num_players),
+            teams,
             level_index: level_index % levels().len(),
             world: World::default(),
             fighters: Vec::new(),
@@ -476,6 +680,14 @@ impl GameState {
             clash_banner: None,
             clash_cd: 0,
             hazard_cd: Vec::new(),
+            fall: Vec::new(),
+            spike_pins: Vec::new(),
+            fluid: stickfell_physics::Fluid::new(crate::liquid::fluid_kinds(), crate::liquid::DROP_SPACING),
+            trap: Trap::default(),
+            steam: crate::steam::Steam::default(),
+            burst_cd: 0,
+            #[cfg(test)]
+            hot_contacts: Vec::new(),
             sparks: Vec::new(),
             decals: Vec::new(),
             bullets: Vec::new(),
@@ -502,6 +714,9 @@ impl GameState {
         let mut w = World::new(WorldConfig::default());
         for bx in &lv.boxes {
             w.add_static(Obb::new(bx.center, bx.half, bx.angle).with_friction(0.9));
+        }
+        for h in &lv.hazards {
+            Self::add_spike_statics(&mut w, h);
         }
         self.lamps.clear();
         for (i, ld) in lv.lamps.iter().enumerate() {
@@ -555,6 +770,10 @@ impl GameState {
             self.balls.push(Ball { def: *bd, chain });
         }
         self.hazards = lv.hazards.clone();
+        self.fluid = Self::settled_liquid(self.level_index, &self.hazards, &w);
+        self.trap = Trap { def: lv.trap, open: false, toggled: 0, poured: 0 };
+        self.steam = crate::steam::Steam::new(lv.min - Vec2::splat(2.0), lv.max + Vec2::splat(2.0), &w);
+        self.burst_cd = 0;
         self.clash = None;
         self.clash_banner = None;
         self.clash_cd = 0;
@@ -565,11 +784,12 @@ impl GameState {
         self.hazard_cd = vec![0; self.num_players];
         self.fighters.clear();
         for id in 0..self.num_players {
-            let sp = lv.spawns[id % lv.spawns.len()];
+            let sp = self.spawn_point(&lv, id);
             let feet = w.raycast(sp, Vec2::NEG_Y, 25.0).map_or(sp, |h| h.point + Vec2::new(0.0, 0.02));
             let facing = if sp.x <= 0.0 { 1.0 } else { -1.0 };
             self.fighters.push(Fighter::spawn(&mut w, id as u8, feet, facing));
         }
+        self.spike_pins = Self::make_spike_pins(&mut w, self.num_players);
         self.world = w;
         self.weapons.clear();
         // starting weapons on distinct spawn points
@@ -639,6 +859,34 @@ impl GameState {
 
     pub fn alive_count(&self) -> usize {
         self.fighters.iter().filter(|f| f.alive).count()
+    }
+
+    /// Which team a fighter is on (0 or 1), in a team match.
+    pub fn team(&self, id: usize) -> Option<u8> {
+        (self.teams > 0).then_some((id % 2) as u8)
+    }
+
+    /// Whether two fighters are on the same side (yourself included).
+    pub fn allies(&self, a: usize, b: usize) -> bool {
+        a == b || (self.teams > 0 && a % 2 == b % 2)
+    }
+
+    /// Teams with someone still alive.
+    fn teams_alive(&self) -> usize {
+        (0..2).filter(|&t| self.fighters.iter().any(|f| f.alive && f.id as usize % 2 == t)).count()
+    }
+
+    /// Where fighter `id` starts: in turn round the level's spawns, or in a
+    /// team match, one team from the left end and the other from the right.
+    fn spawn_point(&self, lv: &LevelDef, id: usize) -> Vec2 {
+        let n = lv.spawns.len();
+        if self.teams == 0 {
+            return lv.spawns[id % n];
+        }
+        let mut by_x = lv.spawns.clone();
+        by_x.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let k = (id / 2) % n;
+        if id % 2 == 0 { by_x[k] } else { by_x[n - 1 - k] }
     }
 
     // ---- weapons in hand ------------------------------------------------
@@ -944,7 +1192,7 @@ impl GameState {
             let rest = (self.world.particles[anchor as usize].pos - hand).length();
             self.world.distances[f.tether as usize] = Distance { a: hb, b: anchor, rest, compliance: 0.0, enabled: true };
             (pid, true, 1e-4)
-        } else if self.world.statics.iter().any(|s| s.collide_circle(hand, 0.18).is_some()) {
+        } else if self.world.statics.iter().any(|s| !crate::level::is_spike(s.tag) && s.collide_circle(hand, 0.18).is_some()) {
             let a = f.anchor as usize;
             self.world.particles[a].pos = hand;
             self.world.particles[a].prev = hand;
@@ -1152,7 +1400,9 @@ impl GameState {
         let (f, vf) = (&self.fighters[fi], &self.fighters[v]);
         let behind = (vf.pos(&self.world, PELVIS).x - f.pos(&self.world, PELVIS).x) * f.facing;
         let tied = self.nooses.iter().any(|n| n.victim as usize == v && !n.cut);
-        f.grounded && f.heave == 0 && f.shoulder == 0 && f.down == 0 && !vf.choking && !tied && !self.in_finisher(v)
+        // (no leverage in water: hip deep or more, either of them, and it won't go)
+        let footing = f.wade < THROW_WADE && vf.wade < THROW_WADE;
+        f.grounded && footing && f.heave == 0 && f.shoulder == 0 && f.down == 0 && !vf.choking && !tied && !self.in_finisher(v)
             && (-SHOULDER_REACH..-0.05).contains(&behind)
     }
 
@@ -1250,6 +1500,8 @@ impl GameState {
             vf.flying = 20;
             vf.flung_by = fi as u8;
             vf.slam = SHOULDER_DAMAGE;
+            vf.shouldered = SHOULDER_COMBO;
+            vf.shouldered_by = fi as u8;
             let at = self.fighters[v].pos(&self.world, PELVIS);
             self.events.push(Sfx::Throw.at(at).vol(1.3));
         }
@@ -1260,7 +1512,9 @@ impl GameState {
         let f = &self.fighters[fi];
         let Some(v) = f.hold.map(|v| v as usize) else { return };
         let dir = f.aim_dir();
-        let power = 0.55 + 0.45 * f.strength().min(1.0);
+        // (no footing in water: waist deep, a quarter of a throw)
+        let footing = 1.0 - (f.wade / WATER_THROW_DEPTH).clamp(0.0, 1.0) * (1.0 - WATER_THROW);
+        let power = (0.55 + 0.45 * f.strength().min(1.0)) * footing;
         let fling = (dir * BODY_THROW_SPEED + Vec2::new(0.0, BODY_THROW_LIFT)) * power;
         self.release_grab(fi);
         self.fighters[fi].grab_cd = 30;
@@ -1608,7 +1862,7 @@ impl GameState {
             let a = dmath::angle(dir) + self.rng.range(-0.9, 0.9);
             let v = dmath::dir(a) * (speed * self.rng.range(0.3, 1.0)) + Vec2::new(0.0, 1.5);
             let life = 30 + (self.rng.next_u32() % 30) as u8;
-            self.sparks.push(Spark { pos: at, vel: v, life, max_life: life, blood: true });
+            self.sparks.push(Spark { pos: at, vel: v, life, max_life: life, blood: true, tint: 0, steam: false });
         }
     }
 
@@ -1661,6 +1915,7 @@ impl GameState {
             WoundKind::Exit => 420,
             WoundKind::Stab => 300,
             WoundKind::Cut => 200,
+            WoundKind::Spatter => 0,
         };
         let wd = fighter::Wound { part: part as u8, kind, at: local, dir: run, size, born: self.frame, bleed };
         let f = &mut self.fighters[fi];
@@ -1690,7 +1945,7 @@ impl GameState {
                 }
                 let (at, _) = f.wound_at(&self.world, &wd);
                 let vel = Vec2::new(self.rng.range(-0.25, 0.25), -0.3);
-                self.sparks.push(Spark { pos: at, vel, life: 50, max_life: 50, blood: true });
+                self.sparks.push(Spark { pos: at, vel, life: 50, max_life: 50, blood: true, tint: 0, steam: false });
             }
         }
     }
@@ -1703,7 +1958,7 @@ impl GameState {
             let a = dmath::angle(dir) + self.rng.range(-1.4, 1.4);
             let v = dmath::dir(a) * (speed * self.rng.range(0.35, 1.0));
             let life = 10 + (self.rng.next_u32() % 14) as u8;
-            self.sparks.push(Spark { pos: at, vel: v, life, max_life: life, blood: false });
+            self.sparks.push(Spark { pos: at, vel: v, life, max_life: life, blood: false, tint: 0, steam: false });
         }
     }
 
@@ -1776,6 +2031,10 @@ impl GameState {
         if self.tossed(fi) {
             return;
         }
+        // (teammates can knock each other about, but not hurt each other)
+        if attacker.is_some_and(|a| self.allies(a as usize, fi) && a as usize != fi) {
+            return;
+        }
         let was_alive = self.fighters[fi].alive;
         let k = knock.min(40.0);
         {
@@ -1836,7 +2095,7 @@ impl GameState {
     /// Down, badly hurt, and not already busy: can be finished off.
     pub fn finishable(&self, vi: usize) -> bool {
         let v = &self.fighters[vi];
-        v.alive && !v.choking && !self.tossed(vi) && (v.down > 0 || v.dazed > 0) && v.health <= FINISH_HP && !self.in_finisher(vi) && !self.weapons.iter().any(|w| w.victim == Some(vi as u8)) && self.clash.is_none_or(|c| c.side_of(vi).is_none())
+        v.alive && !v.choking && !self.tossed(vi) && (v.down > 0 || v.dazed > 0) && v.health <= FINISH_HP && !self.in_finisher(vi) && v.impaled == 0 && !self.weapons.iter().any(|w| w.victim == Some(vi as u8)) && self.clash.is_none_or(|c| c.side_of(vi).is_none())
     }
 
     /// The finishable fighter `fi` could finish right now, if any.
@@ -1847,7 +2106,7 @@ impl GameState {
         }
         let me = f.pos(&self.world, PELVIS);
         (0..self.fighters.len())
-            .filter(|&v| v != fi && self.finishable(v))
+            .filter(|&v| !self.allies(fi, v) && self.finishable(v))
             // (already tied to the hook in your hand: toss it instead)
             .filter(|&v| !self.nooses.iter().any(|n| !n.cut && n.hook == Hook::Loaded && n.victim as usize == v && Some(n.weapon) == f.weapon))
             .map(|v| (v, (self.fighters[v].pos(&self.world, PELVIS) - me).length()))
@@ -1877,13 +2136,19 @@ impl GameState {
                 mv = Finish::Lift;
             }
         }
+        // just thrown over your shoulder: stomp on their head, whatever's in your hand
+        let vf = &self.fighters[vi];
+        if vf.shouldered > 0 && vf.shouldered_by as usize == fi {
+            mv = Finish::Stomp;
+        }
         let weapon = self.fighters[fi].weapon;
         // a sword with a wall at their back: pin them to it instead
         let wall = if mv == Finish::Behead { self.wall_behind(fi, vi) } else { None };
         if wall.is_some() {
             mv = Finish::Pin;
         }
-        self.finishers.push(Finisher { attacker: fi as u8, victim: vi as u8, mv, t: 0, weapon, killed: false, wall });
+        let side = Self::head_side(&self.fighters[vi], &self.world) as i8;
+        self.finishers.push(Finisher { attacker: fi as u8, victim: vi as u8, mv, t: 0, weapon, killed: false, wall, side });
         // the performance can't land a stray hit early: only the scripted strikes count
         // (and a pickup's grace running out mustn't undo that)
         if let Some(wi) = self.fighters[fi].weapon {
@@ -1957,7 +2222,9 @@ impl GameState {
         // (reaches are for the game's arm; they stretch with the attacker's)
         let ak = a.body.arm_k();
         let shove = x.mv == Finish::Pin && ft < PIN_HIT;
-        let hs = |ang: f32, reach: f32, omega: f32| HandScript { ang: dmath::wrap_angle(ang), reach: reach * ak, omega, hold: x.mv.holds(), high, kneel, shove, aim: None };
+        // a stomp faces back at the head from beyond it
+        let f = if x.mv == Finish::Stomp { -(x.side as f32) } else { f };
+        let hs = |ang: f32, reach: f32, omega: f32| HandScript { ang: dmath::wrap_angle(ang), reach: reach * ak, omega, hold: x.mv.holds(), high, kneel, shove, aim: None, leg: None };
         let sc = match x.mv {
             Finish::Behead if t < 28 => hs(to_head + f * 2.2, 0.5, 18.0),
             Finish::Behead => hs(to_head - f * 0.7, 0.64, 32.0),
@@ -2041,6 +2308,27 @@ impl GameState {
             Finish::Pin if ft < PIN_HIT - 6 => hs(to_chest, -0.15, 5.0),
             Finish::Pin if ft <= PIN_HIT => hs(to_chest, 0.85, 36.0),
             Finish::Pin => hs(to_chest - f * 0.5, 0.35, 6.0),
+            Finish::Stomp => {
+                // the heel placed by working the leg back from where it should
+                // be (the knee bent forward to fit): lifted straight up beside
+                // you, carried over their head, then driven straight down onto
+                // it; up over it again, higher, and down again. It never sweeps
+                // along the floor into them.
+                let (hip, knee, foot) = (a.pos(w, PELVIS), a.pos(w, fighter::KNEE_A), a.pos(w, fighter::FOOT_A));
+                let (lt, ls) = ((knee - hip).length().max(0.1), (foot - knee).length().max(0.1));
+                let ik = |target: Vec2| {
+                    let d = (target - hip).length().clamp(0.05, (lt + ls) * 0.999);
+                    // (acos from the deterministic atan2, for rollback)
+                    let cos_rule = |near: f32, far: f32| {
+                        let c = ((near * near + d * d - far * far) / (2.0 * near * d)).clamp(-1.0, 1.0);
+                        dmath::angle(Vec2::new(c, (1.0 - c * c).max(0.0).sqrt()))
+                    };
+                    let (at_hip, at_foot) = (cos_rule(lt, ls), cos_rule(ls, lt));
+                    (dmath::angle(target - hip) + f * at_hip, at_hip + at_foot)
+                };
+                let leg = self.stomp_foot(x).map(|(target, _)| ik(target));
+                HandScript { leg, ..hs(dmath::angle(Vec2::new(-f, 0.25)), 0.45, 8.0) }
+            }
         };
         (sc, f)
     }
@@ -2085,7 +2373,32 @@ impl GameState {
                 self.slowmo = SLOWMO_FRAMES;
             }
             // moves that don't grab: step in to striking distance first
-            if !x.mv.holds() && x.t + 12 < x.mv.hits()[0] {
+            if let (true, Some((target, speed))) = (x.mv == Finish::Stomp, self.stomp_foot(&x)) {
+                // the heel carried along its path (the leg's muscles only
+                // shape it: driving it with them would heave the body up)
+                let p = &mut self.world.particles[self.fighters[a].p(fighter::FOOT_A) as usize];
+                let mut want = (target - p.pos) * 14.0;
+                if want.length() > speed {
+                    want *= speed / want.length();
+                }
+                p.vel = p.vel.lerp(want, 0.5);
+            }
+            if x.mv == Finish::Stomp {
+                // eased to just beyond their head (away from their body),
+                // never while a stomp is coming down
+                let [first, second] = weapon::STOMP_HITS;
+                // (a shuffle: a little each frame, which standing still can't undo)
+                if ticked && (x.t < first - 10 || (first + 8..second - 10).contains(&x.t)) {
+                    let spot = self.fighters[v].pos(&self.world, fighter::HEAD).x + x.side as f32 * STOMP_STAND;
+                    let dx = (spot - self.fighters[a].pos(&self.world, PELVIS).x).clamp(-STOMP_SHUFFLE, STOMP_SHUFFLE);
+                    for id in self.fighters[a].particle_ids() {
+                        let p = &mut self.world.particles[id as usize];
+                        p.pos.x += dx;
+                        p.prev.x += dx;
+                    }
+                }
+            }
+            if !x.mv.holds() && x.mv != Finish::Stomp && x.t + 12 < x.mv.hits()[0] {
                 let gap = self.fighters[v].pos(&self.world, PELVIS).x - self.fighters[a].pos(&self.world, PELVIS).x;
                 if gap.abs() > 1.2 {
                     let want = gap.signum() * 4.0;
@@ -2209,6 +2522,10 @@ impl GameState {
     /// from the victim before a spear throw, as far as there's room).
     fn finisher_walk(&self, fi: usize) -> u16 {
         let Some(x) = self.finishers.iter().find(|x| x.attacker as usize == fi) else { return 0 };
+        if x.mv == Finish::Stomp {
+            // (placed by a slide in update_finishers, not by running into them)
+            return 0;
+        }
         if let (Finish::Pin, Some(wall)) = (x.mv, x.wall) {
             let me = self.fighters[fi].pos(&self.world, PELVIS);
             let toward = if wall.x >= me.x { RIGHT } else { LEFT };
@@ -2526,7 +2843,7 @@ impl GameState {
         let Some((_, base, tip)) = wp.def().impale else { return };
         let seg = self.world.segments[(self.fighters[v].seg_base + S_TORSO) as usize];
         let (slot, b_id, t_id) = (wp.skewer, wp.particle(base), wp.particle(tip));
-        self.world.skewers[slot as usize] = stickfell_physics::Skewer { a: seg.a, b: seg.b, s: 0.5, base: b_id, tip: t_id, u_min: 0.08, friction, u: 0.5, enabled: true, anchored: false };
+        self.world.skewers[slot as usize] = stickfell_physics::Skewer { a: seg.a, b: seg.b, s: 0.5, base: b_id, tip: t_id, u_min: 0.08, u_max: f32::MAX, friction, u: 0.5, enabled: true, anchored: false };
         let wp = &mut self.weapons[wi];
         wp.victim = Some(v as u8);
         wp.skewer_t = GLIDE_FRAMES;
@@ -2731,6 +3048,100 @@ impl GameState {
         self.events.push(Sfx::Pain.at(head).line(0, fi as u8));
     }
 
+    /// Where a curb stomp has the stomper's heel this frame, and how fast it
+    /// may get there (m/s): lifted straight up beside them, carried over the
+    /// head, driven straight down onto it; up over it again, higher, and down
+    /// again. None while they're stepping in, and after.
+    fn stomp_foot(&self, x: &Finisher) -> Option<(Vec2, f32)> {
+        let (a, v) = (&self.fighters[x.attacker as usize], &self.fighters[x.victim as usize]);
+        let w = &self.world;
+        let f = -(x.side as f32);
+        let hip = a.pos(w, PELVIS);
+        let head = v.pos(w, fighter::HEAD);
+        // (on top of the head: its radius and the heel's, sunk in a little)
+        let top = w.segments[(v.seg_base + S_HEAD) as usize].radius + w.particles[a.p(fighter::FOOT_A) as usize].radius;
+        let hover = |h: f32| head + Vec2::new(0.0, top + h);
+        let on = head + Vec2::new(0.0, top - 0.03);
+        let [first, second] = weapon::STOMP_HITS;
+        Some(match x.t {
+            t if t < 26 => return None,
+            t if t < 34 => (Vec2::new(hip.x + f * 0.08, hip.y - 0.4), 3.0),
+            t if t < first - 7 => (hover(0.3), 3.0),
+            t if t < first + 8 => (on, 7.0),
+            t if t < first + 16 => (hover(0.2), 2.5),
+            t if t < second - 7 => (hover(0.4), 2.5),
+            t if t < second + 14 => (on, 8.0),
+            _ => return None,
+        })
+    }
+
+    /// Which way their head lies from their body (+1: to the right).
+    fn head_side(v: &Fighter, w: &World) -> f32 {
+        if v.pos(w, fighter::HEAD).x >= v.pos(w, PELVIS).x { 1.0 } else { -1.0 }
+    }
+
+    /// A curb stomp landing: the first flattens the head, the last bursts it.
+    /// Either way the stomper's leg comes away bloody.
+    fn stomp(&mut self, x: Finisher, last: bool) {
+        let (a, v) = (x.attacker as usize, x.victim as usize);
+        let head = self.fighters[v].pos(&self.world, fighter::HEAD);
+        let foot = self.fighters[a].pos(&self.world, fighter::FOOT_A);
+        let att = Some(x.attacker);
+        // the stomper's foot and shin take some of it
+        let (knee, hip) = (self.fighters[a].pos(&self.world, fighter::KNEE_A), self.fighters[a].pos(&self.world, PELVIS));
+        let spots: &[(u32, Vec2)] = if last {
+            &[(fighter::S_SHIN_A, foot), (fighter::S_SHIN_A, foot.lerp(knee, 0.5)), (fighter::S_SHIN_A, knee), (fighter::S_THIGH_A, knee.lerp(hip, 0.4)), (S_TORSO, hip + Vec2::new(0.0, 0.18))]
+        } else {
+            &[(fighter::S_SHIN_A, foot), (fighter::S_SHIN_A, foot.lerp(knee, 0.4))]
+        };
+        for &(part, at) in spots {
+            let jitter = Vec2::new(self.rng.range(-0.04, 0.04), self.rng.range(-0.04, 0.04));
+            let size = self.rng.range(0.03, 0.045);
+            self.wound(a, part, at + jitter, fighter::WoundKind::Spatter, size, Vec2::X);
+        }
+        self.events.push(Sfx::Thud.at(head).vol(1.6));
+        if !last {
+            self.fighters[v].head_squash = self.fighters[v].head_squash.max(STOMP_SQUASH);
+            self.events.push(Sfx::HitHeavy.at(head).vol(1.3));
+            self.spawn_blood(head, Vec2::new(0.0, 1.0), 10, 3.5);
+            let alive = self.fighters[v].health;
+            self.damage(v, S_HEAD, 4.0, head, Vec2::NEG_Y, 0.0, Kind::Blunt, att);
+            // the first one never kills
+            self.fighters[v].health = self.fighters[v].health.max(alive.min(1.0));
+            self.wince(v);
+            self.shake = (self.shake + 0.7).min(1.5);
+            return;
+        }
+        self.finish_banner = Some((x.mv, x.attacker, FINISH_BANNER));
+        self.shake = 1.5;
+        self.flash = 10;
+        // flattened, then gone: nothing flies off, it bursts where it lies
+        let fv = self.fighters[v].clone();
+        self.sever(v, S_HEAD);
+        let hid = fv.p(fighter::HEAD) as usize;
+        let hp = &mut self.world.particles[hid];
+        hp.vel = Vec2::ZERO;
+        hp.prev = hp.pos;
+        hp.radius = 0.01;
+        self.world.segments[(fv.seg_base + S_HEAD) as usize].radius = 0.005;
+        {
+            let fm = &mut self.fighters[v];
+            fm.head_squash = 1.0;
+            fm.head_popped = true;
+        }
+        for k in 0..9 {
+            let ang = core::f32::consts::PI * (k as f32 + 0.5) / 9.0;
+            let (s, c) = dmath::sin_cos(ang);
+            let speed = self.rng.range(5.0, 9.0);
+            self.spawn_blood(head, Vec2::new(c, s * 0.6 + 0.2), 7, speed);
+        }
+        self.spawn_blood(head, Vec2::Y, 18, 3.0);
+        self.events.push(Sfx::Sever.at(head).vol(1.6));
+        self.events.push(Sfx::HitHeavy.at(head).vol(1.8));
+        let neck = self.fighters[v].pos(&self.world, fighter::NECK);
+        self.damage(v, S_TORSO, 999.0, neck, Vec2::NEG_Y, 0.0, Kind::Blunt, att);
+    }
+
     fn finisher_hit(&mut self, x: Finisher, k: usize) {
         let hits = x.mv.hits();
         let last = k + 1 == hits.len();
@@ -2739,6 +3150,7 @@ impl GameState {
             return;
         }
         match (x.mv, k) {
+            (Finish::Stomp, _) => return self.stomp(x, last),
             (Finish::Javelin, 1) => return self.javelin_throw(x),
             (Finish::Lift, 1) => return self.lift_jam(x),
             (Finish::Lift, 2) => return self.lift_drop(x),
@@ -2796,7 +3208,7 @@ impl GameState {
                 let dir = if x.mv == Finish::Smash { Vec2::NEG_Y } else { Vec2::new(f, 0.0) };
                 kill(self, S_TORSO, torso, dir, 30.0, Kind::Blunt);
             }
-            Finish::Javelin | Finish::Lift | Finish::Hang | Finish::Pin => {}
+            Finish::Javelin | Finish::Lift | Finish::Hang | Finish::Pin | Finish::Stomp => {}
             Finish::Spin => {
                 self.events.push(Sfx::HitHeavy.at(torso).vol(1.8));
                 self.release_grab(a);
@@ -3202,6 +3614,7 @@ impl GameState {
         let s = if vseg.a == vseg.b { 0.0 } else { stickfell_physics::collide::point_segment(point, va, vb).1 };
         let (slot, base_id, tip_id) = (w.skewer, w.particle(base), w.particle(tip));
         self.world.skewers[slot as usize] = stickfell_physics::Skewer {
+            u_max: f32::MAX,
             a: vseg.a,
             b: vseg.b,
             s,
@@ -3271,6 +3684,771 @@ impl GameState {
         }
     }
 
+    /// A spike bed's solid parts: its base plate and a thin core up each
+    /// tooth to its point (bodies rest on the points; the damage comes from
+    /// touching a tooth's real shape, see `update_hazards`).
+    fn add_spike_statics(w: &mut World, h: &HazardDef) {
+        if h.kind != HazardKind::Spikes {
+            return;
+        }
+        let (c, half) = h.plate();
+        w.add_static(Obb::new(c, half, 0.0).with_friction(0.9).with_tag(crate::level::SPIKE_PLATE_TAG));
+        for t in h.teeth() {
+            let mid = (t.base + t.tip) * 0.5;
+            let half = Vec2::new(crate::level::SPIKE_CORE, (t.tip.y - t.base.y) * 0.5);
+            w.add_static(Obb::new(mid, half, 0.0).with_friction(0.6).with_tag(crate::level::SPIKE_TAG));
+        }
+    }
+
+    /// Practice: brings a dummy back whole (a dead one if there is one, else
+    /// the one furthest away), standing a step in front of fighter `me`,
+    /// facing them. Everything still tied to its old body lets go first, and
+    /// the old body is taken out of play.
+    pub fn bring_dummy(&mut self, me: usize) {
+        let here = self.fighters[me].pos(&self.world, PELVIS);
+        let score = |s: &Self, i: usize| (if s.fighters[i].alive { 0.0 } else { 1e6 }) + (s.fighters[i].pos(&s.world, PELVIS) - here).length();
+        let Some(i) = (0..self.fighters.len()).filter(|&i| i != me).max_by(|&a, &b| score(self, a).total_cmp(&score(self, b))) else { return };
+        // let go of everything tied to it
+        self.release(i, false);
+        self.release_grab(i);
+        for k in 0..self.fighters.len() {
+            if self.fighters[k].hold == Some(i as u8) {
+                self.release_grab(k);
+            }
+        }
+        let mut j = 0;
+        while j < self.finishers.len() {
+            let x = self.finishers[j];
+            if x.attacker as usize == i || x.victim as usize == i {
+                self.finishers.remove(j);
+                self.release_grab(x.attacker as usize);
+            } else {
+                j += 1;
+            }
+        }
+        for n in self.nooses.iter().filter(|n| n.victim as usize == i) {
+            self.world.distances[n.tether as usize].enabled = false;
+        }
+        self.nooses.retain(|n| n.victim as usize != i);
+        for wi in 0..self.weapons.len() {
+            if self.weapons[wi].victim == Some(i as u8) {
+                self.unskewer(wi);
+            }
+            if self.weapons[wi].stuck.is_some_and(|(f, _)| f as usize == i) {
+                self.unstick(wi);
+            }
+        }
+        if self.clash.is_some_and(|c| c.side_of(i).is_some()) {
+            self.clash = None;
+        }
+        self.unimpale(i);
+        // the old body out of play
+        let old = self.fighters[i].clone();
+        for id in old.particle_ids().chain([old.anchor]) {
+            self.world.park_particle(id);
+        }
+        for k in 0..fighter::BONES.len() as u32 {
+            self.world.segments[(old.seg_base + k) as usize].enabled = false;
+        }
+        for d in [old.grab, old.tether, old.grip_a, old.grip_b] {
+            self.world.distances[d as usize].enabled = false;
+        }
+        // a fresh one a step in front, on whatever's under it
+        let facing = self.fighters[me].facing;
+        // a step ahead, or further on if someone's standing there already
+        let reach = self.world.raycast(here, Vec2::new(facing, 0.0), 3.4).map_or(3.4, |h| (h.t - 0.45).max(0.5));
+        let clear = |x: f32| (0..self.fighters.len()).filter(|&k| k != i && k != me).all(|k| (self.fighters[k].pos(&self.world, PELVIS).x - x).abs() > 0.7);
+        let ahead = [1.4f32, 2.2, 3.0].into_iter().map(|a| a.min(reach)).find(|&a| clear(here.x + facing * a)).unwrap_or(1.4f32.min(reach));
+        let spot = here + Vec2::new(facing * ahead, 1.0);
+        let feet = self.world.raycast(spot, Vec2::NEG_Y, 25.0).map_or(spot, |h| h.point + Vec2::new(0.0, 0.02));
+        self.fighters[i] = Fighter::spawn(&mut self.world, i as u8, feet, -facing);
+        self.hazard_cd[i] = 0;
+        self.punch_cd[i] = 0;
+        let at = self.fighters[i].pos(&self.world, fighter::NECK);
+        self.events.push(Sfx::Pickup.at(at));
+    }
+
+    /// Run through on a spike: the body slides down it and stays on it (the
+    /// tooth's line through the part it went in by) until they struggle off
+    /// the point or bleed out. Head or heart first and hard enough, they die
+    /// on it at once.
+    fn spike_impale(&mut self, fi: usize, part: u32, s: f32, tooth: crate::level::Tooth, down: f32) {
+        let Some(&[pb, pt, slot]) = self.spike_pins.get(fi) else { return };
+        for (id, at) in [(pb, tooth.base), (pt, tooth.tip)] {
+            let p = &mut self.world.particles[id as usize];
+            p.pos = at;
+            p.prev = at;
+            p.vel = Vec2::ZERO;
+        }
+        let f = self.fighters[fi].clone();
+        let sg = self.world.segments[(f.seg_base + part) as usize];
+        let at = self.world.particles[sg.a as usize].pos.lerp(self.world.particles[sg.b as usize].pos, s);
+        let u = ((at.y - tooth.base.y) / (tooth.tip.y - tooth.base.y)).max(SPIKE_DEPTH);
+        // (if it's still above the point, it's drawn down onto it over a few frames)
+        self.world.skewers[slot as usize] = stickfell_physics::Skewer { a: sg.a, b: sg.b, s, base: pb, tip: pt, u_min: SPIKE_DEPTH, u_max: u, friction: 0.05, u, enabled: true, anchored: true };
+        // through the other teeth too, down onto the plate
+        self.set_spike_skip(fi, crate::level::SPIKE_TAG);
+        for id in f.particle_ids() {
+            self.world.particles[id as usize].vel.x *= 0.3;
+        }
+        let fm = &mut self.fighters[fi];
+        fm.impaled = 1;
+        fm.impale_part = part as u8;
+        fm.impale_free = 0;
+        self.hazard_cd[fi] = 25;
+        let point = Vec2::new(tooth.tip.x, at.y);
+        self.events.push(Sfx::Impale.at(point).vol(1.3));
+        self.events.push(Sfx::Spikes.at(point));
+        self.wound(fi, part, point, fighter::WoundKind::Stab, 0.045, Vec2::Y);
+        self.spawn_blood(point, Vec2::Y, 14, 3.5);
+        let vital = part == S_HEAD || (part == S_TORSO && s >= 0.5);
+        if vital && down >= IMPALE_SPIKE_VITAL {
+            self.spawn_blood(point, Vec2::Y, 16, 5.0);
+            self.shake = (self.shake + 0.8).min(1.5);
+            self.damage(fi, part, 999.0, point, Vec2::Y, 0.0, Kind::Spike, None);
+        } else {
+            self.damage(fi, part, SPIKE_IMPALE_DAMAGE + down * 2.0, point, Vec2::Y, 0.0, Kind::Spike, None);
+        }
+    }
+
+    /// Each fighter's spike pins (see `spike_pins`), out of the way till needed.
+    pub(crate) fn make_spike_pins(w: &mut World, n: usize) -> Vec<[u32; 3]> {
+        (0..n)
+            .map(|_| {
+                let mut pin = Particle::new(Vec2::new(0.0, -1000.0), 0.0, 0.01);
+                pin.collide_static = false;
+                [w.add_particle(pin), w.add_particle(pin), w.add_skewer_slot()]
+            })
+            .collect()
+    }
+
+    /// A fighter's body passing through (or not) a kind of static.
+    fn set_spike_skip(&mut self, fi: usize, tag: u32) {
+        let f = &self.fighters[fi];
+        for id in f.particle_ids() {
+            self.world.particles[id as usize].skip_tag = tag;
+        }
+        for k in 0..fighter::BONES.len() as u32 {
+            self.world.segments[(f.seg_base + k) as usize].skip_tag = tag;
+        }
+    }
+
+    /// Off the spike (struggled free, or taken out of play).
+    fn unimpale(&mut self, fi: usize) {
+        if self.fighters[fi].impaled == 0 {
+            return;
+        }
+        if let Some(&[_, _, slot]) = self.spike_pins.get(fi) {
+            self.world.skewers[slot as usize].enabled = false;
+        }
+        self.set_spike_skip(fi, 0);
+        let f = &mut self.fighters[fi];
+        f.impaled = 0;
+        f.impale_free = 0;
+    }
+
+    /// The impaled: bleeding, held on the spike, struggling up it (mash the
+    /// movement keys) and off the point.
+    fn update_impaled(&mut self) {
+        for fi in 0..self.fighters.len() {
+            let f = &mut self.fighters[fi];
+            f.impale_grace = f.impale_grace.saturating_sub(1);
+            if f.impaled == 0 {
+                continue;
+            }
+            f.impaled = f.impaled.saturating_add(1);
+            let Some(&[_, _, slot]) = self.spike_pins.get(fi) else { continue };
+            let (t, alive) = (f.impaled, f.alive);
+            // (anything still above the point comes down onto it)
+            {
+                let sk = &mut self.world.skewers[slot as usize];
+                sk.u_max = (sk.u_max - SPIKE_DRAW).max(sk.u_min).max(if alive { SPIKE_DEPTH } else { 0.0 });
+                if alive {
+                    sk.u_max = sk.u_max.max(1.02);
+                }
+            }
+            if !alive {
+                // the dead stay on it
+                self.world.skewers[slot as usize].friction = 1.0;
+                continue;
+            }
+            f.down = f.down.max(8);
+            // (a struggle counts at most every few frames, however fast the keys go)
+            f.impale_beat = f.impale_beat.saturating_sub(1);
+            let pressed = [LEFT, RIGHT, JUMP, CROUCH].iter().any(|&b| f.pressed(b));
+            let mash = (pressed && f.impale_beat == 0) as u8;
+            if mash > 0 {
+                f.impale_beat = SPIKE_BEAT;
+            }
+            f.impale_free = if mash > 0 {
+                f.impale_free.saturating_add(mash * SPIKE_STRUGGLE)
+            } else if t % 3 == 0 {
+                f.impale_free.saturating_sub(1)
+            } else {
+                f.impale_free
+            };
+            let free = f.impale_free;
+            // hauled up the spike as they struggle, sliding back down as they tire
+            let sk = &mut self.world.skewers[slot as usize];
+            sk.u_min = SPIKE_DEPTH + (1.02 - SPIKE_DEPTH) * (free.min(100) as f32 / 100.0);
+            sk.friction = 0.1;
+            let sk = *sk;
+            let at = self.world.particles[sk.a as usize].pos.lerp(self.world.particles[sk.b as usize].pos, sk.s);
+            if mash > 0 {
+                // thrashing about on it
+                let ids: Vec<u32> = self.fighters[fi].particle_ids().collect();
+                for id in ids {
+                    let kick = Vec2::new(self.rng.range(-0.8, 0.8), self.rng.range(0.0, 0.6));
+                    self.world.particles[id as usize].vel += kick;
+                }
+                if self.rng.range(0.0, 1.0) < 0.4 {
+                    self.spawn_blood(at, Vec2::Y, 2, 2.0);
+                }
+            }
+            if free >= 100 {
+                // off the point: up and away
+                self.unimpale(fi);
+                let ids = self.fighters[fi].particle_ids();
+                self.world.add_velocity(ids, Vec2::new(0.0, 2.4));
+                let f = &mut self.fighters[fi];
+                f.impale_grace = 90;
+                f.down = f.down.max(20);
+                self.hazard_cd[fi] = 40;
+                self.events.push(Sfx::Pickup.at(at).vol(0.7));
+                continue;
+            }
+            if t % 7 == 0 {
+                self.spawn_blood(at, Vec2::NEG_Y, 2, 1.5);
+            }
+            let part = self.fighters[fi].impale_part as u32;
+            if t > 10 {
+                self.damage(fi, part, SPIKE_BLEED, at, Vec2::Y, 0.0, Kind::Spike, None);
+            }
+        }
+    }
+
+    /// A level's liquids, poured in and left to settle before anyone's
+    /// there (worked out once per level: it depends on nothing else).
+    fn settled_liquid(level: usize, hazards: &[HazardDef], w: &World) -> stickfell_physics::Fluid {
+        static SETTLED: std::sync::Mutex<Vec<(usize, stickfell_physics::Fluid)>> = std::sync::Mutex::new(Vec::new());
+        if let Some((_, f)) = SETTLED.lock().unwrap().iter().find(|(l, _)| *l == level) {
+            return f.clone();
+        }
+        let mut fluid = stickfell_physics::Fluid::new(crate::liquid::fluid_kinds(), crate::liquid::DROP_SPACING);
+        for h in hazards {
+            if let Some(kind) = crate::liquid::drop_kind(h.kind) {
+                fluid.fill(h.a - h.size, h.a + h.size, kind);
+            }
+        }
+        if !fluid.drops.is_empty() {
+            let mut still = World::new(WorldConfig::default());
+            still.statics = w.statics.clone();
+            fluid.settle(&mut still, LIQUID_SETTLE);
+        }
+        SETTLED.lock().unwrap().push((level, fluid.clone()));
+        fluid
+    }
+
+    /// Water touching hot lava boils off in a puff of steam, and cools the
+    /// lava it touched (enough of it, and that lava's rock).
+    fn water_on_lava(&mut self) {
+        use crate::liquid::{COOLED_LAVA, DROP_SPACING, LAVA_COOLING, LAVA_DROP, WATER_DROP};
+        self.burst_cd = self.burst_cd.saturating_sub(1);
+        let pairs = self.fluid.touching(WATER_DROP, LAVA_DROP, DROP_SPACING * 1.2);
+        if pairs.is_empty() {
+            return;
+        }
+        let mut gone = Vec::with_capacity(pairs.len());
+        let mut burst: Option<Vec2> = None;
+        for (k, &(w, l)) in pairs.iter().enumerate() {
+            let at = self.fluid.drops[w].pos;
+            let (lava_at, heat) = (self.fluid.drops[l].pos, 1.0 - self.fluid.drops[l].dye);
+            // the lava's heat boils the water off (with less than a drop's
+            // worth left, only maybe: on average LAVA_BOILS drops a lava drop)
+            let boils = heat >= LAVA_COOLING || self.rng.range(0.0, 1.0) < heat / LAVA_COOLING;
+            #[cfg(test)]
+            if heat > 1.0 - COOLED_LAVA {
+                let into = (self.fluid.drops[w].vel - self.fluid.drops[l].vel).dot((lava_at - at).normalize_or_zero());
+                self.hot_contacts.push((lava_at.y - at.y, into));
+            }
+            // water getting under hot lava, or slamming into it, flashes to
+            // steam and blows it apart
+            let into = (self.fluid.drops[w].vel - self.fluid.drops[l].vel).dot((lava_at - at).normalize_or_zero());
+            if burst.is_none() && heat > 1.0 - COOLED_LAVA && (at.y < lava_at.y || into > BURST_IMPACT) {
+                burst = Some(at);
+            }
+            let lava = &mut self.fluid.drops[l];
+            lava.dye = (lava.dye + LAVA_COOLING).min(1.0);
+            if !boils {
+                continue;
+            }
+            gone.push(w);
+            self.steam.add(at, crate::steam::STEAM_PER_DROP);
+            if k % 3 == 0 && self.sparks.len() < 320 {
+                let vel = Vec2::new(self.rng.range(-0.4, 0.4), self.rng.range(1.0, 2.0));
+                self.sparks.push(Spark { pos: at, vel, life: 50, max_life: 50, blood: false, tint: 0xe8e8e2, steam: true });
+            }
+        }
+        if self.frame % 16 == 0 {
+            let at = self.fluid.drops[pairs[0].0].pos;
+            self.events.push(Sfx::Splash.at(at).vol(0.4));
+        }
+        self.fluid.remove(&gone);
+        if let (Some(at), 0) = (burst, self.burst_cd) {
+            self.steam_burst(at);
+        }
+    }
+
+    /// Water trapped under hot lava flashing to steam: the liquid round it
+    /// thrown out, a cloud of steam, and anyone close knocked back and
+    /// scalded (much less than the real thing).
+    fn steam_burst(&mut self, at: Vec2) {
+        self.burst_cd = BURST_COOLDOWN;
+        for d in &mut self.fluid.drops {
+            let off = d.pos - at;
+            let l = off.length();
+            if l < BURST_REACH {
+                let dir = (off.normalize_or(Vec2::Y) + Vec2::new(0.0, 0.6)).normalize();
+                d.vel += dir * (BURST_SPEED * (1.0 - l / BURST_REACH));
+            }
+        }
+        self.steam.add(at, BURST_STEAM);
+        for fi in 0..self.fighters.len() {
+            let f = &self.fighters[fi];
+            if !f.alive {
+                continue;
+            }
+            let (near, part) = [(PELVIS, S_TORSO), (fighter::NECK, S_TORSO), (fighter::HEAD, S_HEAD), (fighter::KNEE_A, fighter::S_THIGH_A), (fighter::KNEE_B, fighter::S_THIGH_B)]
+                .into_iter()
+                .map(|(slot, part)| ((f.pos(&self.world, slot) - at).length(), part))
+                .fold((f32::MAX, S_TORSO), |a, b| if b.0 < a.0 { b } else { a });
+            if near >= BURST_HIT {
+                continue;
+            }
+            let k = 1.0 - near / BURST_HIT;
+            let dir = (f.pos(&self.world, PELVIS) - at).normalize_or(Vec2::Y);
+            let ids = f.particle_ids();
+            self.world.add_velocity(ids, (dir + Vec2::new(0.0, 0.5)).normalize() * (BURST_PUSH * k));
+            self.damage(fi, part, BURST_DAMAGE * k, at, dir, 0.0, Kind::Blunt, None);
+            let f = &mut self.fighters[fi];
+            f.scorch = (f.scorch + 0.3 * k).min(1.0);
+            if k > 0.5 {
+                f.knock_down(40);
+            }
+        }
+        for _ in 0..14 {
+            if self.sparks.len() >= 320 {
+                break;
+            }
+            let vel = Vec2::new(self.rng.range(-3.0, 3.0), self.rng.range(1.5, 6.0));
+            self.sparks.push(Spark { pos: at, vel, life: 26, max_life: 26, blood: false, tint: 0, steam: false });
+        }
+        for _ in 0..10 {
+            if self.sparks.len() >= 320 {
+                break;
+            }
+            let vel = Vec2::new(self.rng.range(-1.2, 1.2), self.rng.range(1.0, 3.0));
+            self.sparks.push(Spark { pos: at, vel, life: 70, max_life: 70, blood: false, tint: 0xf0f0ea, steam: true });
+        }
+        self.events.push(Sfx::HitHeavy.at(at).vol(1.5));
+        self.events.push(Sfx::Splash.at(at).vol(1.4));
+    }
+
+    /// Steam: it rises, spreads and condenses; anyone breathing it in thick
+    /// enough is scalded, slowly (time to get out of it).
+    fn update_steam(&mut self, dt: f32) {
+        self.steam.step(dt);
+        let fluid = &self.fluid;
+        self.steam.condense_in(dt, |p| fluid.sample(p).total());
+        for fi in 0..self.fighters.len() {
+            let f = &self.fighters[fi];
+            if !f.alive {
+                continue;
+            }
+            let head = f.pos(&self.world, fighter::HEAD);
+            let thick = self.steam.at(head).max(self.steam.at(f.pos(&self.world, fighter::NECK)));
+            if thick <= SCALD_FROM {
+                continue;
+            }
+            let rate = SCALD_RATE * ((thick - SCALD_FROM) / (1.0 - SCALD_FROM)).min(1.0);
+            {
+                let f = &mut self.fighters[fi];
+                f.scorch = (f.scorch + rate / 100.0 * dt).min(1.0);
+                // (crying out in the worst of it)
+                if rate > SCALD_RATE * 0.5 {
+                    f.burning = true;
+                }
+            }
+            if (self.frame + fi as u32 * 3) % 8 == 0 {
+                self.damage(fi, S_TORSO, rate * 8.0 * dt, head, Vec2::Y, 0.0, Kind::Blunt, None);
+            }
+            let f = &self.fighters[fi];
+            if f.burning && f.alive && (self.frame + fi as u32 * 7) % CHOKE_EVERY == 0 {
+                self.events.push(Sfx::Burning.at(head).line(0, fi as u8));
+            }
+        }
+    }
+
+    /// The flood trap: a hand on the lever (E or Shift) throws it; the
+    /// hatch swings open and the water pours in until the flood's all in.
+    fn update_trap(&mut self) {
+        let Some(def) = self.trap.def else { return };
+        let since = self.trap.since(self.round_frame);
+        // (standing by it, on its floor; once it's done moving) throws it
+        // the other way: open, or shut again
+        let settled = since.is_none_or(|t| t >= LEVER_FRAMES);
+        let puller = (0..self.fighters.len()).find(|&i| {
+            let f = &self.fighters[i];
+            let off = f.pos(&self.world, PELVIS) - def.lever;
+            f.alive && f.down == 0 && (f.pressed(PICKUP) || f.pressed(GRAB)) && off.x.abs() < LEVER_REACH && off.y > 0.3 && off.y < 1.6
+        });
+        if settled && puller.is_some() {
+            self.trap.open = !self.trap.open;
+            self.trap.toggled = self.round_frame.max(1);
+            if self.trap.open {
+                self.trap.poured = 0;
+            }
+            self.events.push(Sfx::Thud.at(def.lever).vol(1.2));
+            return;
+        }
+        let Some(since) = since else { return };
+        // the doors: banging open once the lever's over, shut as they close
+        if (self.trap.open && since == LEVER_FRAMES) || (!self.trap.open && since == HATCH_FRAMES) {
+            self.events.push(Sfx::HitHeavy.at(def.hatch).vol(1.4));
+        }
+        if !self.trap.open || since < POUR_AFTER || self.fluid.drops.len() as u32 >= def.max_drops {
+            return;
+        }
+        // as much as should be in by now, across the opening, falling (no
+        // more than the level can hold)
+        let room = def.max_drops - self.fluid.drops.len() as u32;
+        let due = ((since - POUR_AFTER + 1) as f32 * def.pour_rate / 60.0) as u32;
+        let due = due.min(self.trap.poured + room);
+        // (scattered across the opening and through the frame's fall, so it
+        // comes down as a column, not in rows)
+        let fall = 5.0;
+        while self.trap.poured < due {
+            let x = def.hatch.x + self.rng.range(-def.hatch_half, def.hatch_half) * 0.9;
+            let y = def.hatch.y - crate::liquid::DROP_SPACING * 0.75 - self.rng.range(0.0, fall / 60.0);
+            self.fluid.pour(Vec2::new(x, y), Vec2::new(0.0, -fall), crate::liquid::WATER_DROP);
+            self.trap.poured += 1;
+        }
+        if since % 20 == 0 {
+            // the roar of it coming down
+            let floor = self.world.raycast(def.hatch - Vec2::new(0.0, 0.5), Vec2::NEG_Y, 30.0).map_or(def.hatch, |h| h.point);
+            self.events.push(Sfx::Splash.at(floor).vol(0.35));
+        }
+    }
+
+    /// A fighter's momentum (all their parts).
+    fn momentum(&self, f: &Fighter) -> Vec2 {
+        f.particle_ids().map(|i| { let p = &self.world.particles[i as usize]; p.vel * p.mass() }).sum()
+    }
+
+    /// The lip of a side fighter `fi` could haul themselves out onto, going
+    /// `toward` (+1 right, -1 left): the first floor out of the liquid
+    /// ahead of them, no higher than their hands reach over their head and
+    /// above their waist (its edge x and its top).
+    fn ledge_ahead(&self, fi: usize, toward: f32) -> Option<(f32, f32)> {
+        let f = &self.fighters[fi];
+        let (neck, pelvis) = (f.pos(&self.world, fighter::NECK), f.pos(&self.world, PELVIS));
+        let from_y = neck.y + ARM_REACH;
+        for k in 1..=HAUL_LOOK {
+            let x = neck.x + toward * k as f32 * HAUL_STEP;
+            let Some(hit) = self.world.raycast(Vec2::new(x, from_y), Vec2::NEG_Y, from_y - (pelvis.y - 0.3)) else { continue };
+            if hit.t <= 0.0 || hit.normal.y < 0.7 {
+                continue;
+            }
+            // (a floor under the liquid isn't a way out)
+            if self.fluid.sample(hit.point + Vec2::new(0.0, 0.15)).total() > 0.3 {
+                continue;
+            }
+            return Some((x - toward * HAUL_STEP * 0.5, hit.point.y));
+        }
+        None
+    }
+
+    /// What the liquid does to whatever is in it (the liquid itself is
+    /// `self.fluid`: it's pushed aside and splashes by itself). How much of
+    /// a body part is in how much of which liquid comes from the drops
+    /// around it: water holds a body up (and lets the living swim, and
+    /// drowns them if they stay under); acid and lava let it sink, and eat it.
+    fn update_liquids(&mut self, dt: f32) {
+        // (who was swimming: they keep at it until they're well out of it)
+        let was_swimming: Vec<bool> = self.fighters.iter().map(|f| f.swimming).collect();
+        let was_burning: Vec<bool> = self.fighters.iter().map(|f| f.burning).collect();
+        for f in &mut self.fighters {
+            f.stroke = f.stroke.saturating_sub(1);
+            f.swimming = false;
+            f.burning = false;
+        }
+        if self.fluid.drops.is_empty() {
+            for f in &mut self.fighters {
+                f.breath = (f.breath + 3).min(AIR);
+                f.wet = false;
+                f.wade = 0.0;
+                f.surge = 0.0;
+            }
+            return;
+        }
+        for fi in 0..self.fighters.len() {
+            let pelvis = self.fighters[fi].pos(&self.world, PELVIS);
+            self.fighters[fi].wade = self.fluid.sample(pelvis).total();
+        }
+        let g = -self.world.cfg.gravity.y;
+        let liquids = crate::liquid::LIQUIDS;
+        let active: Vec<bool> = self.fighters.iter().zip(&was_swimming).map(|(f, &was)| {
+            let held = f.held(LEFT) || f.held(RIGHT) || f.held(JUMP) || f.held(CROUCH);
+            was && held && f.alive && f.down == 0
+        }).collect();
+        // (alive and struggling but without the limbs left to swim: they go
+        // down, rather than float like the dead)
+        let sinking: Vec<bool> = self.fighters.iter().map(|f| f.alive && f.down == 0 && f.swim_power() <= 0.0).collect();
+        // (how much liquid a part is in, and which: buoyancy, drag and harm blended by kind)
+        let blend = |amount: [f32; 4]| {
+            let tot: f32 = amount[..3].iter().sum();
+            let k = |f: &dyn Fn(&crate::liquid::Liquid) -> f32| (0..3).map(|i| f(liquids[i]) * amount[i]).sum::<f32>() / tot.max(1e-5);
+            (tot.min(1.0), k(&|l| l.buoyancy), k(&|l| l.drag))
+        };
+        for fi in 0..self.fighters.len() {
+            let ids = self.fighters[fi].particle_ids();
+            let base = self.fighters[fi].base;
+            let mut by_kind = [0.0f32; 3];
+            let mut wet = 0u32;
+            let mut splash: Option<(Vec2, f32)> = None;
+            let mut highest: Option<Vec2> = None;
+            // (in control of themselves, on their feet or swimming, the
+            // water's drag is taken as a whole: dragging at their legs alone
+            // would tip them over, or brake every turn and kick; limp, it
+            // tumbles them)
+            let upright = { let f = &self.fighters[fi]; f.alive && f.down == 0 };
+            let (mut drag_dp, mut mass) = (Vec2::ZERO, 0.0f32);
+            for id in ids.clone() {
+                let p = &self.world.particles[id as usize];
+                if p.inv_mass > 0.0 {
+                    mass += p.mass();
+                }
+            }
+            for id in ids.clone() {
+                let p = self.world.particles[id as usize];
+                if p.inv_mass == 0.0 {
+                    continue;
+                }
+                let smp = self.fluid.sample(p.pos);
+                let (sub, buoy, drag) = blend(smp.amount);
+                if sub < 0.08 {
+                    continue;
+                }
+                wet += 1;
+                for k in 0..3 {
+                    by_kind[k] += smp.amount[k];
+                }
+                // (lava cooled to rock is just a weight on them)
+                by_kind[crate::liquid::LAVA_DROP as usize] -= smp.dyed[crate::liquid::LAVA_DROP as usize];
+                if highest.is_none_or(|h| p.pos.y > h.y) {
+                    highest = Some(p.pos);
+                }
+                let q = &mut self.world.particles[id as usize];
+                // (stroking, a swimmer holds their depth: weightless in it,
+                // going where they swim)
+                if sinking[fi] {
+                    q.vel.y += g * SINKING_BUOYANCY * sub * dt;
+                } else if active[fi] {
+                    // (stroking holds them up as well as their limbs let it)
+                    let p = self.fighters[fi].swim_power();
+                    q.vel.y += g * (SINKING_BUOYANCY + (SWIM_BUOYANCY - SINKING_BUOYANCY) * p) * dt;
+                } else {
+                    q.vel.y += g * buoy * sub * dt;
+                }
+                // dragged along with the liquid around it
+                let dv = (smp.vel - q.vel) * (drag * sub * dt).min(1.0);
+                if upright {
+                    drag_dp += dv * q.mass();
+                } else {
+                    q.vel += dv;
+                }
+                // the body going in fast: a splash (the drops fly by themselves)
+                let _ = base;
+                if !self.fighters[fi].wet && p.vel.y < -3.5 && splash.is_none_or(|(_, v)| p.vel.y < v) {
+                    splash = Some((p.pos, p.vel.y));
+                }
+            }
+            if upright && mass > 0.0 {
+                let dv = drag_dp / mass;
+                for id in ids.clone() {
+                    let q = &mut self.world.particles[id as usize];
+                    if q.inv_mass > 0.0 {
+                        q.vel += dv;
+                    }
+                }
+            }
+            if let Some((at, v)) = splash {
+                self.events.push(Sfx::Splash.at(at).vol((-v / 8.0).clamp(0.3, 1.4)));
+                let (mut x0, mut x1, mut low) = (f32::MAX, f32::MIN, f32::MAX);
+                for id in ids.clone() {
+                    let q = self.world.particles[id as usize].pos;
+                    x0 = x0.min(q.x);
+                    x1 = x1.max(q.x);
+                    low = low.min(q.y);
+                }
+                self.fluid.splash(x0, x1, low, -v);
+            }
+            self.fighters[fi].wet = wet > 0;
+            // which liquid they're mostly in
+            let kind = (0..3).max_by(|&a, &b| by_kind[a].total_cmp(&by_kind[b])).unwrap_or(0);
+            let liq = liquids[kind];
+            // breath: held under, run out, drown
+            let f = &self.fighters[fi];
+            let head = self.world.particles[f.p(fighter::HEAD) as usize];
+            let at_head = self.fluid.sample(head.pos);
+            let head_under = f.has(S_HEAD) && at_head.amount[..3].iter().zip(liquids).any(|(a, l)| l.drowns && *a > HEAD_UNDER);
+            if f.alive && head_under {
+                let f = &mut self.fighters[fi];
+                f.breath = f.breath.saturating_sub(1);
+                if f.breath == 0 && (self.frame + fi as u32) % 8 == 0 {
+                    self.events.push(Sfx::Choke.at(head.pos).line(0, fi as u8));
+                    self.damage(fi, S_HEAD, DROWN_DAMAGE, head.pos, Vec2::Y, 0.0, Kind::Blunt, None);
+                }
+                if (self.frame + fi as u32 * 5) % 20 == 0 && self.sparks.len() < 320 {
+                    self.sparks.push(Spark { pos: head.pos, vel: Vec2::new(0.0, 0.6), life: 40, max_life: 40, blood: false, tint: liq.foam.0, steam: true });
+                }
+            } else {
+                let f = &mut self.fighters[fi];
+                f.breath = (f.breath + 3).min(AIR);
+            }
+            if wet == 0 {
+                continue;
+            }
+            // in acid or lava, alive: screaming (straight away going in, then
+            // again each time they've finished)
+            if liq.damage > 0.0 && by_kind[kind] > 0.0 && self.fighters[fi].alive {
+                self.fighters[fi].burning = true;
+                if !was_burning[fi] || (self.frame + fi as u32 * 7) % CHOKE_EVERY == 0 {
+                    self.events.push(Sfx::Burning.at(head.pos).line(0, fi as u8));
+                }
+            }
+            let share = wet as f32 / fighter::PARTICLES as f32;
+            {
+                let f = &mut self.fighters[fi];
+                f.scorch = (f.scorch + liq.scorch * share * dt).min(1.0);
+            }
+            // steam off whatever's cooking in it
+            if liq.steams && (self.frame + fi as u32 * 3) % 5 == 0 && self.sparks.len() < 320 {
+                let at = highest.unwrap_or(self.fighters[fi].pos(&self.world, PELVIS)) + Vec2::new(self.rng.range(-0.2, 0.2), 0.1);
+                let vel = Vec2::new(self.rng.range(-0.25, 0.25), self.rng.range(0.6, 1.1));
+                self.sparks.push(Spark { pos: at, vel, life: 55, max_life: 55, blood: false, tint: 0xd8d8d0, steam: true });
+            }
+            // eaten away, the more of them in it the faster
+            if liq.damage > 0.0 && self.fighters[fi].alive && self.hazard_cd[fi] == 0 {
+                self.hazard_cd[fi] = 8;
+                let at = highest.unwrap_or(self.fighters[fi].pos(&self.world, PELVIS));
+                let dmg = liq.damage * 8.0 / 60.0 * (0.5 + 0.5 * share);
+                self.damage(fi, S_TORSO, dmg, at, Vec2::Y, 0.0, Kind::Blunt, None);
+            }
+            if !self.fighters[fi].alive {
+                self.fighters[fi].burning = false;
+            }
+            // swimming (waist deep, or out of their depth): the keys steer
+            // them through it; at the surface, jump leaps up out of it
+            let f = &self.fighters[fi];
+            let pelvis = f.pos(&self.world, PELVIS);
+            let deep = if was_swimming[fi] { f.wade > SWIM_KEEP && (!f.grounded || f.wade > SWIM_DEPTH) } else { f.wade > SWIM_DEPTH && (!f.grounded || f.wade > SWIM_DEPTH_STANDING) };
+            if !f.alive || liq.swim <= 0.0 || !deep || f.impaled > 0 || f.down > 0 || f.swim_power() <= 0.0 {
+                continue;
+            }
+            self.fighters[fi].swimming = true;
+            let f = &self.fighters[fi];
+            let dir = f.swim_dir();
+            let head_out = self.fluid.sample(f.pos(&self.world, fighter::HEAD)).total() < 0.3;
+            // at the side, jump hauls them up out onto it (the way they're
+            // pushing, or facing); held, they swim up until they can reach it
+            let toward = if f.held(RIGHT) != f.held(LEFT) { if f.held(RIGHT) { 1.0 } else { -1.0 } } else { f.facing };
+            // (a hand to haul with)
+            let haul = if f.held(JUMP) && f.stroke == 0 && (f.arm_a_ok() || f.arm_b_ok()) { self.ledge_ahead(fi, toward) } else { None };
+            let leap = f.pressed(JUMP) && f.stroke == 0 && head_out && haul.is_none();
+            let body = f.body_vel(&self.world);
+            let want = dir * SWIM_SPEED * liq.swim * f.swim_power();
+            // (just leapt or hauled: the stroke doesn't fight it)
+            let free = f.stroke == 0;
+            let haul_vel = haul.map(|(edge, top)| {
+                // up past the lip with the feet clear of it, and over it by
+                // the time they're at the top: v = sqrt(2 g h), t = v / g
+                let f = &self.fighters[fi];
+                let feet = f.pos(&self.world, fighter::FOOT_A).y.min(f.pos(&self.world, fighter::FOOT_B).y);
+                let rise = (top + HAUL_CLEAR - feet).max(0.0);
+                let vy = (2.0 * g * rise).sqrt() * HAUL_LOSS;
+                // (however little there is to climb, they take HAUL_TIME
+                // getting over it, not an instant)
+                let t = (vy / g).max(HAUL_TIME);
+                let across = ((edge - f.pos(&self.world, PELVIS).x) * toward).max(0.0) + HAUL_ONTO;
+                Vec2::new(toward * across / t, vy)
+            });
+            // (stroking steers the body as a whole: pulling each part toward
+            // the same speed would hold them stiff, every turn and kick braked)
+            let steer = (want - body) * (SWIM_STEER * dt).min(1.0);
+            for id in ids.clone() {
+                let q = &mut self.world.particles[id as usize];
+                if let Some(v) = haul_vel {
+                    q.vel = v;
+                    continue;
+                }
+                if !free {
+                } else if dir != Vec2::ZERO {
+                    // (along the way they're swimming, against what the water does)
+                    q.vel += steer;
+                } else {
+                    // treading water: limbs settle with the body instead of
+                    // flailing, and the bobbing calms down
+                    q.vel += (body - q.vel) * 0.15;
+                    q.vel.y *= 1.0 - (TREAD_DAMP * dt).min(1.0);
+                }
+                if leap {
+                    q.vel.y = q.vel.y.max(0.0) + 4.5 * liq.swim;
+                }
+            }
+            if leap || haul.is_some() {
+                let f = &mut self.fighters[fi];
+                f.stroke = 18;
+                if haul.is_some() {
+                    f.facing = toward;
+                }
+                self.events.push(Sfx::Splash.at(pelvis).vol(0.35));
+            }}
+        // loose weapons: metal and wood sink, slowly in water
+        for wi in 0..self.weapons.len() {
+            let w = &self.weapons[wi];
+            if !w.active || w.holder.is_some() {
+                continue;
+            }
+            for k in 0..w.n {
+                let id = w.particle(k) as usize;
+                let p = self.world.particles[id];
+                if p.inv_mass == 0.0 {
+                    continue;
+                }
+                let smp = self.fluid.sample(p.pos);
+                let (sub, _, drag) = blend(smp.amount);
+                if sub < 0.08 {
+                    continue;
+                }
+                // (no lift of its own: the drops pressing on it from below
+                // already hold it up as much as the water it pushes aside)
+                let q = &mut self.world.particles[id];
+                q.vel += (smp.vel - q.vel) * (drag * sub * dt).min(1.0);
+            }
+        }
+    }
+
+    /// Adds a hazard to the arena as it stands (its solid parts too).
+    #[allow(dead_code)] // (tests build arenas this way)
+    pub fn add_hazard(&mut self, h: HazardDef) {
+        Self::add_spike_statics(&mut self.world, &h);
+        if let Some(kind) = crate::liquid::drop_kind(h.kind) {
+            self.fluid.fill(h.a - h.size, h.a + h.size, kind);
+        }
+        self.hazards.push(h);
+    }
+
     /// Is `p` in or near a spike bed, acid vat or saw? (Bots steer by this.)
     pub fn hazard_near(&self, p: Vec2, margin: f32) -> bool {
         self.hazards.iter().any(|h| match h.kind {
@@ -3289,38 +4467,88 @@ impl GameState {
         for hi in 0..self.hazards.len() {
             let h = self.hazards[hi];
             for fi in 0..self.fighters.len() {
-                if self.hazard_cd[fi] > 0 || !self.fighters[fi].alive {
+                // (a spike can still run someone through while it's cooling off from a graze)
+                if (self.hazard_cd[fi] > 0 && h.kind != HazardKind::Spikes) || !self.fighters[fi].alive {
                     continue;
                 }
                 let f = &self.fighters[fi];
+                let cooling = self.hazard_cd[fi] > 0;
                 match h.kind {
-                    HazardKind::Spikes | HazardKind::Acid => {
-                        let touching = f.particle_ids().find(|&id| {
-                            let p = &self.world.particles[id as usize];
-                            let d = (p.pos - h.a).abs();
-                            d.x <= h.size.x + p.radius && d.y <= h.size.y + p.radius
-                        });
-                        let Some(id) = touching else { continue };
-                        let (slot, p) = (id - f.base, self.world.particles[id as usize]);
-                        let part = Self::part_of_slot(slot);
-                        if !f.has(part) {
+                    HazardKind::Spikes if f.impaled > SPIKE_SETTLE => {}
+                    HazardKind::Spikes => {
+                        // only a tooth's real shape hurts: brushing its side a
+                        // little, coming down on its point a lot, taking one
+                        // square and hard enough runs them through
+                        let teeth = h.teeth();
+                        // (just run through one spike: only another point through the head or heart matters)
+                        let settling = f.impaled > 0;
+                        let mut hit: Option<(u32, Vec2, f32)> = None;
+                        // (part, how far along it, which tooth, how hard, and how bad: fatal, then body before limb)
+                        let mut through: Option<(u32, f32, usize, f32, (bool, bool))> = None;
+                        for part in 0..10u32 {
+                            if !f.has(part) || (settling && part != S_HEAD && part != S_TORSO) {
+                                continue;
+                            }
+                            let sg = self.world.segments[(f.seg_base + part) as usize];
+                            let (pa, pb) = (self.world.particles[sg.a as usize], self.world.particles[sg.b as usize]);
+                            // (as fast as they were coming down before the points stopped them)
+                            let fall = |id: u32| self.fall.get(id as usize).copied().unwrap_or(0.0);
+                            let (fa, fb) = (fall(sg.a), fall(sg.b));
+                            for k in 0..5 {
+                                let along = k as f32 / 4.0;
+                                let q = pa.pos.lerp(pb.pos, along);
+                                if (q.x - h.a.x).abs() > h.size.x + sg.radius + 0.1 {
+                                    continue;
+                                }
+                                // (the joints' own collision can be fatter than the bone's)
+                                let r = sg.radius.max(pa.radius + (pb.radius - pa.radius) * along) + 0.01;
+                                for (ti, tooth) in teeth.iter().enumerate() {
+                                    let Some(t) = tooth.touch(q, r) else { continue };
+                                    let down = (-(pa.vel.y + (pb.vel.y - pa.vel.y) * along)).max(fa + (fb - fa) * along);
+                                    // coming down hard: on the point, the full force; down
+                                    // the side of a tooth, most of it; just brushing one, a graze
+                                    let point_first = t > 0.6 && down > 0.5;
+                                    let hard = if down > 1.5 { 8.0 + down * 3.0 } else { 4.0 };
+                                    let dmg = (if point_first { hard } else { hard * 0.7 }).min(45.0);
+                                    if hit.is_none_or(|(_, _, d)| dmg > d) {
+                                        hit = Some((part, Vec2::new(tooth.tip.x, q.y), dmg));
+                                    }
+                                    if point_first && down >= IMPALE_SPIKE_SPEED && SPIKE_IMPALES.contains(&part) && f.impale_grace == 0 {
+                                        let vital = part == S_HEAD || (part == S_TORSO && along >= 0.5);
+                                        let rank = (vital && down >= IMPALE_SPIKE_VITAL, part == S_HEAD || part == S_TORSO);
+                                        if through.is_none_or(|x| rank > x.4) {
+                                            through = Some((part, along, ti, down, rank));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if settling {
+                            if let Some((part, _, ti, _, (true, _))) = through {
+                                let at = teeth[ti].tip - Vec2::new(0.0, 0.05);
+                                self.wound(fi, part, at, fighter::WoundKind::Stab, 0.045, Vec2::Y);
+                                self.spawn_blood(at, Vec2::Y, 24, 5.0);
+                                self.events.push(Sfx::Impale.at(at).vol(1.3));
+                                self.shake = (self.shake + 0.8).min(1.5);
+                                self.damage(fi, part, 999.0, at, Vec2::Y, 0.0, Kind::Spike, None);
+                            }
                             continue;
                         }
-                        if h.kind == HazardKind::Spikes {
-                            // a hard landing on them is much worse than a brush
-                            let dmg = (8.0 + (-p.vel.y).max(0.0) * 2.5).min(45.0);
-                            self.hazard_cd[fi] = 25;
-                            self.events.push(Sfx::Spikes.at(p.pos));
-                            self.damage(fi, part, dmg, p.pos, Vec2::Y, 9.0, Kind::Spike, None);
-                        } else {
-                            self.hazard_cd[fi] = 8;
-                            self.events.push(Sfx::Splash.at(p.pos).vol(0.5));
-                            for id in self.fighters[fi].particle_ids() {
-                                self.world.particles[id as usize].vel *= 0.85; // thick
-                            }
-                            self.damage(fi, part, 5.0, p.pos, Vec2::Y, 0.0, Kind::Blunt, None);
+                        if let Some((part, along, ti, down, _)) = through {
+                            self.spike_impale(fi, part, along, teeth[ti], down);
+                            continue;
                         }
+                        let Some((part, at, dmg)) = hit.filter(|_| !cooling) else { continue };
+                        self.hazard_cd[fi] = 25;
+                        self.events.push(Sfx::Spikes.at(at));
+                        if dmg > 10.0 {
+                            self.wound(fi, part, at, fighter::WoundKind::Stab, 0.03, Vec2::Y);
+                            self.spawn_blood(at, Vec2::Y, 6, 3.0);
+                        }
+                        self.damage(fi, part, dmg, at, Vec2::Y, if dmg > 10.0 { 6.0 } else { 2.0 }, Kind::Spike, None);
                     }
+                    // (what liquids do is in `update_liquids`)
+                    HazardKind::Acid | HazardKind::Water | HazardKind::Lava => {}
                     HazardKind::Saw => {
                         let c = h.center(self.round_frame);
                         let mut hit = None;
@@ -3375,7 +4603,7 @@ impl GameState {
             // tip at (or within reach of) the level, pointing into it: a fast
             // stab carries it the rest of the way in
             let reach = 0.16;
-            let hit = self.world.statics.iter().filter_map(|o| o.collide_circle(pt.pos, pt.radius + reach)).find(|(n, _)| axis.dot(*n) < -0.55);
+            let hit = self.world.statics.iter().filter(|o| !crate::level::is_spike(o.tag)).filter_map(|o| o.collide_circle(pt.pos, pt.radius + reach)).find(|(n, _)| axis.dot(*n) < -0.55);
             if let Some((n, pen)) = hit {
                 let gap = (reach - pen).max(0.0) / (-axis.dot(n));
                 let mut w = self.weapons[wi].clone();
@@ -3644,6 +4872,37 @@ impl GameState {
         }
     }
 
+    /// A long fall ending on something solid: whatever hit first was
+    /// stopped from falling fast, and the legs can't take it, so they go
+    /// down in a heap (thrown fighters have their own slam).
+    fn hard_landings(&mut self) {
+        for i in 0..self.fighters.len() {
+            let f = &self.fighters[i];
+            if !f.alive || f.down > 0 || f.flying > 0 || f.impaled > 0 || f.held_by.is_some() {
+                continue;
+            }
+            let stopped = self.landing_speed(i);
+            if stopped < FALL_DOWN_SPEED {
+                continue;
+            }
+            let at = f.pos(&self.world, PELVIS);
+            let frames = FALL_DOWN_FRAMES + ((stopped - FALL_DOWN_SPEED) * FALL_DOWN_MORE) as u16;
+            self.fighters[i].knock_down(frames.min(FALL_DOWN_MAX));
+            self.events.push(Sfx::Thud.at(at).vol((stopped / 15.0).min(1.6)));
+            self.shake = (self.shake + 0.3).min(1.5);
+        }
+    }
+
+    /// How hard fighter `i` landed this frame: the most any part of them
+    /// touching the ground was stopped from falling (m/s).
+    fn landing_speed(&self, i: usize) -> f32 {
+        self.fighters[i]
+            .particle_ids()
+            .filter(|&id| self.world.particles[id as usize].on_ground())
+            .map(|id| self.fall.get(id as usize).copied().unwrap_or(0.0) + self.world.particles[id as usize].vel.y)
+            .fold(0.0f32, f32::max)
+    }
+
     /// Sweeps don't need a perfect capsule hit: the sweeping foot or shin
     /// passing near someone's feet or shins while it's swinging takes them down.
     fn sweep_check(&mut self) {
@@ -3801,8 +5060,22 @@ impl GameState {
         for i in 0..self.sparks.len() {
             let mut s = self.sparks[i];
             let dt = DT * self.time_scale();
-            s.vel.y -= 22.0 * dt;
-            s.vel *= 0.99;
+            // blood landing in liquid mixes into it (water takes the colour;
+            // acid and lava just swallow it)
+            if s.blood && !self.fluid.drops.is_empty() && self.fluid.sample(s.pos).total() > 0.3 {
+                self.fluid.dye(s.pos, crate::liquid::BLOOD_DYE, crate::liquid::WATER_DROP);
+                s.life = 0;
+                self.sparks[i] = s;
+                continue;
+            }
+            if s.steam {
+                // rising, slowing, spreading
+                s.vel.y += 2.0 * dt;
+                s.vel *= 0.95;
+            } else {
+                s.vel.y -= 22.0 * dt;
+                s.vel *= 0.99;
+            }
             let step = s.vel * dt;
             if s.blood {
                 if let Some(hit) = self.world.raycast(s.pos, step, 1.0) {
@@ -3843,10 +5116,14 @@ impl GameState {
         }
         let fighting = matches!(self.phase, Phase::Fight);
 
+        // the computer's fighters decide from this frame as it stands (the
+        // same on every player's copy)
+        let ai: Vec<u32> = (self.humans..self.fighters.len()).map(|i| crate::bot::bot_input(self, i)).collect();
         // a finisher can walk its performer: backing off before a spear throw
         let walk: Vec<u16> = (0..self.fighters.len()).map(|i| self.finisher_walk(i)).collect();
         for i in 0..self.fighters.len() {
-            let raw = if fighting { inputs.get(i).copied().unwrap_or(0) } else { 0 };
+            let given = if i >= self.humans { ai[i - self.humans] } else { inputs.get(i).copied().unwrap_or(0) };
+            let raw = if fighting { given } else { 0 };
             let (b, aim) = input::decode(raw);
             let locked = self.clash.is_some_and(|c| c.side_of(i).is_some()) || self.in_finisher(i);
             let f = &mut self.fighters[i];
@@ -3903,8 +5180,11 @@ impl GameState {
                 thrust = w.def().thrust;
             }
             let gun = f.weapon.is_some_and(|wi| self.weapons[wi as usize].is_gun() || self.weapons[wi as usize].is_grapple());
-            let (step_before, air_before) = (dmath::sin(f.phase), f.air_t);
+            let (step_before, air_before, slid) = (dmath::sin(f.phase), f.air_t, f.slide > 0);
             f.control(&mut self.world, DT * scale, load, two_handed, thrust, gun);
+            if f.alive && f.slide > 0 && !slid {
+                self.events.push(Sfx::Slide.at(f.pos(&self.world, PELVIS)));
+            }
             // sounds: the strike of an attack, footfalls, hard landings
             if f.alive && f.swing > 0 && f.swing == f.strike_frame() {
                 let at = f.pos(&self.world, HAND_A);
@@ -3993,7 +5273,65 @@ impl GameState {
             f.update_joints(&mut self.world, self.joint_limits);
         }
         self.keep_upright();
+        self.update_trap();
+        self.update_liquids(DT * scale);
+        self.fall = self.world.particles.iter().map(|p| -p.vel.y).collect();
         self.world.step(DT * scale);
+        self.hard_landings();
+        // the liquid flows, and is shoved about by (and shoves) everything in
+        // it: how hard it shoved each fighter (sideways and down: up is it
+        // holding them up), as a share of their weight, eased over SURGE_EASE
+        // (not the water holding back their own going: that's only drag)
+        let before: Vec<(Vec2, Vec2)> = self.fighters.iter().map(|f| (self.momentum(f), f.body_vel(&self.world))).collect();
+        let vels: Vec<Vec<Vec2>> = self.fighters.iter().map(|f| f.particle_ids().map(|i| self.world.particles[i as usize].vel).collect()).collect();
+        self.fluid.step(DT * scale, &mut self.world);
+        // on their feet, they take it as a whole (the water dragging at their
+        // legs alone doesn't tip them over: a shove too hard for them knocks
+        // them down, below); down, it tumbles them as it likes
+        for (fi, v0) in vels.iter().enumerate() {
+            let f = &self.fighters[fi];
+            if !f.alive || f.down > 0 {
+                continue;
+            }
+            let ids: Vec<usize> = f.particle_ids().map(|i| i as usize).collect();
+            let (mut dp, mut m) = (Vec2::ZERO, 0.0);
+            for (k, &i) in ids.iter().enumerate() {
+                let p = &self.world.particles[i];
+                dp += (p.vel - v0[k]) * p.mass();
+                m += p.mass();
+            }
+            let dv = dp / m.max(1e-6);
+            for (k, &i) in ids.iter().enumerate() {
+                if self.world.particles[i].inv_mass > 0.0 {
+                    self.world.particles[i].vel = v0[k] + dv;
+                }
+            }
+        }
+        let g = -self.world.cfg.gravity.y;
+        for (fi, (p0, going)) in before.into_iter().enumerate() {
+            let f = &self.fighters[fi];
+            let mut push = (self.momentum(f) - p0) / (DT * scale);
+            let way = going.normalize_or_zero();
+            push -= way * push.dot(way).min(0.0);
+            let weight = f.particle_ids().map(|i| self.world.particles[i as usize].mass()).sum::<f32>() * g;
+            let shove = Vec2::new(push.x, push.y.min(0.0)).length() / weight.max(1e-3);
+            let k = (DT * scale / SURGE_EASE).min(1.0);
+            let f = &mut self.fighters[fi];
+            f.surge += (shove - f.surge) * k;
+            // too much of it, on their feet: swept off them (not as they
+            // find their feet coming out of a swim: the shove's averaged
+            // over SURGE_EASE, and some of it is still the swim's)
+            f.dry = if f.swimming { 0 } else { f.dry.saturating_add(1) };
+            let settled = f.dry as f32 * DT * scale >= SURGE_EASE;
+            if f.surge > SURGE_KNOCK && settled && f.alive && f.grounded && f.down == 0 && f.impaled == 0 {
+                f.knock_down(SURGE_DOWN);
+                let at = f.pos(&self.world, PELVIS);
+                self.events.push(Sfx::Splash.at(at).vol(0.6));
+            }
+        }
+        self.fluid.keep_within(Vec2::new(self.min.x - 4.0, self.kill_y), Vec2::new(self.max.x + 4.0, self.max.y + 20.0));
+        self.water_on_lava();
+        self.update_steam(DT * scale);
         self.carry_stuck();
         self.resolve_hits();
         self.slam_thrown(&flying);
@@ -4003,6 +5341,7 @@ impl GameState {
         self.cut_nooses();
         self.update_bullets();
         self.update_hazards();
+        self.update_impaled();
         self.upkeep_weapons();
 
         for i in 0..self.fighters.len() {
@@ -4054,6 +5393,8 @@ impl GameState {
                 let over = if self.training {
                     // practice: over when you die or every dummy is down for good
                     !self.fighters[0].alive || self.fighters[1..].iter().all(|f| !f.alive)
+                } else if self.teams > 0 {
+                    self.teams_alive() <= 1
                 } else if self.num_players >= 2 {
                     alive <= 1
                 } else {
@@ -4065,8 +5406,11 @@ impl GameState {
                     } else {
                         None
                     };
-                    if let Some(w) = winner {
-                        self.scores[w as usize] += 1;
+                    // (a team's win counts for everyone on it)
+                    for i in 0..self.fighters.len() {
+                        if winner.is_some_and(|w| self.allies(w as usize, i)) {
+                            self.scores[i] += 1;
+                        }
                     }
                     self.phase = Phase::RoundOver { timer: ROUND_OVER_FRAMES, winner };
                 }
@@ -4074,7 +5418,7 @@ impl GameState {
             Phase::RoundOver { timer, winner } => {
                 if timer <= 1 {
                     if !self.training {
-                        self.level_index = (self.level_index + 1) % ARENAS;
+                        self.level_index = crate::level::next_arena(self.level_index, self.fighters.len());
                     }
                     self.reset_round();
                 } else {
@@ -4101,6 +5445,8 @@ impl RollbackGame for GameState {
         h.write_u32(self.frame);
         h.write_u32(self.round_frame);
         h.write_u32(self.level_index as u32);
+        h.write_u32(self.humans as u32);
+        h.write_u32(self.teams as u32);
         h.write_u32(self.rng.0);
         h.write_u32(self.next_drop);
         self.world.hash_into(|v| h.write_u32(v));
@@ -4148,6 +5494,20 @@ impl RollbackGame for GameState {
             h.write_u32(f.hold.map_or(255, |v| v as u32) | (f.hold_slot as u32) << 8 | (f.struggle as u32) << 16 | (f.heave as u32) << 24);
             h.write_u32(f.limbs_gone as u32 | (f.flip as u32) << 16 | (f.flip_dir as u8 as u32) << 24);
             h.write_u8(f.shoulder);
+            h.write_u8(f.shouldered);
+            h.write_u8(f.shouldered_by);
+            h.write_f32(f.head_squash);
+            h.write_u8(f.head_popped as u8);
+            h.write_u32(f.impaled as u32 | (f.impale_part as u32) << 16 | (f.impale_free as u32) << 24);
+            h.write_u8(f.impale_grace);
+            h.write_u8(f.impale_beat);
+            h.write_u32(f.breath as u32 | (f.stroke as u32) << 16 | (f.swimming as u32) << 24 | (f.wet as u32) << 25);
+            h.write_f32(f.scorch);
+            h.write_u32(f.burning as u32);
+            h.write_f32(f.surge);
+            h.write_u32(f.dry as u32);
+            h.write_f32(f.wade);
+            h.write_f32(f.swim_phase);
             h.write_f32(f.slam);
             h.write_u8(f.shoulder_dir as u8);
             h.write_u8(f.dove as u8 | (f.prey as u8) << 1 | (f.hang_blade as u8) << 2 | (f.choking as u8) << 3 | (f.dove_shift as u8) << 4 | (f.flip_whip as u8) << 5);
@@ -4177,6 +5537,12 @@ impl RollbackGame for GameState {
             h.write_f32(b.vel.y);
             h.write_u32(b.owner as u32 | (b.life as u32) << 8);
         }
+        self.fluid.hash_into(|v| h.write_u32(v));
+        h.write_u32(self.trap.open as u32);
+        h.write_u32(self.trap.toggled);
+        h.write_u32(self.trap.poured);
+        self.steam.hash_into(|v| h.write_u32(v));
+        h.write_u32(self.burst_cd);
         for s in &self.sparks {
             h.write_f32(s.pos.x);
             h.write_f32(s.pos.y);
@@ -4196,6 +5562,7 @@ impl RollbackGame for GameState {
         }
         for x in &self.finishers {
             h.write_u32(x.attacker as u32 | (x.victim as u32) << 8 | (x.mv as u32) << 16 | (x.killed as u32) << 24);
+            h.write_u8(x.side as u8);
             h.write_u32(x.t as u32);
             if let Some(wall) = x.wall {
                 h.write_f32(wall.x);

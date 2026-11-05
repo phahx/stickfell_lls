@@ -11,8 +11,10 @@
 
 pub mod collide;
 pub mod dmath;
+pub mod fluid;
 mod world;
 
 pub use collide::{Obb, RayHit};
+pub use fluid::{Drop, Fluid, FluidKind, FluidSample};
 pub use glam::Vec2;
 pub use world::*;

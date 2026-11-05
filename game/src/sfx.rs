@@ -34,6 +34,8 @@ pub enum Sfx {
     Saw,
     Spikes,
     Splash,
+    /// A floor slide starting.
+    Slide,
     /// Voice lines around a finisher: the announcer naming it (`variant` =
     /// the `Finish`), the victim begging, the finisher's one-liner after
     /// (`variant` = the `Finish`). `speaker` is who says it.
@@ -46,6 +48,8 @@ pub enum Sfx {
     ChokeEnd,
     /// Hurt mid-finisher: cuts off whatever they were saying.
     Pain,
+    /// Burning in acid or lava: screaming (looped by the player while they're in it).
+    Burning,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -61,7 +65,7 @@ impl Sfx {
     /// Someone talking (or the announcer): heard by every player alike, once
     /// the frame it was said on is final.
     pub fn is_voice(self) -> bool {
-        matches!(self, Sfx::Announce | Sfx::Plea | Sfx::Quip | Sfx::Choke | Sfx::ChokeEnd | Sfx::Pain)
+        matches!(self, Sfx::Announce | Sfx::Plea | Sfx::Quip | Sfx::Choke | Sfx::ChokeEnd | Sfx::Pain | Sfx::Burning)
     }
 
     pub fn at(self, pos: Vec2) -> SfxEvent {

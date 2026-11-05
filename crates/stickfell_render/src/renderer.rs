@@ -117,6 +117,11 @@ struct Targets {
     ao: wgpu::TextureView,
     /// Shadow maps, contact shadows and params, for the light pass.
     light_bg: wgpu::BindGroup,
+    /// The liquids' drops, splatted (see shaders/fluid_*.wgsl): kinds and
+    /// foam, and dye; and those for the resolve.
+    fluid: wgpu::TextureView,
+    fluid_dye: wgpu::TextureView,
+    fluid_bg: wgpu::BindGroup,
 }
 
 pub struct Renderer {
@@ -159,6 +164,16 @@ pub struct Renderer {
     sampler: wgpu::Sampler,
     targets: Option<Targets>,
     shape_buf: DynBuffer,
+    splat_buf: DynBuffer,
+    fluid_bgl: wgpu::BindGroupLayout,
+    /// Each kind of liquid's look, the view and the time (for the resolve).
+    fluid_buf: wgpu::Buffer,
+    /// Vapour: its layout, its params (view, grid, look), and its grid as a
+    /// texture (sized to the grid, remade when that changes) with its bind
+    /// group.
+    vapour_bgl: wgpu::BindGroupLayout,
+    vapour_buf: wgpu::Buffer,
+    vapour_tex: Option<((u32, u32), wgpu::Texture, wgpu::BindGroup)>,
     ui_buf: DynBuffer,
     light_buf: DynBuffer,
     caster_buf: DynBuffer,
@@ -166,6 +181,28 @@ pub struct Renderer {
     light_insts: Vec<LightInstance>,
     /// Shadow rows in use this frame.
     shadow_rows: u32,
+}
+
+/// The vapour shader's params: view, grid, look (three vec4s).
+const VAPOUR_UNIFORM: usize = 12;
+
+/// An f32 as a half float's bits (what an R16Float texture holds): rounded
+/// to nearest, too small to hold going to zero, too big to the largest.
+fn f32_to_f16(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    let man = b & 0x7f_ffff;
+    if x.is_nan() || exp <= 0 {
+        return sign;
+    }
+    if exp >= 31 {
+        return sign | 0x7bff;
+    }
+    let h = ((exp as u32) << 10) | (man >> 13);
+    // (round to nearest: the dropped bits' top one)
+    let h = if man & 0x1000 != 0 { h + 1 } else { h };
+    sign | h.min(0x7bff) as u16
 }
 
 /// Uploads a sprite atlas (with its mips).
@@ -246,10 +283,29 @@ fn shape_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
+fn splat_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    const ATTRS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4, 2 => Float32x2];
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<crate::frame::FluidSplat>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &ATTRS,
+    }
+}
+
+/// The liquid field: each kind's share in r, g, b, foam in a.
+const FLUID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Floats in the liquids' uniform: three looks of nine vec4s, the view, params.
+const FLUID_LOOK: usize = 36;
+const FLUID_UNIFORM: usize = 3 * FLUID_LOOK + 8;
+/// Where the field says there's liquid.
+const FLUID_THRESHOLD: f32 = 0.35;
+
 /// Bind group layouts the pipelines are made against (shared with the
 /// thread that compiles them).
 #[derive(Clone)]
 struct Layouts {
+    fluid: wgpu::BindGroupLayout,
+    vapour: wgpu::BindGroupLayout,
     cam: wgpu::BindGroupLayout,
     sprite: wgpu::BindGroupLayout,
     light: wgpu::BindGroupLayout,
@@ -265,6 +321,9 @@ struct Layouts {
 /// loading screen draws.
 struct Pipelines {
     shape: wgpu::RenderPipeline,
+    splat: wgpu::RenderPipeline,
+    resolve: wgpu::RenderPipeline,
+    vapour: wgpu::RenderPipeline,
     caster: wgpu::RenderPipeline,
     reduce: wgpu::ComputePipeline,
     ambient: wgpu::RenderPipeline,
@@ -314,6 +373,97 @@ fn build_pipelines(device: &wgpu::Device, l: &Layouts, output_format: wgpu::Text
         fragment: Some(wgpu::FragmentState {
             module: &shapes_sm,
             entry_point: Some("fs_scene"),
+            compilation_options: Default::default(),
+            targets: &[blend_target(ALBEDO_FORMAT), blend_target(HDR_FORMAT)],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    // liquids: drops splatted into a field, then resolved over the scene
+    let splat_sm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("stickfell liquid splat"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/fluid_splat.wgsl").into()),
+    });
+    let resolve_sm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("stickfell liquid resolve"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/fluid_resolve.wgsl").into()),
+    });
+    let splat_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("liquid splat layout"),
+        bind_group_layouts: &[Some(&l.cam)],
+        immediate_size: 0,
+    });
+    let add = wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add };
+    let splat_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("liquid splat"),
+        layout: Some(&splat_layout),
+        vertex: wgpu::VertexState {
+            module: &splat_sm,
+            entry_point: Some("vs_splat"),
+            compilation_options: Default::default(),
+            buffers: &[Some(splat_vertex_layout())],
+        },
+        primitive: tri,
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &splat_sm,
+            entry_point: Some("fs_splat"),
+            compilation_options: Default::default(),
+            targets: &[
+                Some(wgpu::ColorTargetState { format: FLUID_FORMAT, blend: Some(wgpu::BlendState { color: add, alpha: add }), write_mask: wgpu::ColorWrites::ALL }),
+                Some(wgpu::ColorTargetState { format: FLUID_FORMAT, blend: Some(wgpu::BlendState { color: add, alpha: add }), write_mask: wgpu::ColorWrites::ALL }),
+            ],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    let resolve_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("liquid resolve layout"),
+        bind_group_layouts: &[Some(&l.fluid)],
+        immediate_size: 0,
+    });
+    let resolve_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("liquid resolve"),
+        layout: Some(&resolve_layout),
+        vertex: wgpu::VertexState {
+            module: &resolve_sm,
+            entry_point: Some("vs_full"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: tri,
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &resolve_sm,
+            entry_point: Some("fs_resolve"),
+            compilation_options: Default::default(),
+            targets: &[blend_target(ALBEDO_FORMAT), blend_target(HDR_FORMAT)],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    // vapour: its grid drawn as one volume over the scene
+    let vapour_sm = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("stickfell vapour"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/vapour.wgsl").into()),
+    });
+    let vapour_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("vapour layout"),
+        bind_group_layouts: &[Some(&l.vapour)],
+        immediate_size: 0,
+    });
+    let vapour_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("vapour"),
+        layout: Some(&vapour_layout),
+        vertex: wgpu::VertexState { module: &vapour_sm, entry_point: Some("vs_full"), compilation_options: Default::default(), buffers: &[] },
+        primitive: tri,
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &vapour_sm,
+            entry_point: Some("fs_vapour"),
             compilation_options: Default::default(),
             targets: &[blend_target(ALBEDO_FORMAT), blend_target(HDR_FORMAT)],
         }),
@@ -548,6 +698,9 @@ fn build_pipelines(device: &wgpu::Device, l: &Layouts, output_format: wgpu::Text
     });
     Pipelines {
         shape: shape_pipe,
+        splat: splat_pipe,
+        resolve: resolve_pipe,
+        vapour: vapour_pipe,
         caster: caster_pipe,
         reduce: reduce_pipe,
         ambient: ambient_pipe,
@@ -937,7 +1090,56 @@ impl Renderer {
             ..Default::default()
         });
 
+        let fluid_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("liquid resolve bgl"),
+            entries: &[
+                tex_entry(0),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                tex_entry(3),
+            ],
+        });
+        let vapour_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("vapour bgl"),
+            entries: &[
+                tex_entry(0),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+            ],
+        });
+        let vapour_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vapour params"),
+            contents: bytemuck::cast_slice(&[0.0f32; VAPOUR_UNIFORM]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let fluid_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("liquid looks"),
+            contents: bytemuck::cast_slice(&[0.0f32; FLUID_UNIFORM]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
         let layouts = Layouts {
+            fluid: fluid_bgl.clone(),
+            vapour: vapour_bgl.clone(),
             cam: cam_bgl.clone(),
             sprite: sprite_bgl.clone(),
             light: light_bgl.clone(),
@@ -992,6 +1194,12 @@ impl Renderer {
             sampler,
             targets: None,
             shape_buf: DynBuffer::new(device, "shape instances", vb),
+            splat_buf: DynBuffer::new(device, "liquid drops", vb),
+            fluid_bgl,
+            fluid_buf,
+            vapour_bgl,
+            vapour_buf,
+            vapour_tex: None,
             ui_buf: DynBuffer::new(device, "ui instances", vb),
             light_buf: DynBuffer::new(device, "light instances", vb),
             caster_buf: DynBuffer::new(device, "shadow casters", vb),
@@ -1075,7 +1283,64 @@ impl Renderer {
             })
         };
         let post_bg = [post(&emissive), post(&bloom_a), post(&bloom_b)];
-        self.targets = Some(Targets { size: (w, h), albedo, emissive, light, bloom_a, bloom_b, composite_bg, post_bg, ao, light_bg });
+        let fluid = mk("liquid field", FLUID_FORMAT, w, h, true);
+        let fluid_dye = mk("liquid dye", FLUID_FORMAT, w, h, true);
+        let fluid_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("liquid resolve"),
+            layout: &self.fluid_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&fluid) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: self.fluid_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&fluid_dye) },
+            ],
+        });
+        self.targets = Some(Targets { size: (w, h), albedo, emissive, light, bloom_a, bloom_b, composite_bg, post_bg, ao, light_bg, fluid, fluid_dye, fluid_bg });
+    }
+
+    /// The vapour's grid into its texture (made, or remade at a new size),
+    /// and its params.
+    fn upload_vapour(&mut self, v: &crate::VapourField, width: u32, height: u32, frame: &Frame) {
+        let (w, h) = (v.w.max(1), v.h.max(1));
+        if self.vapour_tex.as_ref().is_none_or(|(size, _, _)| *size != (w, h)) {
+            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("vapour grid"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&Default::default());
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("vapour"),
+                layout: &self.vapour_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 2, resource: self.vapour_buf.as_entire_binding() },
+                ],
+            });
+            self.vapour_tex = Some(((w, h), tex, bg));
+        }
+        let Some((_, tex, _)) = &self.vapour_tex else { return };
+        let n = (w * h) as usize;
+        let half: Vec<u16> = (0..n).map(|k| f32_to_f16(v.thick.get(k).copied().unwrap_or(0.0))).collect();
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&half),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 2), rows_per_image: None },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        let half_view = Vec2::new(frame.camera.height * width.max(1) as f32 / height.max(1) as f32, frame.camera.height) * 0.5;
+        let u: [f32; VAPOUR_UNIFORM] = [
+            frame.camera.center.x, frame.camera.center.y, half_view.x, half_view.y,
+            v.origin.x, v.origin.y, v.cell, frame.time,
+            w as f32, h as f32, v.density, v.max_opacity,
+        ];
+        self.queue.write_buffer(&self.vapour_buf, 0, bytemuck::cast_slice(&u));
     }
 
     fn build_shadows(&mut self, frame: &Frame, aspect: f32) {
@@ -1261,6 +1526,28 @@ impl Renderer {
             ],
         });
         self.shape_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&frame.shapes));
+        self.splat_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&frame.fluid));
+        if !frame.fluid.is_empty() {
+            let mut u = [0.0f32; FLUID_UNIFORM];
+            for (k, l) in frame.fluid_looks.iter().enumerate() {
+                let o = k * FLUID_LOOK;
+                u[o..o + 4].copy_from_slice(&l.shallow.to_array());
+                u[o + 4..o + 8].copy_from_slice(&l.deep.to_array());
+                u[o + 8..o + 12].copy_from_slice(&l.foam.to_array());
+                u[o + 12..o + 16].copy_from_slice(&[l.depth, l.foam_width, l.glow, l.sparkle]);
+                u[o + 16..o + 20].copy_from_slice(&[l.caustics, l.bubbles, l.crust, l.flow]);
+                u[o + 20..o + 24].copy_from_slice(&[l.seed, l.dyed_glow, l.dye_curve, 0.0]);
+                u[o + 24..o + 28].copy_from_slice(&l.dyed_shallow.to_array());
+                u[o + 28..o + 32].copy_from_slice(&l.dyed_deep.to_array());
+            }
+            let v = 3 * FLUID_LOOK;
+            let half = Vec2::new(frame.camera.height * width.max(1) as f32 / height.max(1) as f32, frame.camera.height) * 0.5;
+            u[v..v + 8].copy_from_slice(&[frame.camera.center.x, frame.camera.center.y, half.x, half.y, frame.time, FLUID_THRESHOLD, frame.camera.height / height.max(1) as f32, 0.0]);
+            self.queue.write_buffer(&self.fluid_buf, 0, bytemuck::cast_slice(&u));
+        }
+        if let Some(v) = &frame.vapour {
+            self.upload_vapour(v, width, height, frame);
+        }
         self.ui_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&frame.ui));
         self.light_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&self.light_insts));
         self.caster_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&self.casters));
@@ -1299,6 +1586,49 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.shape_buf.buf.slice(..));
                 pass.draw(0..6, 0..frame.shapes.len() as u32);
             }
+        }
+        // 1a. liquids: the drops into their field, then that over the scene
+        if !frame.fluid.is_empty() {
+            {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("liquid splat"),
+                    color_attachments: &[color_att(&t.fluid, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)), color_att(&t.fluid_dye, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT))],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&p.splat);
+                pass.set_bind_group(0, &self.cam_bg, &[]);
+                pass.set_vertex_buffer(0, self.splat_buf.buf.slice(..));
+                pass.draw(0..6, 0..frame.fluid.len() as u32);
+            }
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("liquid resolve"),
+                color_attachments: &[color_att(&t.albedo, wgpu::LoadOp::Load), color_att(&t.emissive, wgpu::LoadOp::Load)],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&p.resolve);
+            pass.set_bind_group(0, &t.fluid_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // 1a'. vapour, over the scene and its liquids
+        if let (true, Some((_, _, bg))) = (frame.vapour.is_some(), &self.vapour_tex) {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("vapour"),
+                color_attachments: &[color_att(&t.albedo, wgpu::LoadOp::Load), color_att(&t.emissive, wgpu::LoadOp::Load)],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&p.vapour);
+            pass.set_bind_group(0, bg, &[]);
+            pass.draw(0..3, 0..1);
         }
 
         // 1b. bloom: emissive -> A, then blur A->B->A twice
@@ -1624,5 +1954,15 @@ fn push_casters(out: &mut Vec<CasterInstance>, l: &Light, row: f32, o: &Occluder
     push(s, e.min(PI));
     if e > PI {
         push(-PI, e - TAU);
+    }
+}
+
+#[cfg(test)]
+mod f16_tests {
+    #[test]
+    fn halves() {
+        for (x, want) in [(0.0f32, 0x0000u16), (1.0, 0x3c00), (0.5, 0x3800), (2.0, 0x4000), (65504.0, 0x7bff), (1e9, 0x7bff), (1e-9, 0x0000), (-1.0, 0xbc00)] {
+            assert_eq!(super::f32_to_f16(x), want, "{x}");
+        }
     }
 }

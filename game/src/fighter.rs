@@ -127,15 +127,30 @@ const KICK_LUNGE: f32 = 6.5;
 const DROPKICK_SPEED: f32 = 8.0;
 /// Diving for a grab in mid-air: a lunge along the aim at this speed.
 const DIVE_SPEED: f32 = 8.0;
+/// Swimming: stroke cycles a second (radians) swimming and treading water.
+const SWIM_STROKE_RATE: f32 = 7.0;
+const SWIM_TREAD_RATE: f32 = 3.0;
+
 /// Where a guarding fist sits, from the neck (x is forward).
 const GUARD: Vec2 = Vec2::new(0.3, 0.02);
 const RUN_SPEED: f32 = 6.0;
+/// How much a swimmer's legs give (muscle compliance: softer the higher).
+const SWIM_LEG_GIVE: f32 = 3e-4;
+/// Wading: run speed over (1 + this x the liquid round the pelvis).
+const WADE_SLOW: f32 = 4.0;
 const JUMP_SPEED: f32 = 12.5;
 const WALL_JUMP_SPEED: f32 = 11.5;
 /// The second jump, in mid-air (a little weaker than one off the ground).
 const DOUBLE_JUMP_SPEED: f32 = 10.5;
 /// Sideways kick away from the wall.
 const WALL_JUMP_PUSH: f32 = 6.5;
+/// How much liquid seeps through a body rather than being pushed aside by it
+/// (see `Segment::porous`).
+pub const BODY_POROUS: f32 = 1.0;
+
+/// Liquid round the pelvis from which there's no kicking off walls or
+/// jumping in mid-air (hip deep: measured 0.18 in 0.9 m of water).
+const WATER_KICK: f32 = 0.15;
 /// Fastest fall while pressed against a wall.
 const WALL_SLIDE: f32 = 3.5;
 pub const GETUP_FRAMES: u16 = 50;
@@ -148,6 +163,10 @@ pub const KICK_LOW: u8 = 1;
 pub const KICK_DROP: u8 = 2;
 /// Frames of winding up before a held body is thrown.
 pub const HEAVE_FRAMES: u8 = 14;
+/// How flattened a stomped head stays once it springs back from the blow
+/// (0 round .. 1 flat; the blow itself flattens it further).
+pub const HEAD_DENT: f32 = 0.55;
+
 /// Frames of the flip over someone grabbed by the head in mid-air (one full
 /// turn).
 pub const FLIP_FRAMES: u8 = 30;
@@ -231,6 +250,9 @@ pub struct HandScript {
     pub shove: bool,
     /// Points the weapon this way instead of along the arm.
     pub aim: Option<f32>,
+    /// The front leg's pose instead of standing (a stomp): thigh angle and
+    /// knee bend, held stiff and moved fast.
+    pub leg: Option<(f32, f32)>,
 }
 
 /// What made a wound (how it's drawn).
@@ -244,6 +266,8 @@ pub enum WoundKind {
     Stab,
     /// A blade dragged across: a long gash.
     Cut,
+    /// Someone else's blood splashed on (it doesn't bleed).
+    Spatter,
 }
 
 /// A wound, in its body part's own frame (so it moves with the part):
@@ -273,6 +297,7 @@ impl WoundKind {
             WoundKind::Exit => 1.15,
             WoundKind::Stab => 0.5,
             WoundKind::Cut => 0.45,
+            WoundKind::Spatter => 1.0,
         }
     }
 
@@ -385,6 +410,41 @@ pub struct Fighter {
     /// and who threw).
     pub flying: u8,
     pub flung_by: u8,
+    /// Just slammed down by a shoulder throw: frames left in which the
+    /// thrower's finisher is a curb stomp, and who threw them.
+    pub shouldered: u8,
+    pub shouldered_by: u8,
+    /// How flattened the head is (0 round .. 1 flat), and whether it's burst.
+    pub head_squash: f32,
+    pub head_popped: bool,
+    /// Run through on a spike: frames on it (0 = not), the part it went
+    /// through, the struggle off it (free at 100), and frames before a spike
+    /// can run them through again.
+    pub impaled: u16,
+    pub impale_part: u8,
+    pub impale_free: u8,
+    pub impale_grace: u8,
+    pub impale_beat: u8,
+    /// Breath left under water (frames, see `sim::AIR`), frames till the
+    /// next swimming stroke, and how burnt (acid, lava) they are (0..1).
+    pub breath: u16,
+    pub stroke: u8,
+    /// In a liquid deep enough to swim in (set by the sim each frame), how
+    /// much liquid's around the pelvis (1: all of it), and where in the
+    /// stroke they are (radians).
+    pub swimming: bool,
+    pub wade: f32,
+    pub swim_phase: f32,
+    /// In any liquid last frame (for splashing going in).
+    pub wet: bool,
+    pub scorch: f32,
+    /// In acid or lava this frame (alive): screaming.
+    pub burning: bool,
+    /// How hard the liquid is shoving them (sideways and down), as a share of
+    /// their weight, averaged over the last moment (`sim::SURGE_EASE`).
+    pub surge: f32,
+    /// Frames since they were last swimming (capped).
+    pub dry: u16,
     /// Damage owed for being slammed down (a shoulder throw), dealt when the
     /// body first touches the level.
     pub slam: f32,
@@ -470,6 +530,19 @@ impl Fighter {
 
     pub fn arm_b_ok(&self) -> bool {
         self.severed & ARM_B_BITS == 0
+    }
+
+    /// What they've left to swim with: 1 with all four limbs, each whole arm
+    /// or leg a quarter of it (a forearm or shin gone, half that).
+    pub fn swim_limbs(&self) -> f32 {
+        let limb = |upper: u32, lower: u32| if !self.has(upper) { 0.0 } else if !self.has(lower) { 0.5 } else { 1.0 };
+        (limb(S_UPPER_A, S_FORE_A) + limb(S_UPPER_B, S_FORE_B) + limb(S_THIGH_A, S_SHIN_A) + limb(S_THIGH_B, S_SHIN_B)) / 4.0
+    }
+
+    /// How well they can swim (0..1): full with every limb, half with one
+    /// gone, nothing with two gone (an arm and a leg, both arms, both legs).
+    pub fn swim_power(&self) -> f32 {
+        ((self.swim_limbs() - 0.5) / 0.5).clamp(0.0, 1.0)
     }
 
     pub fn legs_left(&self) -> u32 {
@@ -615,6 +688,8 @@ impl Fighter {
             let s = w.add_segment(base + a, base + b, r, group, seg_tag(id, part as u32));
             // torso and arms also collide along their length (legs use the joints)
             w.segments[s as usize].collide_static = matches!(part as u32, S_TORSO | S_UPPER_A | S_FORE_A | S_UPPER_B | S_FORE_B);
+            // (water goes round a body, not held back by it)
+            w.segments[s as usize].porous = BODY_POROUS;
         }
         let mut anchor = Particle::new(Vec2::new(0.0, -1000.0), 0.0, 0.01);
         anchor.collide_static = false;
@@ -678,6 +753,25 @@ impl Fighter {
             grab_cd: 0,
             flying: 0,
             flung_by: 0,
+            shouldered: 0,
+            shouldered_by: 0,
+            head_squash: 0.0,
+            head_popped: false,
+            impaled: 0,
+            impale_part: 0,
+            impale_free: 0,
+            impale_grace: 0,
+            impale_beat: 0,
+            breath: crate::sim::AIR,
+            stroke: 0,
+            swimming: false,
+            wade: 0.0,
+            swim_phase: 0.0,
+            wet: false,
+            scorch: 0.0,
+            burning: false,
+            surge: 0.0,
+            dry: 0,
             slam: 0.0,
             carry: 0.0,
             flip: 0,
@@ -879,6 +973,31 @@ impl Fighter {
     }
 
     /// A key went down this frame (ignores the lock's masking).
+    /// Which way the keys say to swim (unit length, or zero): the
+    /// movement keys, jump up, crouch down.
+    pub fn swim_dir(&self) -> Vec2 {
+        if !self.swimming {
+            return Vec2::ZERO;
+        }
+        let x = self.held(RIGHT) as i32 as f32 - self.held(LEFT) as i32 as f32;
+        let y = self.held(JUMP) as i32 as f32 - self.held(CROUCH) as i32 as f32;
+        Vec2::new(x, y).normalize_or_zero()
+    }
+
+    /// Where a swimming hand is in its stroke (`offset`: the other hand half
+    /// a stroke behind): round in a circle the way they're going (front
+    /// crawl), or sculling at their sides treading water. Angle from the
+    /// neck, reach (on the game's build).
+    fn stroke_hand(&self, swim_ang: f32, stroking: bool, offset: f32) -> (f32, f32) {
+        let f = self.facing;
+        let ph = self.swim_phase + offset;
+        if stroking {
+            (dmath::wrap_angle(swim_ang - f * ph), 0.5)
+        } else {
+            (-FRAC_PI_2 + f * (0.6 + 0.45 * dmath::sin(ph)), 0.42)
+        }
+    }
+
     pub fn pressed_raw(&self, b: u16) -> bool {
         self.raw_buttons & b != 0 && self.prev_raw & b == 0
     }
@@ -968,6 +1087,11 @@ impl Fighter {
         self.dazed = self.dazed.saturating_sub(1);
         self.grab_cd = self.grab_cd.saturating_sub(1);
         self.flying = self.flying.saturating_sub(1);
+        self.shouldered = self.shouldered.saturating_sub(1);
+        // a stomped head springs back from the blow, to a lasting dent
+        if !self.head_popped && self.head_squash > HEAD_DENT {
+            self.head_squash = (self.head_squash - 0.03).max(HEAD_DENT);
+        }
         if self.down > 0 {
             self.down -= 1;
             if self.down == 0 {
@@ -1004,8 +1128,9 @@ impl Fighter {
             return;
         }
         // toppled over: go limp for a moment, then get up
-        // (mid-flip, upside down is the point)
-        if self.down == 0 && self.getup == 0 && self.grounded && tilt.abs() > 1.25 && self.flip == 0 {
+        // (mid-flip, upside down is the point; hip deep in water, lying in it
+        // is coming out of a swim, not a fall)
+        if self.down == 0 && self.getup == 0 && self.grounded && tilt.abs() > 1.25 && self.flip == 0 && !self.swimming && self.wade < WATER_KICK {
             self.knock_down(24);
         }
 
@@ -1035,6 +1160,16 @@ impl Fighter {
         }
         let sliding = self.slide > 0;
         let crouch = self.held(CROUCH) && self.grounded;
+        // ---- swimming: the keys say which way (jump up, crouch down) ----
+        let swim_dir = self.swim_dir();
+        let stroking = swim_dir != Vec2::ZERO;
+        if self.swimming {
+            self.swim_phase = dmath::wrap_angle(self.swim_phase + dt * if stroking { SWIM_STROKE_RATE } else { SWIM_TREAD_RATE });
+        }
+        // laid out along the way they're swimming, upright treading water
+        let swim_ang = if stroking { dmath::angle(swim_dir) } else { FRAC_PI_2 };
+        let swim_pose = self.swimming && self.swing == 0 && self.kick == 0 && self.script.is_none() && self.locked.is_none();
+        let (sw_s, _) = dmath::sin_cos(self.swim_phase);
 
         // feet: slide while running (or sliding), plant while idle
         let foot_friction = if sliding {
@@ -1082,7 +1217,9 @@ impl Fighter {
             }
         } else if !lunging && (strength > 0.15 || !self.grounded) {
             let haul = 1.0 / (1.0 + self.carry * 0.045);
-            let speed = if crouch { RUN_SPEED * CROUCH_SPEED } else { RUN_SPEED } * haul;
+            // (wading, the deeper the slower: nobody runs through water)
+            let wading = if self.grounded { 1.0 / (1.0 + WADE_SLOW * self.wade) } else { 1.0 };
+            let speed = if crouch { RUN_SPEED * CROUCH_SPEED } else { RUN_SPEED } * haul * wading;
             let accel = if self.grounded { 55.0 * strength } else { 22.0 };
             let accel = if self.held_by.is_some() && dir_x == 0.0 { accel * 0.3 } else { accel };
             let dv = (dir_x * speed - vel.x).clamp(-accel * dt, accel * dt);
@@ -1141,11 +1278,15 @@ impl Fighter {
         } else if !self.grounded && self.coyote == 0 && self.down == 0 && strength > 0.5 {
             // airborne next to a wall: jump off it (twice before landing), and
             // slide down it slowly while pushing into it
-            let wall = self.wall_beside(w);
+            // (nothing to kick off in the water: hip deep or more, no wall
+            // or mid-air jumps)
+            let in_water = self.wade >= WATER_KICK;
+            let wall = if in_water { None } else { self.wall_beside(w) };
             let wall_jump = wall.is_some() && self.wall_jumps < WALL_JUMPS;
             // a jump in mid-air: once, until you land (not while jump is
             // letting go of a rope or heaving up off a blade)
-            let free = !self.grabbing && !self.hang_blade && self.flip == 0 && self.shoulder == 0 && self.held_by.is_none();
+            // (swimming, jump is a stroke instead: see `sim::update_liquids`)
+            let free = !self.grabbing && !self.hang_blade && self.flip == 0 && self.shoulder == 0 && self.held_by.is_none() && !self.swimming && !in_water;
             if self.pressed(JUMP) && self.jump_cd == 0 && !wall_jump && !self.air_jumped && free {
                 for id in self.particle_ids() {
                     let p = &mut w.particles[id as usize];
@@ -1172,7 +1313,7 @@ impl Fighter {
                 }
             }
         }
-        if !self.held(JUMP) && vel.y > 0.0 && !self.grounded && self.jump_cd < 8 && !self.hanging() {
+        if !self.held(JUMP) && vel.y > 0.0 && !self.grounded && self.jump_cd < 8 && !self.hanging() && !self.swimming {
             for id in self.particle_ids() {
                 let p = &mut w.particles[id as usize];
                 p.force.y -= 18.0 * p.mass();
@@ -1264,6 +1405,9 @@ impl Fighter {
         if limp {
             self.relax(w, M_TORSO);
             self.relax(w, M_HEAD);
+        } else if swim_pose {
+            self.muscle(w, M_TORSO, swim_ang, 3.5e-5 * weak);
+            self.muscle(w, M_HEAD, swim_ang, 7e-4 * weak);
         } else {
             self.muscle(w, M_TORSO, FRAC_PI_2 + lean, 3.5e-5 * weak);
             self.muscle(w, M_HEAD, FRAC_PI_2 + lean * 0.5, 7e-4 * weak);
@@ -1295,6 +1439,19 @@ impl Fighter {
         } else {
             (down + f * 0.2, 0.12, down - f * 0.14, 0.08)
         };
+        let (thigh_a, bend_a, thigh_b, bend_b) = if swim_pose && stroking {
+            // a flutter kick, trailing out behind the body as it lies now
+            // (not where it's turning to: the legs follow it round rather
+            // than swinging the other way against the hips)
+            let back = dmath::angle(self.pos(w, PELVIS) - self.pos(w, NECK));
+            let flutter = 0.3 * dmath::sin(self.swim_phase * 2.0);
+            (back + flutter, 0.25, back - flutter, 0.25)
+        } else if swim_pose {
+            // treading water: legs cycling under them
+            (down + 0.35 * sw_s, 0.7, down - 0.35 * sw_s, 0.7)
+        } else {
+            (thigh_a, bend_a, thigh_b, bend_b)
+        };
         let (thigh_a, bend_a, thigh_b, bend_b) = if self.diving() {
             // legs trailing out behind
             (down - f * 0.7, 0.3, down - f * 0.9, 0.5)
@@ -1310,11 +1467,18 @@ impl Fighter {
             (Some(t), _) if t < 0.8 => (down + f * 1.42, 0.0, thigh_b, bend_b),
             _ => (thigh_a, bend_a, thigh_b, bend_b),
         };
-        let leg_tilt = if self.kick > 0 { 0.0 } else { tilt * 0.5 };
+        // a stomp: the front leg posed by the finisher
+        let stomp = self.script.and_then(|sc| sc.leg);
+        let (thigh_a, bend_a) = stomp.unwrap_or((thigh_a, bend_a));
+        // (swimming, the kick's already aimed along the body: tilting it with
+        // the body again would turn it half as far again, off to the side)
+        let leg_tilt = if self.kick > 0 || stomp.is_some() || swim_pose { 0.0 } else { tilt * 0.5 };
         // legs: soft on the ground, softer still in the air (they trail and
         // flop); a kick tenses them
-        let leg_c = if self.kick > 0 && self.kick_kind == KICK_DROP {
+        let leg_c = if (self.kick > 0 && self.kick_kind == KICK_DROP) || stomp.is_some() {
             5e-5
+        } else if swim_pose {
+            SWIM_LEG_GIVE
         } else if airborne {
             3.5e-4
         } else if crouch && self.kick == 0 {
@@ -1335,10 +1499,11 @@ impl Fighter {
             if self.has(shin) {
                 self.muscle(w, shin, ang + leg_tilt - f * bend, leg_c);
             }
-            if self.kick > 0 {
-                // a kick snaps out far faster than a step
-                w.aims[(self.aim_base + thigh) as usize].max_step = 0.07;
-                w.aims[(self.aim_base + shin) as usize].max_step = 0.09;
+            if self.kick > 0 || (stomp.is_some() && thigh == S_THIGH_A) {
+                // a kick snaps out far faster than a step, a stomp faster still
+                let (t, s) = if stomp.is_some() { (0.15, 0.18) } else { (0.07, 0.09) };
+                w.aims[(self.aim_base + thigh) as usize].max_step = t;
+                w.aims[(self.aim_base + shin) as usize].max_step = s;
             }
         }
 
@@ -1381,6 +1546,12 @@ impl Fighter {
             w2 = 2600.0;
             reach_rate = 14.0;
             self.swing = 0;
+        }
+        if swim_pose && fists && !self.grabbing {
+            let (ang, reach) = self.stroke_hand(swim_ang, stroking, 0.0);
+            want_ang = ang;
+            want_reach = reach * ak;
+            omega = 14.0;
         }
         if let Some(t) = self.swing_t() {
             if self.swing_thrust {
@@ -1500,6 +1671,11 @@ impl Fighter {
             self.relax(w, S_UPPER_B);
             self.relax(w, S_FORE_B);
         } else if two_handed || self.grabbing {
+            self.relax(w, S_UPPER_B);
+            self.relax(w, S_FORE_B);
+        } else if swim_pose {
+            let (ang, reach) = self.stroke_hand(swim_ang, stroking, core::f32::consts::PI);
+            self.set_drive(w, self.drive_b, dmath::dir(ang) * reach * ak, 500.0 * strength.max(0.3), 0.4, 0.03, 1.0);
             self.relax(w, S_UPPER_B);
             self.relax(w, S_FORE_B);
         } else if self.weapon.is_none() && self.grounded && self.kick == 0 {
