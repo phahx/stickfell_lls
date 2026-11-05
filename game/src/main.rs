@@ -630,7 +630,8 @@ impl Game for App {
                     }
                     room.exchange(*players);
                     if room.client.is_host() {
-                        if let Some(r) = self.autostart_rules {
+                        // (--autostart's settings, once: after that they're the host's to change)
+                        if let Some(r) = self.autostart_rules.take() {
                             room.sync.set(r);
                         }
                         if self.autostart.is_some_and(|n| *players >= n) && room.can_start(*players) {
@@ -1177,7 +1178,7 @@ fn main() -> ExitCode {
     let mut app = App::new(menu(None), args.relay.clone());
     app.loading = Some(Box::new(loading::Loading::start()));
     app.autostart = args.autostart;
-    app.autostart_rules = Some(args.rules);
+    app.autostart_rules = args.autostart.map(|_| args.rules);
     app.bot_local = args.bot;
     if args.host {
         app.do_action(Action::Host);
@@ -1446,6 +1447,71 @@ mod lobby_shots {
                 *room = *back;
             }
         }
+        stop.store(true, Ordering::Relaxed);
+        th.join().unwrap();
+    }
+
+    fn room_of(app: &App) -> &Room {
+        match &app.screen {
+            Screen::Lobby(r) => r,
+            _ => panic!("not in the room"),
+        }
+    }
+
+    /// The host changes the mode and AI with someone in the room: the
+    /// settings stay as picked (a regression: `--autostart`'s defaults were
+    /// put back every frame), reach the guest, and the match can start.
+    #[test]
+    fn the_hosts_settings_stick_and_reach_the_room() {
+        let mut server = stickfell_net::RelayServer::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap().to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let th = std::thread::spawn(move || {
+            while !stop2.load(Ordering::Relaxed) {
+                server.poll();
+            }
+        });
+        let mut host = LobbyClient::host(&addr, 8).unwrap();
+        let code = loop {
+            if let LobbyState::InRoom { code, .. } = host.poll() {
+                break code.clone();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let mut guest = LobbyClient::join(&addr, &code).unwrap();
+        while !matches!(guest.poll(), LobbyState::InRoom { players: 2, .. }) {
+            host.poll();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut h = App::new(Screen::Lobby(Box::new(Room::new(host))), addr.clone());
+        let mut g = App::new(Screen::Lobby(Box::new(Room::new(guest))), addr.clone());
+        // (as `--host --autostart` would, for a count never reached: its
+        // settings once, then the host's)
+        h.autostart = Some(3);
+        h.autostart_rules = Some(lobby::Rules::default());
+        let input = Input::default();
+        let want = lobby::Rules { teams: 2, ai: 1 };
+        let mut frames = 0;
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_secs(5) {
+            h.tick(&input);
+            g.tick(&input);
+            frames += 1;
+            if frames == 30 {
+                h.do_action(Action::CycleMode);
+                h.do_action(Action::CycleAi);
+            }
+            if frames > 30 {
+                assert_eq!(room_of(&h).sync.rules, want, "frame {frames}: the host's pick stays");
+                if room_of(&g).sync.rules == want && room_of(&h).can_start(2) {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(room_of(&g).sync.heard && room_of(&g).sync.rules == want, "the guest has them ({:?})", room_of(&g).sync.rules);
+        assert!(room_of(&h).can_start(2), "and the host can start");
         stop.store(true, Ordering::Relaxed);
         th.join().unwrap();
     }
