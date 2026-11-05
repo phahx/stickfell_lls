@@ -1,4 +1,5 @@
-// Vapour (steam, smoke): a grid of how thick it is, drawn as one continuous
+// Vapour (steam, smoke), and fire: a grid of how thick it is (how hot, for
+// fire), drawn as one continuous
 // volume over the scene. The grid is sampled smoothly (its cells never
 // show), looked up through drifting noise so it curls and rises, broken up
 // by finer billows, and given its opacity by how much of it a ray goes
@@ -103,5 +104,45 @@ fn fs_vapour(o: FullOut) -> SceneOut {
     out.albedo = vec4<f32>(col, a);
     // (it hides glows behind it a little; it doesn't glow)
     out.emissive = vec4<f32>(col * 0.03, a * 0.5);
+    return out;
+}
+
+// Fire: the grid holds how hot it is (about 1 in a flame's heart, falling
+// away above and around what's burning). Looked up through noise racing
+// upward, so tongues of it lick up and break off; cut away where the noise
+// is low, more so where it's cooler; coloured along a flame's temperatures
+// (deep red at its ragged edges, orange, yellow, nearly white at its
+// heart), and glowing (into the bloom) far more than it shows as paint.
+@fragment
+fn fs_flame(o: FullOut) -> SceneOut {
+    let p = v.view.xy + vec2<f32>((o.uv.x * 2.0 - 1.0) * v.view.z, (1.0 - o.uv.y * 2.0) * v.view.w);
+    let t = v.grid.w;
+    let cell = v.grid.z;
+    if soft(p) < 0.003 && thick(p - vec2<f32>(0.0, cell * 3.0)) < 0.003 {
+        discard;
+    }
+    // racing upward: sampling from below stretches the flames up
+    let n1 = fbm(p * 4.5 + vec2<f32>(0.0, -t * 3.4));
+    let n2 = fbm(p * 9.0 + vec2<f32>(3.1, -t * 5.6));
+    let warp = vec2<f32>((n1 - 0.5) * 0.14, -n2 * 0.22);
+    var heat = soft(p + warp);
+    // tongues and gaps (more of them the cooler it is, so the edges and
+    // tips break up)
+    heat = heat * (0.35 + 1.0 * n2) - 0.28 * (1.0 - n1);
+    if heat <= 0.02 {
+        discard;
+    }
+    let x = clamp(heat / 1.2, 0.0, 1.0);
+    let red = vec3<f32>(0.62, 0.07, 0.02);
+    let orange = vec3<f32>(1.0, 0.38, 0.05);
+    let yellow = vec3<f32>(1.0, 0.78, 0.28);
+    let white = vec3<f32>(1.0, 0.96, 0.82);
+    var col = mix(red, orange, smoothstep(0.0, 0.35, x));
+    col = mix(col, yellow, smoothstep(0.35, 0.7, x));
+    col = mix(col, white, smoothstep(0.75, 1.0, x));
+    let a = smoothstep(0.02, 0.3, heat) * 0.85;
+    var out: SceneOut;
+    out.albedo = vec4<f32>(col * 0.7, a * 0.55);
+    out.emissive = vec4<f32>(col * (0.55 + 0.9 * x), a * 0.9);
     return out;
 }

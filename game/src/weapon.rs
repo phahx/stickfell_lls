@@ -667,8 +667,13 @@ pub struct Weapon {
     /// and which part, and where each of its points sits in that part's frame.
     pub stuck: Option<(u8, u8)>,
     pub stuck_at: [Vec2; 6],
-    /// A severed limb: which (for drawing it with the right textures).
+    /// A severed limb: which (for drawing it with the right textures), and
+    /// how eaten away by acid, melted to the bone by lava (out of
+    /// `fighter::ROT_FULL`) and on fire (frames left) it is.
     pub limb: Option<LimbKind>,
+    pub eaten: u16,
+    pub melted: u16,
+    pub fire: u16,
     /// Kinematic anchor particles and the pin slots holding an embedded weapon.
     pub anchors: [u32; 2],
     pub pins: [u32; 2],
@@ -806,6 +811,9 @@ impl Weapon {
             lever: false,
             flip: false,
             limb: None,
+            eaten: 0,
+            melted: 0,
+            fire: 0,
             anchors,
             pins,
             yank: 0,

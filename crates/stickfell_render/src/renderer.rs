@@ -174,6 +174,9 @@ pub struct Renderer {
     vapour_bgl: wgpu::BindGroupLayout,
     vapour_buf: wgpu::Buffer,
     vapour_tex: Option<((u32, u32), wgpu::Texture, wgpu::BindGroup)>,
+    /// Fire: drawn the same way as vapour (its own params and grid).
+    flame_buf: wgpu::Buffer,
+    flame_tex: Option<((u32, u32), wgpu::Texture, wgpu::BindGroup)>,
     ui_buf: DynBuffer,
     light_buf: DynBuffer,
     caster_buf: DynBuffer,
@@ -324,6 +327,7 @@ struct Pipelines {
     splat: wgpu::RenderPipeline,
     resolve: wgpu::RenderPipeline,
     vapour: wgpu::RenderPipeline,
+    flame: wgpu::RenderPipeline,
     caster: wgpu::RenderPipeline,
     reduce: wgpu::ComputePipeline,
     ambient: wgpu::RenderPipeline,
@@ -464,6 +468,23 @@ fn build_pipelines(device: &wgpu::Device, l: &Layouts, output_format: wgpu::Text
         fragment: Some(wgpu::FragmentState {
             module: &vapour_sm,
             entry_point: Some("fs_vapour"),
+            compilation_options: Default::default(),
+            targets: &[blend_target(ALBEDO_FORMAT), blend_target(HDR_FORMAT)],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    // fire: the same, a field of heat drawn as licking flames
+    let flame_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("flames"),
+        layout: Some(&vapour_layout),
+        vertex: wgpu::VertexState { module: &vapour_sm, entry_point: Some("vs_full"), compilation_options: Default::default(), buffers: &[] },
+        primitive: tri,
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &vapour_sm,
+            entry_point: Some("fs_flame"),
             compilation_options: Default::default(),
             targets: &[blend_target(ALBEDO_FORMAT), blend_target(HDR_FORMAT)],
         }),
@@ -701,6 +722,7 @@ fn build_pipelines(device: &wgpu::Device, l: &Layouts, output_format: wgpu::Text
         splat: splat_pipe,
         resolve: resolve_pipe,
         vapour: vapour_pipe,
+        flame: flame_pipe,
         caster: caster_pipe,
         reduce: reduce_pipe,
         ambient: ambient_pipe,
@@ -1132,6 +1154,11 @@ impl Renderer {
             contents: bytemuck::cast_slice(&[0.0f32; VAPOUR_UNIFORM]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let flame_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("flame params"),
+            contents: bytemuck::cast_slice(&[0.0f32; VAPOUR_UNIFORM]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
         let fluid_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("liquid looks"),
             contents: bytemuck::cast_slice(&[0.0f32; FLUID_UNIFORM]),
@@ -1200,6 +1227,8 @@ impl Renderer {
             vapour_bgl,
             vapour_buf,
             vapour_tex: None,
+            flame_buf,
+            flame_tex: None,
             ui_buf: DynBuffer::new(device, "ui instances", vb),
             light_buf: DynBuffer::new(device, "light instances", vb),
             caster_buf: DynBuffer::new(device, "shadow casters", vb),
@@ -1298,12 +1327,24 @@ impl Renderer {
         self.targets = Some(Targets { size: (w, h), albedo, emissive, light, bloom_a, bloom_b, composite_bg, post_bg, ao, light_bg, fluid, fluid_dye, fluid_bg });
     }
 
-    /// The vapour's grid into its texture (made, or remade at a new size),
-    /// and its params.
-    fn upload_vapour(&mut self, v: &crate::VapourField, width: u32, height: u32, frame: &Frame) {
+    /// A volume's grid (vapour or fire) into its texture (made, or remade at
+    /// a new size), and its params.
+    #[allow(clippy::too_many_arguments)]
+    fn upload_volume(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        sampler: &wgpu::Sampler,
+        bgl: &wgpu::BindGroupLayout,
+        slot: &mut Option<((u32, u32), wgpu::Texture, wgpu::BindGroup)>,
+        buf: &wgpu::Buffer,
+        v: &crate::VapourField,
+        width: u32,
+        height: u32,
+        frame: &Frame,
+    ) {
         let (w, h) = (v.w.max(1), v.h.max(1));
-        if self.vapour_tex.as_ref().is_none_or(|(size, _, _)| *size != (w, h)) {
-            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+        if slot.as_ref().is_none_or(|(size, _, _)| *size != (w, h)) {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("vapour grid"),
                 size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
                 mip_level_count: 1,
@@ -1314,21 +1355,21 @@ impl Renderer {
                 view_formats: &[],
             });
             let view = tex.create_view(&Default::default());
-            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("vapour"),
-                layout: &self.vapour_bgl,
+                layout: bgl,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                    wgpu::BindGroupEntry { binding: 2, resource: self.vapour_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                    wgpu::BindGroupEntry { binding: 2, resource: buf.as_entire_binding() },
                 ],
             });
-            self.vapour_tex = Some(((w, h), tex, bg));
+            *slot = Some(((w, h), tex, bg));
         }
-        let Some((_, tex, _)) = &self.vapour_tex else { return };
+        let Some((_, tex, _)) = slot.as_ref() else { return };
         let n = (w * h) as usize;
         let half: Vec<u16> = (0..n).map(|k| f32_to_f16(v.thick.get(k).copied().unwrap_or(0.0))).collect();
-        self.queue.write_texture(
+        queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             bytemuck::cast_slice(&half),
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 2), rows_per_image: None },
@@ -1340,7 +1381,7 @@ impl Renderer {
             v.origin.x, v.origin.y, v.cell, frame.time,
             w as f32, h as f32, v.density, v.max_opacity,
         ];
-        self.queue.write_buffer(&self.vapour_buf, 0, bytemuck::cast_slice(&u));
+        queue.write_buffer(buf, 0, bytemuck::cast_slice(&u));
     }
 
     fn build_shadows(&mut self, frame: &Frame, aspect: f32) {
@@ -1546,7 +1587,10 @@ impl Renderer {
             self.queue.write_buffer(&self.fluid_buf, 0, bytemuck::cast_slice(&u));
         }
         if let Some(v) = &frame.vapour {
-            self.upload_vapour(v, width, height, frame);
+            Self::upload_volume(&self.device, &self.queue, &self.sampler, &self.vapour_bgl, &mut self.vapour_tex, &self.vapour_buf, v, width, height, frame);
+        }
+        if let Some(v) = &frame.flames {
+            Self::upload_volume(&self.device, &self.queue, &self.sampler, &self.vapour_bgl, &mut self.flame_tex, &self.flame_buf, v, width, height, frame);
         }
         self.ui_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&frame.ui));
         self.light_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&self.light_insts));
@@ -1627,6 +1671,20 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&p.vapour);
+            pass.set_bind_group(0, bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        // 1a''. fire, over that (glowing into the bloom)
+        if let (true, Some((_, _, bg))) = (frame.flames.is_some(), &self.flame_tex) {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("flames"),
+                color_attachments: &[color_att(&t.albedo, wgpu::LoadOp::Load), color_att(&t.emissive, wgpu::LoadOp::Load)],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&p.flame);
             pass.set_bind_group(0, bg, &[]);
             pass.draw(0..3, 0..1);
         }

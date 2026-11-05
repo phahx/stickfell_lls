@@ -194,8 +194,10 @@ impl<G: RollbackGame, T: Transport> P2PSession<G, T> {
     pub fn drain_events(&mut self) -> Vec<SessionEvent> {
         std::mem::take(&mut self.events)
     }
+    /// Whether `player`'s connection is gone (anyone who isn't a player in
+    /// this session: no).
     pub fn is_disconnected(&self, player: usize) -> bool {
-        self.peers[player].disconnected
+        self.peers.get(player).is_some_and(|p| p.disconnected)
     }
 
     fn remotes(&self) -> impl Iterator<Item = usize> + '_ {

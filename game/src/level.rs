@@ -185,6 +185,27 @@ pub struct ArtDef {
     pub layer: ArtLayer,
 }
 
+/// A raft: a plank floating on water, where it's moored (its middle), its
+/// half size, and the water it floats on (its bottom and still surface).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RaftDef {
+    pub x: f32,
+    pub half: Vec2,
+    pub sea: (f32, f32),
+}
+
+/// What a level gives fighters to fight with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arms {
+    /// A few weapons lying about to start with (a few more than there are
+    /// fighters), and more dropping in every so often.
+    Scattered,
+    /// One weapon where each fighter starts, and nothing more.
+    OneEach,
+    /// Nothing: bare hands only.
+    BareHands,
+}
+
 #[derive(Clone, Debug)]
 pub struct LevelDef {
     pub name: &'static str,
@@ -208,6 +229,10 @@ pub struct LevelDef {
     /// Practice yard: one of every weapon on the rack, no drops, and the round
     /// only resets when the player or all the dummies are down for good.
     pub training: bool,
+    /// What fighters have to fight with (not the practice yard's rack).
+    pub arms: Arms,
+    /// Rafts floating on the level's water.
+    pub rafts: Vec<RaftDef>,
     /// A flood trap (practice only).
     pub trap: Option<TrapDef>,
     pub bg: u32,
@@ -252,10 +277,6 @@ fn spikes(cx: f32, cy: f32, hx: f32, hy: f32) -> HazardDef {
     HazardDef { kind: HazardKind::Spikes, a: v(cx, cy), b: v(cx, cy), size: v(hx, hy), speed: 0.0 }
 }
 
-fn acid(cx: f32, cy: f32, hx: f32, hy: f32) -> HazardDef {
-    HazardDef { kind: HazardKind::Acid, a: v(cx, cy), b: v(cx, cy), size: v(hx, hy), speed: 0.0 }
-}
-
 /// A pool from `x0` to `x1`, from `bottom` up to its surface at `top`.
 fn pool(kind: HazardKind, x0: f32, x1: f32, bottom: f32, top: f32) -> HazardDef {
     let (a, size) = (v((x0 + x1) * 0.5, (bottom + top) * 0.5), v((x1 - x0) * 0.5, (top - bottom) * 0.5));
@@ -290,14 +311,18 @@ impl TrapDef {
 }
 
 /// The arenas online matches rotate through (the training yard comes after them).
-pub const ARENAS: usize = 5;
+pub const ARENAS: usize = 6;
 /// Index of the eight-player arena in `levels()`.
 #[cfg_attr(not(test), allow(dead_code))]
-pub const GAUNTLET: usize = 4;
+pub const GAUNTLET: usize = 3;
+/// Index of the rope course arena in `levels()`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const ROPES: usize = 4;
+/// Index of the open water arena in `levels()`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SEA: usize = 5;
 /// Index of the practice yard in `levels()`.
-pub const TRAINING: usize = 5;
-/// Index of the art test level (a practice yard built from the level kit).
-pub const ART_TEST: usize = 6;
+pub const TRAINING: usize = 6;
 
 /// The arena after `now` in the rotation with a spawn for each of
 /// `fighters` (the big ones only, with more than four).
@@ -312,7 +337,7 @@ pub fn first_arena(seed: u32, fighters: usize) -> usize {
 }
 
 pub fn levels() -> Vec<LevelDef> {
-    vec![foundry(), rooftops(), keep(), brickworks(), gauntlet(), training_yard(), art_test()]
+    vec![foundry(), rooftops(), keep(), gauntlet(), rope_course(), open_water(), training_yard()]
 }
 
 const STONE: u32 = 0x3a3f4b;
@@ -409,6 +434,8 @@ fn foundry() -> LevelDef {
         kill_y: -6.0,
         art: vec![],
         training: false,
+        arms: Arms::Scattered,
+        rafts: vec![],
         bg: 0x5a6070,
         trap: None,
         ambient: [0.15, 0.16, 0.21],
@@ -503,6 +530,8 @@ fn rooftops() -> LevelDef {
         kill_y: -7.0,
         art: vec![],
         training: false,
+        arms: Arms::Scattered,
+        rafts: vec![],
         bg: 0x1a2030,
         trap: None,
         ambient: [0.09, 0.10, 0.16],
@@ -587,6 +616,8 @@ fn keep() -> LevelDef {
         kill_y: -8.0,
         art: vec![],
         training: false,
+        arms: Arms::Scattered,
+        rafts: vec![],
         bg: 0x161a26,
         trap: None,
         ambient: [0.15, 0.14, 0.17],
@@ -753,6 +784,8 @@ fn gauntlet() -> LevelDef {
         max: v(45.0, 17.0),
         kill_y: -12.0,
         training: false,
+        arms: Arms::Scattered,
+        rafts: vec![],
         bg: 0x1d2028,
         // the flood: the lever on the left tower, the hatch over the open
         // floor. Online, a rollback runs up to 8 steps in one tick, so it's
@@ -845,6 +878,8 @@ fn training_yard() -> LevelDef {
         kill_y: -10.0,
         art: vec![],
         training: true,
+        arms: Arms::Scattered,
+        rafts: vec![],
         bg: 0x3a4152,
         // up on the chimney, where the rope course starts: a lever that
         // opens a hatch in the ceiling over the yard and floods it (the
@@ -860,361 +895,146 @@ fn training_yard() -> LevelDef {
     }
 }
 
-/// One of the kit's 9-slice sets: 1 m fill tiles, 0.25 m edges and corners.
-struct NineSlice {
-    fill: &'static str,
-    alt: &'static str,
-    top: &'static str,
-    bottom: &'static str,
-    left: &'static str,
-    right: &'static str,
-    tl: &'static str,
-    tr: &'static str,
-    bl: &'static str,
-    br: &'static str,
+/// The rope course's platforms: how many, the middle of the first, how far
+/// apart, half their width, and their tops; and the two ropes in each gap
+/// between them, hung from the ceiling: how far in from each platform's
+/// edge, and how long. (Spaced like the practice course, which is crossed
+/// in `practice_rope_course_can_be_crossed`: 5.5-6 m between ropes, the
+/// first 3 m out from the platform, ropes 6.2-7.5 m long off an 18 m
+/// ceiling with the platform tops at 10.4.)
+pub const ROPE_PLATFORMS: usize = 8;
+pub const ROPE_FIRST: f32 = -59.5;
+pub const ROPE_PITCH: f32 = 17.0;
+pub const ROPE_HALF: f32 = 3.0;
+pub const ROPE_TOP: f32 = 10.42;
+pub const ROPE_IN: f32 = 2.75;
+pub const ROPE_LEN: f32 = 7.0;
+const ROPE_CEILING: f32 = 18.0;
+
+/// Where platform `k` of the rope course is (the middle of its top).
+pub fn rope_platform(k: usize) -> Vec2 {
+    v(ROPE_FIRST + k as f32 * ROPE_PITCH, ROPE_TOP)
 }
 
-const STONE_SET: NineSlice = NineSlice {
-    fill: "stone_fill",
-    alt: "stone_fill_alt",
-    top: "stone_edge_top",
-    bottom: "stone_edge_bottom",
-    left: "stone_edge_left",
-    right: "stone_edge_right",
-    tl: "stone_corner_tl",
-    tr: "stone_corner_tr",
-    bl: "stone_corner_bl",
-    br: "stone_corner_br",
-};
-
-const STEEL_SET: NineSlice = NineSlice {
-    fill: "steel_fill",
-    alt: "steel_fill_alt",
-    top: "steel_edge_top",
-    bottom: "steel_edge_bottom",
-    left: "steel_edge_left",
-    right: "steel_edge_right",
-    tl: "steel_corner_tl",
-    tr: "steel_corner_tr",
-    bl: "steel_corner_bl",
-    br: "steel_corner_br",
-};
-
-/// Lays out level art from the kit's pieces, in metres (the kit is 256 px
-/// per metre). Tiles repeat from the bottom-left; the last row and column
-/// are cut short rather than squashed.
-struct Kit {
-    art: Vec<ArtDef>,
-    layer: ArtLayer,
-}
-
-impl Kit {
-    fn put(&mut self, piece: &'static str, min: Vec2, size: Vec2, crop: [f32; 4]) {
-        self.art.push(ArtDef { piece, min, size, crop, layer: self.layer });
-    }
-
-    fn piece(&mut self, piece: &'static str, min: Vec2, size: Vec2) {
-        self.put(piece, min, size, [0.0, 0.0, 1.0, 1.0]);
-    }
-
-    /// `tile` repeated from x0 to x1 with its bottom at `y`.
-    fn row(&mut self, piece: &'static str, x0: f32, x1: f32, y: f32, tile: Vec2) {
-        let mut x = x0;
-        while x < x1 - 1e-4 {
-            let w = (x1 - x).min(tile.x);
-            self.put(piece, v(x, y), v(w, tile.y), [0.0, 0.0, w / tile.x, 1.0]);
-            x += tile.x;
-        }
-    }
-
-    /// `tile` repeated up from y0 to y1 with its left side at `x`.
-    fn column(&mut self, piece: &'static str, x: f32, y0: f32, y1: f32, tile: Vec2) {
-        let mut y = y0;
-        while y < y1 - 1e-4 {
-            let h = (y1 - y).min(tile.y);
-            self.put(piece, v(x, y), v(tile.x, h), [0.0, 1.0 - h / tile.y, 1.0, 1.0]);
-            y += tile.y;
-        }
-    }
-
-    /// Square tiles over min..max, an `alt` one now and then to break up
-    /// the repeats.
-    fn fill(&mut self, piece: &'static str, alt: &'static str, min: Vec2, max: Vec2, tile: f32) {
-        let (mut j, mut y) = (0, min.y);
-        while y < max.y - 1e-4 {
-            let h = (max.y - y).min(tile);
-            let (mut i, mut x) = (0, min.x);
-            while x < max.x - 1e-4 {
-                let w = (max.x - x).min(tile);
-                let pick = if (i * 7 + j * 3) % 5 == 2 { alt } else { piece };
-                self.put(pick, v(x, y), v(w, h), [0.0, 1.0 - h / tile, w / tile, 1.0]);
-                x += tile;
-                i += 1;
-            }
-            y += tile;
-            j += 1;
-        }
-    }
-
-    /// A solid block over min..max from a 9-slice set.
-    fn block(&mut self, set: &NineSlice, min: Vec2, max: Vec2) {
-        let e = 0.25;
-        let c = v(e, e);
-        self.piece(set.bl, min, c);
-        self.piece(set.br, v(max.x - e, min.y), c);
-        self.piece(set.tl, v(min.x, max.y - e), c);
-        self.piece(set.tr, v(max.x - e, max.y - e), c);
-        self.row(set.bottom, min.x + e, max.x - e, min.y, v(1.0, e));
-        self.row(set.top, min.x + e, max.x - e, max.y - e, v(1.0, e));
-        self.column(set.left, min.x, min.y + e, max.y - e, v(e, 1.0));
-        self.column(set.right, max.x - e, min.y + e, max.y - e, v(e, 1.0));
-        self.fill(set.fill, set.alt, min + c, max - c, 1.0);
-    }
-
-    /// A 0.5 m thick wooden ledge from x0 to x1 with its top at `top`.
-    fn ledge(&mut self, x0: f32, x1: f32, top: f32) {
-        let y = top - 0.5;
-        self.piece("platform_cap_left", v(x0, y), v(0.25, 0.5));
-        self.row("platform_tile", x0 + 0.25, x1 - 0.25, y, v(1.0, 0.5));
-        self.piece("platform_cap_right", v(x1 - 0.25, y), v(0.25, 0.5));
-    }
-
-    /// A stone column (0.625 m wide) centred on `cx`, from y0 up to y1.
-    fn pillar(&mut self, cx: f32, y0: f32, y1: f32) {
-        let x = cx - 0.3125;
-        self.piece("pillar_base", v(x, y0), v(0.625, 0.25));
-        self.column("pillar_tile", x, y0 + 0.25, y1 - 0.25, v(0.625, 1.0));
-        self.piece("pillar_cap", v(x, y1 - 0.25), v(0.625, 0.25));
-    }
-}
-
-/// A practice yard built from the HD level kit, for trying the art in game:
-/// steel towers at either end, stone floors either side of a sunken acid
-/// pit with a ledge over it, columns, crates and a brick back wall.
-fn art_test() -> LevelDef {
-    // (a box from its corners)
-    let r = |x0: f32, y0: f32, x1: f32, y1: f32, color: u32| b((x0 + x1) * 0.5, (y0 + y1) * 0.5, (x1 - x0) * 0.5, (y1 - y0) * 0.5, color);
-    let boxes = vec![
-        r(-15.0, -4.5, -14.0, 12.5, STONE),
-        r(14.0, -4.5, 15.0, 12.5, STONE),
-        r(-14.0, -4.5, -11.0, 4.0, STEEL),
-        r(11.0, -4.5, 14.0, 4.0, STEEL),
-        r(-11.0, -4.5, -2.5, 0.0, STONE),
-        r(2.5, -4.5, 11.0, 0.0, STONE),
-        r(-2.5, -4.5, 2.5, -3.0, STONE),
-        // the ledge over the pit, and one off each tower
-        r(-1.75, 2.0, 1.75, 2.5, WOODC),
-        r(-11.0, 3.5, -7.0, 4.0, WOODC),
-        r(7.0, 3.5, 11.0, 4.0, WOODC),
-        // columns and crates
-        r(-5.3125, 0.0, -4.6875, 3.0, STONE),
-        r(4.6875, 0.0, 5.3125, 3.0, STONE),
-        r(-9.5, 0.0, -8.5, 1.0, WOODC),
-        r(-9.25, 1.0, -8.75, 1.5, WOODC),
-        r(6.5, 0.0, 7.5, 1.0, WOODC),
+/// The rope course: eight platforms high up in a row over a drop nobody
+/// comes back from, one for each fighter with a weapon on it, and nothing
+/// between them but ropes hung from the ceiling, two in each gap.
+fn rope_course() -> LevelDef {
+    let n = ROPE_PLATFORMS;
+    let left = rope_platform(0).x - ROPE_HALF - 4.0;
+    let right = rope_platform(n - 1).x + ROPE_HALF + 4.0;
+    let mut boxes = vec![
+        // the ceiling the ropes hang from
+        b(0.0, ROPE_CEILING + 0.5, right, 0.5, STONE),
     ];
-
-    let mut k = Kit { art: Vec::new(), layer: ArtLayer::Back };
-    // the back wall: 2 m brick tiles, with lit windows in three of them
-    let (mut y, mut j) = (-4.0f32, 0);
-    while y < 12.5 {
-        let mut x = -15.0f32;
-        while x < 15.0 {
-            let window = j == 5 && [-9.0, -1.0, 7.0].contains(&x);
-            k.piece(if window { "bg_window" } else { "bg_brick" }, v(x, y), v(2.0, 2.0));
-            x += 2.0;
+    let mut ropes = Vec::new();
+    for k in 0..n {
+        let c = rope_platform(k);
+        boxes.push(platform(c.x, c.y - 0.22, ROPE_HALF, STEEL));
+        if k + 1 < n {
+            let (a, z) = (c.x + ROPE_HALF + ROPE_IN, rope_platform(k + 1).x - ROPE_HALF - ROPE_IN);
+            ropes.push(rope(a, ROPE_CEILING, ROPE_LEN));
+            ropes.push(rope(z, ROPE_CEILING, ROPE_LEN));
         }
-        y += 2.0;
-        j += 1;
     }
-    k.piece("bg_support", v(-4.5, 0.0), v(2.0, 2.0));
-    k.piece("bg_support", v(2.5, 0.0), v(2.0, 2.0));
-
-    k.layer = ArtLayer::Solid;
-    k.block(&STONE_SET, v(-15.0, -4.5), v(-14.0, 12.5));
-    k.block(&STONE_SET, v(14.0, -4.5), v(15.0, 12.5));
-    k.block(&STEEL_SET, v(-14.0, -4.5), v(-11.0, 4.0));
-    k.block(&STEEL_SET, v(11.0, -4.5), v(14.0, 4.0));
-    k.row("trim_hazard", -14.0, -11.0, 2.0, v(1.0, 0.25));
-    k.row("trim_hazard", 11.0, 14.0, 2.0, v(1.0, 0.25));
-    k.block(&STONE_SET, v(-11.0, -4.5), v(-2.5, 0.0));
-    k.block(&STONE_SET, v(2.5, -4.5), v(11.0, 0.0));
-    k.block(&STONE_SET, v(-2.5, -4.5), v(2.5, -3.0));
-    k.ledge(-1.75, 1.75, 2.5);
-    k.ledge(-11.0, -7.0, 4.0);
-    k.ledge(7.0, 11.0, 4.0);
-    k.row("railing_tile", -11.0, -7.0, 4.0, v(1.0, 0.25));
-    k.row("railing_tile", 7.0, 11.0, 4.0, v(1.0, 0.25));
-    k.pillar(-5.0, 0.0, 3.0);
-    k.pillar(5.0, 0.0, 3.0);
-    k.piece("crate_1m", v(-9.5, 0.0), v(1.0, 1.0));
-    k.piece("crate_05m", v(-9.25, 1.0), v(0.5, 0.5));
-    k.piece("crate_1m", v(6.5, 0.0), v(1.0, 1.0));
-    // (the barrel's art stands 14 px up from the bottom of its canvas)
-    k.piece("barrel", v(-7.7, -14.0 / 256.0), v(0.75, 1.0));
-    k.row("spike_strip", 9.0, 11.0, 0.0, v(1.0, 0.375));
-
-    // (the acid itself is drawn by the liquid shader, over whoever's in it)
-
+    // the back wall: plain and dark, darker still down in the drop
+    let mut decor = vec![d(0.0, 8.0, right, 11.0, 0x232733, 0.0), d(0.0, -1.0, right, 4.0, 0x15171d, 0.0)];
+    for k in 0..n {
+        let c = rope_platform(k);
+        // a strut under each platform, down into the dark
+        decor.push(d(c.x, c.y - 4.0, 0.25, 3.8, 0x2b303c, 0.0));
+        // a stripe along its front
+        decor.push(front(d(c.x, c.y - 0.3, ROPE_HALF - 0.1, 0.06, 0xd8a530, 0.0)));
+    }
+    // (in turn from the middle out, so a few fighters start a gap or two
+    // apart; in teams, one team fills them from the left and the other the right)
+    let order = [3usize, 4, 2, 5, 1, 6, 0, 7];
+    let spawns: Vec<Vec2> = order.iter().map(|&k| rope_platform(k) + v(0.0, 1.6)).collect();
+    let mut lights = vec![light(0.0, 24.0, 90.0, 0xd8e0ff, 0.55)];
+    for k in (0..n).step_by(2) {
+        let x = (rope_platform(k).x + rope_platform(k + 1).x) * 0.5;
+        lights.push(LightDef { spot: Some((v(0.0, -1.0), 0.9)), fixture: true, ..light(x, ROPE_CEILING - 0.3, 22.0, 0xfff4e0, 0.9) });
+    }
     LevelDef {
-        name: "Art Test",
+        name: "Rope Course",
         boxes,
         lamps: vec![],
-        ropes: vec![rope(0.0, 12.0, 5.5)],
-        hazards: vec![spikes(10.0, 0.19, 1.0, 0.19), acid(0.0, -2.375, 2.5, 0.625)],
+        ropes,
+        hazards: vec![],
         balls: vec![],
-        lights: vec![
-            light(0.0, 14.0, 40.0, 0xfff2e0, 0.25),
-            light(-8.0, 7.0, 7.0, 0xffcf70, 0.35),
-            light(0.0, 7.0, 7.0, 0xffcf70, 0.35),
-            light(8.0, 7.0, 7.0, 0xffcf70, 0.35),
-        ],
-        decor: vec![],
-        art: k.art,
-        spawns: vec![v(-6.5, 1.5), v(3.5, 1.5), v(-3.5, 1.5), v(8.2, 1.5)],
-        // the rack: one of each weapon along both floors
-        weapon_spawns: [-8.1, -6.3, -5.9, -4.1, -3.3, 3.3, 4.1, 5.9, 8.1, 9.5].iter().map(|&x| v(x, 0.4)).collect(),
-        min: v(-15.0, -4.5),
-        max: v(15.0, 12.5),
-        kill_y: -10.0,
-        training: true,
-        bg: 0x1d1a24,
-        trap: None,
-        ambient: [0.62, 0.6, 0.64],
-    }
-}
-
-/// A four-player arena built from the HD level kit (about 46 × 20 m): a
-/// steel tower and spikes on the left, a sunken bowl with a steel stage in
-/// the middle under a platform and two ropes, an acid pit with a bridge and a
-/// taller tower on the right, and walkways up high under a low stone ceiling.
-fn brickworks() -> LevelDef {
-    let r = |x0: f32, y0: f32, x1: f32, y1: f32, color: u32| b((x0 + x1) * 0.5, (y0 + y1) * 0.5, (x1 - x0) * 0.5, (y1 - y0) * 0.5, color);
-    let bottom = -5.5;
-    let boxes = vec![
-        // walls and ceiling
-        r(-23.0, bottom, -22.0, 14.5, STONE),
-        r(22.0, bottom, 23.0, 14.5, STONE),
-        r(-22.0, 13.5, 22.0, 14.5, STONE),
-        // left: tower, floor, its ledge, crates, a column
-        r(-22.0, bottom, -17.0, 6.0, STEEL),
-        r(-17.0, bottom, -7.0, 0.0, STONE),
-        r(-17.0, 5.5, -13.0, 6.0, WOODC),
-        r(-12.0, 0.0, -11.0, 1.0, WOODC),
-        r(-11.0, 0.0, -10.5, 0.5, WOODC),
-        r(-8.3125, 0.0, -7.6875, 3.5, STONE),
-        // middle: the bowl, its stage, the platform over it, the walkways
-        r(-7.0, bottom, 7.0, -1.5, STONE),
-        r(-2.5, -1.5, 2.5, 0.5, STEEL),
-        r(-3.5, 3.5, 3.5, 4.0, WOODC),
-        r(-13.0, 7.5, -6.0, 8.0, WOODC),
-        r(6.0, 7.5, 12.0, 8.0, WOODC),
-        // right: floor, column, crate, the acid pit and its bridge, the tower
-        r(7.0, bottom, 12.0, 0.0, STONE),
-        r(10.1875, 0.0, 10.8125, 3.5, STONE),
-        r(8.0, 0.0, 9.0, 1.0, WOODC),
-        r(12.0, bottom, 16.0, -3.0, STONE),
-        r(12.0, 1.5, 16.0, 2.0, WOODC),
-        r(16.0, bottom, 17.0, 0.0, STONE),
-        r(17.0, bottom, 22.0, 8.0, STEEL),
-        r(13.0, 7.5, 17.0, 8.0, WOODC),
-    ];
-
-    let mut k = Kit { art: Vec::new(), layer: ArtLayer::Back };
-    // the back wall: 2 m brick tiles, lit windows along the upper level
-    let (mut y, mut j) = (bottom, 0);
-    while y < 14.5 {
-        let mut x = -23.0f32;
-        while x < 23.0 {
-            let window = j == 8 && [-17.0, -9.0, -1.0, 7.0, 15.0].contains(&x);
-            k.piece(if window { "bg_window" } else { "bg_brick" }, v(x, y), v(2.0, 2.0));
-            x += 2.0;
-        }
-        y += 2.0;
-        j += 1;
-    }
-    for x in [-6.5, 4.5] {
-        k.piece("bg_support", v(x, -1.5), v(2.0, 2.0));
-    }
-    k.piece("bg_support", v(-15.0, 6.0), v(2.0, 2.0));
-    k.piece("bg_support", v(13.5, 8.0), v(2.0, 2.0));
-
-    k.layer = ArtLayer::Solid;
-    k.block(&STONE_SET, v(-23.0, bottom), v(-22.0, 14.5));
-    k.block(&STONE_SET, v(22.0, bottom), v(23.0, 14.5));
-    k.block(&STONE_SET, v(-22.0, 13.5), v(22.0, 14.5));
-    k.block(&STEEL_SET, v(-22.0, bottom), v(-17.0, 6.0));
-    k.row("trim_hazard", -22.0, -17.0, 3.0, v(1.0, 0.25));
-    k.block(&STONE_SET, v(-17.0, bottom), v(-7.0, 0.0));
-    k.ledge(-17.0, -13.0, 6.0);
-    k.row("railing_tile", -17.0, -13.0, 6.0, v(1.0, 0.25));
-    k.row("spike_strip", -16.0, -14.0, 0.0, v(1.0, 0.375));
-    k.piece("crate_1m", v(-12.0, 0.0), v(1.0, 1.0));
-    k.piece("crate_05m", v(-11.0, 0.0), v(0.5, 0.5));
-    k.piece("barrel", v(-10.2, -14.0 / 256.0), v(0.75, 1.0));
-    k.pillar(-8.0, 0.0, 3.5);
-
-    k.block(&STONE_SET, v(-7.0, bottom), v(7.0, -1.5));
-    k.block(&STEEL_SET, v(-2.5, -1.5), v(2.5, 0.5));
-    k.ledge(-3.5, 3.5, 4.0);
-    k.row("railing_tile", -3.5, 3.5, 4.0, v(1.0, 0.25));
-    k.ledge(-13.0, -6.0, 8.0);
-    k.ledge(6.0, 12.0, 8.0);
-    k.row("railing_tile", -13.0, -6.0, 8.0, v(1.0, 0.25));
-    k.row("railing_tile", 6.0, 12.0, 8.0, v(1.0, 0.25));
-
-    k.block(&STONE_SET, v(7.0, bottom), v(12.0, 0.0));
-    k.pillar(10.5, 0.0, 3.5);
-    k.piece("crate_1m", v(8.0, 0.0), v(1.0, 1.0));
-    k.piece("barrel", v(11.1, -14.0 / 256.0), v(0.75, 1.0));
-    k.block(&STONE_SET, v(12.0, bottom), v(16.0, -3.0));
-    k.ledge(12.0, 16.0, 2.0);
-    k.block(&STONE_SET, v(16.0, bottom), v(17.0, 0.0));
-    k.block(&STEEL_SET, v(17.0, bottom), v(22.0, 8.0));
-    k.row("trim_hazard", 17.0, 22.0, 4.0, v(1.0, 0.25));
-    k.ledge(13.0, 17.0, 8.0);
-    k.row("railing_tile", 13.0, 17.0, 8.0, v(1.0, 0.25));
-
-    // (the acid itself is drawn by the liquid shader, over whoever's in it)
-
-    LevelDef {
-        name: "Brickworks",
-        boxes,
-        lamps: vec![],
-        ropes: vec![rope(-4.5, 13.5, 5.0), rope(4.5, 13.5, 5.0)],
-        hazards: vec![spikes(-15.0, 0.19, 1.0, 0.19), acid(14.0, -2.375, 2.0, 0.625)],
-        balls: vec![],
-        lights: vec![
-            light(0.0, 13.0, 40.0, 0xfff2e0, 0.3),
-            light(-16.0, 11.5, 8.0, 0xffcf70, 0.4),
-            light(-8.0, 11.5, 8.0, 0xffcf70, 0.4),
-            light(0.0, 11.5, 8.0, 0xffcf70, 0.4),
-            light(8.0, 11.5, 8.0, 0xffcf70, 0.4),
-            light(16.0, 11.5, 8.0, 0xffcf70, 0.4),
-        ],
-        decor: vec![],
-        art: k.art,
-        spawns: vec![v(-13.0, 1.5), v(9.6, 1.5), v(-4.5, 0.0), v(4.5, 0.0)],
-        weapon_spawns: vec![
-            v(-19.5, 6.4),
-            v(-15.0, 6.4),
-            v(-9.4, 0.4),
-            v(-5.0, -1.1),
-            v(0.0, 0.9),
-            v(5.0, -1.1),
-            v(0.0, 4.4),
-            v(-9.5, 8.4),
-            v(9.0, 8.4),
-            v(14.0, 2.4),
-            v(15.0, 8.4),
-            v(19.5, 8.4),
-        ],
-        min: v(-23.0, bottom),
-        max: v(23.0, 14.5),
-        kill_y: -12.0,
+        lights,
+        decor,
+        art: vec![],
+        weapon_spawns: spawns.clone(),
+        spawns,
+        min: v(left, -5.0),
+        max: v(right, ROPE_CEILING + 1.0),
+        kill_y: -3.0,
         training: false,
-        bg: 0x1d1a24,
+        arms: Arms::OneEach,
+        rafts: vec![],
+        bg: 0x161922,
         trap: None,
-        ambient: [0.62, 0.6, 0.64],
+        ambient: [0.2, 0.21, 0.26],
+    }
+}
+
+/// Open water's sea: (left, right, bottom, surface). As big as the sim can
+/// keep up with online: 56 x 2.2 m measured 8388 drops at 2.44 ms a step
+/// still (`measure_ocean_cost`; 60 x 2.5 m jumped to 5.19 ms), against the
+/// Gauntlet's 2.28 ms with eight fighters.
+pub const SEA_WATER: (f32, f32, f32, f32) = (-28.0, 28.0, -2.2, 0.0);
+/// Where the rafts are moored, and their half size (2.4 x 0.3 m).
+pub const SEA_RAFTS: [f32; 6] = [-20.0, -12.0, -4.0, 4.0, 12.0, 20.0];
+pub const RAFT_HALF: Vec2 = Vec2::new(1.2, 0.15);
+
+/// Open water: a sea between two rocky ledges, small rafts bobbing on it,
+/// and no weapons at all: bare hands, on the rafts or in the water.
+fn open_water() -> LevelDef {
+    let (x0, x1, bottom, surface) = SEA_WATER;
+    let r = |x0: f32, y0: f32, x1: f32, y1: f32, color: u32| b((x0 + x1) * 0.5, (y0 + y1) * 0.5, (x1 - x0) * 0.5, (y1 - y0) * 0.5, color);
+    let rock = 0x3d3a36;
+    let sand = 0x4a4436;
+    let boxes = vec![
+        // the seabed, and a rocky ledge at either end to climb out onto
+        r(x0, -6.0, x1, bottom, sand),
+        r(x0 - 6.0, -6.0, x0, 1.2, rock),
+        r(x1, -6.0, x1 + 6.0, 1.2, rock),
+        // cliffs behind them
+        r(x0 - 8.0, -6.0, x0 - 6.0, 12.0, rock),
+        r(x1 + 6.0, -6.0, x1 + 8.0, 12.0, rock),
+    ];
+    let sea = (bottom, surface);
+    let rafts: Vec<RaftDef> = SEA_RAFTS.iter().map(|&x| RaftDef { x, half: RAFT_HALF, sea }).collect();
+    // the sky: plain, a little lighter toward the horizon; far headlands
+    let decor = vec![
+        d(0.0, 6.0, x1 + 8.0, 6.0, 0x1f2a3b, 0.0),
+        d(0.0, 1.0, x1 + 8.0, 1.0, 0x283547, 0.0),
+        d(-14.0, 0.6, 7.0, 0.6, 0x232e3d, 0.0),
+        d(17.0, 0.4, 5.0, 0.4, 0x232e3d, 0.0),
+    ];
+    // (on the rafts from the middle out, then the ledges)
+    let spawns = vec![v(-4.0, 1.6), v(4.0, 1.6), v(-12.0, 1.6), v(12.0, 1.6), v(-20.0, 1.6), v(20.0, 1.6), v(x0 - 3.0, 2.8), v(x1 + 3.0, 2.8)];
+    LevelDef {
+        name: "Open Water",
+        boxes,
+        lamps: vec![],
+        ropes: vec![],
+        hazards: vec![pool(HazardKind::Water, x0, x1, bottom, surface)],
+        balls: vec![],
+        lights: vec![light(-10.0, 30.0, 80.0, 0xdfe8ff, 0.9), light(18.0, 14.0, 30.0, 0xffe2b8, 0.4)],
+        decor,
+        art: vec![],
+        weapon_spawns: spawns.clone(),
+        spawns,
+        min: v(x0 - 7.0, -5.0),
+        max: v(x1 + 7.0, 12.0),
+        kill_y: -9.0,
+        training: false,
+        arms: Arms::BareHands,
+        rafts,
+        bg: 0x1a2230,
+        trap: None,
+        ambient: [0.3, 0.32, 0.38],
     }
 }

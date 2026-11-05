@@ -152,6 +152,39 @@ pub fn bot_input(s: &GameState, me: usize) -> u32 {
             bits |= JUMP;
         }
     }
+    // whatever else it wants: never off an edge into a drop with nothing
+    // under it all the way down (the rope course's gaps), unless there's
+    // somewhere to land within a jump
+    if bits & (LEFT | RIGHT) != 0 && f.grounded {
+        let way = if bits & RIGHT != 0 { 1.0 } else { -1.0 };
+        let depth = (my.y - s.kill_y).max(0.0) + 1.0;
+        let bottomless = w.raycast(Vec2::new(my.x + way * 0.9, my.y + 0.2), Vec2::NEG_Y, depth).is_none();
+        let landing = (2..=10).any(|k| w.raycast(Vec2::new(my.x + way * (0.5 * k as f32 + 0.7), my.y + 2.2), Vec2::NEG_Y, 4.5).is_some());
+        if bottomless && !landing {
+            bits &= !(LEFT | RIGHT | JUMP);
+        }
+    }
+    // in the air: not off over such a drop, and if already over one, back
+    // toward the nearest floor
+    if !f.grounded {
+        let depth = (my.y - s.kill_y).max(0.0) + 1.0;
+        let floor_under = |x: f32| w.raycast(Vec2::new(x, my.y), Vec2::NEG_Y, depth).is_some();
+        // where they'll come down, going as they are (no braking in the air)
+        let v = f.body_vel(w);
+        let g = -w.cfg.gravity.y;
+        let fall = w.raycast(my, Vec2::NEG_Y, depth).map_or(depth, |h| h.t);
+        let t = (v.y + (v.y * v.y + 2.0 * g * fall).sqrt()) / g;
+        let lands = my.x + v.x * t;
+        let way = if bits & RIGHT != 0 { 1.0 } else { -1.0 };
+        if !floor_under(lands) {
+            // heading off over the drop: back toward the floor nearest that
+            if let Some(dx) = (1..=16).flat_map(|k| [k as f32 * 0.5, -(k as f32) * 0.5]).find(|&dx| floor_under(lands + dx)) {
+                bits = (bits & !(LEFT | RIGHT)) | if dx > 0.0 { RIGHT } else { LEFT };
+            }
+        } else if bits & (LEFT | RIGHT) != 0 && !floor_under(lands + way * 1.5) {
+            bits &= !(LEFT | RIGHT);
+        }
+    }
 
     // aim: point at the enemy's head and swing back and forth through it
     let mut aim = Vec2::new(dir * 0.6, 0.1);

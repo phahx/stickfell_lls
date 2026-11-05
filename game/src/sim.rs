@@ -125,6 +125,9 @@ const GUN_KICK_UP: f32 = 3.5;
 /// How long (frames) said voice lines stay in `GameState::voice_log`: far
 /// longer than any wait for the other players' inputs.
 const VOICE_LOG_FRAMES: u32 = 600;
+/// How long (frames) other sounds stay in `GameState::sfx_log`: past the
+/// furthest a rollback reaches back (8 frames) and then some.
+const SFX_LOG_FRAMES: u32 = 16;
 /// How often a choking fighter tries another choking sound (frames).
 const CHOKE_EVERY: u32 = 20;
 /// How long a victim winces after being hurt mid-finisher (frames).
@@ -276,6 +279,8 @@ const FALL_DOWN_MAX: u16 = 110;
 /// Steam: from how thick (around the head) it scalds, and how hard at its
 /// thickest (health a second: at least 33 s to kill, time to get out).
 const SCALD_FROM: f32 = 0.3;
+/// Steam off a body cooking in lava, every fifth frame (cells' worth).
+const COOK_STEAM: f32 = 0.01;
 const SCALD_RATE: f32 = 3.0;
 /// A steam burst (water trapped under hot lava): how far it throws the
 /// liquid (m) and how fast at its middle (m/s); the steam it makes (cells'
@@ -316,6 +321,61 @@ const HAUL_ONTO: f32 = 0.4;
 const HAUL_LOSS: f32 = 1.2;
 /// The least time a haul out takes (s).
 const HAUL_TIME: f32 = 0.3;
+/// Rafts: how far below the water their bottom sits, how much lower each
+/// fighter on one puts it (m), how far it tips for each metre they stand
+/// off its middle (rad), the most it tips, how far off its ends it reads the
+/// water, its bob (m, rad/s), and how stiffly and how damped it follows.
+const RAFT_DRAFT: f32 = 0.12;
+const RAFT_SINK: f32 = 0.05;
+const RAFT_TILT: f32 = 0.08;
+const RAFT_MAX_TILT: f32 = 0.3;
+const RAFT_LOOK: f32 = 0.4;
+const RAFT_BOB: f32 = 0.05;
+const RAFT_BOB_RATE: f32 = 1.3;
+const RAFT_K: f32 = 6.0;
+const RAFT_DAMP: f32 = 5.0;
+/// A fluid sample this full of water is at its surface (measured over open
+/// water's sea: 0.38-0.49 at the highest drop, 0.48-0.59 0.1 m under it,
+/// 0.22-0.27 0.2 m over it).
+const WATER_EDGE: f32 = 0.45;
+/// Acid eats a part right away in this long, for as long as the part's
+/// touching it (s), and lava melts one to the bone in this long. Below
+/// `ROT_FROM` of it round a part (a stray drop), it isn't touching.
+const ACID_EAT_TIME: f32 = 6.0;
+const LAVA_MELT_TIME: f32 = 2.5;
+const ROT_FROM: f32 = 0.08;
+/// What a fluid sample reads with a part right in it (measured 0.39-0.44
+/// in the middle of an acid vat): taken as all of it in it.
+const SOAKED: f32 = 0.4;
+/// The most of a torso acid eats away (out of `fighter::ROT_FULL`).
+const TORSO_MOST: u16 = 52000;
+/// A part lava's touched burns this long after it's out (frames); each
+/// burning part costs the living FIRE_DPS health a second and chars them
+/// (`scorch`) FIRE_CHAR a second (all ten parts alight); a part well alight
+/// sets each part joined to it alight at FIRE_SPREAD a second; DOUSE of it
+/// in water puts it out.
+const FIRE_FRAMES: u16 = 360;
+const FIRE_DPS: f32 = 1.2;
+const FIRE_CHAR: f32 = 0.25;
+const FIRE_SPREAD: f32 = 0.8;
+const DOUSE: f32 = 0.25;
+/// The most a camera shakes.
+const SHAKE_MAX: f32 = 1.5;
+/// Broken bones: the chance a hard blunt blow (more than BREAK_DAMAGE, or
+/// knocked harder than BREAK_KNOCK) breaks the arm or leg bone it lands on,
+/// and the same chance a fall stopped BREAK_FALL_OVER m/s past the one that
+/// floors you breaks a leg.
+const BREAK_CHANCE: f32 = 0.1;
+const BREAK_DAMAGE: f32 = 14.0;
+const BREAK_KNOCK: f32 = 16.0;
+const BREAK_FALL_OVER: f32 = 3.0;
+/// Steam off a part put out (cells' worth: a wisp, well short of scalding).
+const DOUSE_STEAM: f32 = 0.04;
+/// Pulling up onto a ledge from hanging off it: how much faster than
+/// v = sqrt(2 g h) to go up, and the frames before you can grab or jump
+/// again (so a held grab doesn't catch the wall on the way up).
+const CLIMB_LOSS: f32 = 1.1;
+const CLIMB_FRAMES: u8 = 20;
 const SWIM_STEER: f32 = 6.0;
 const SWIM_BUOYANCY: f32 = 1.0;
 /// Treading water, how fast the bobbing dies away (1/s).
@@ -433,8 +493,22 @@ pub struct Noose {
     pub hang: f32,
 }
 
+/// A raft afloat: its level def, its box in the world, and how it's riding
+/// (height of its middle and how fast that's changing, tilt and its rate,
+/// and where it is in its bob).
+#[derive(Clone, Copy, Debug)]
+pub struct Raft {
+    pub def: crate::level::RaftDef,
+    pub statik: u32,
+    pub y: f32,
+    pub vy: f32,
+    pub tilt: f32,
+    pub spin: f32,
+    pub phase: f32,
+}
+
 /// Keys a blade lock can ask for: W A S D.
-pub const CLASH_KEYS: [u16; 4] = [JUMP, LEFT, CROUCH, RIGHT];
+pub const CLASH_KEYS: [u16; 4] = [UP, LEFT, CROUCH, RIGHT];
 pub const CLASH_KEY_NAMES: [&str; 4] = ["W", "A", "S", "D"];
 /// Points to win a blade lock.
 pub const CLASH_WIN: u8 = 3;
@@ -520,6 +594,12 @@ pub struct GameState {
     /// players hear a line once its frame is final, so everyone hears the
     /// same lines in the same order.
     pub voice_log: Vec<(u32, SfxEvent)>,
+    /// The other sounds of the last few frames, by frame (rolled back with
+    /// the rest): online, a frame re-run once someone's late input arrives
+    /// can have sounds the first run didn't (their gunshot, on the frame
+    /// they clicked), and only the newest frame's own would leave those
+    /// unheard (see `Audio::play_new`).
+    pub sfx_log: Vec<(u32, SfxEvent)>,
     /// Realistic joint limits on every fighter (always on in the game; the
     /// character lab can switch them off to compare).
     pub joint_limits: bool,
@@ -585,10 +665,14 @@ pub struct GameState {
     pub rng: Rng,
     pub scores: Vec<u16>,
     pub phase: Phase,
-    pub shake: f32,
+    /// Camera shake, per fighter: only the player it happened to (or who
+    /// did it) feels it.
+    pub shake: [f32; MAX_PLAYERS],
     next_drop: u32,
     punch_cd: Vec<u8>,
-    kill_y: f32,
+    pub(crate) kill_y: f32,
+    /// Rafts afloat this round.
+    pub rafts: Vec<Raft>,
     min: Vec2,
     max: Vec2,
 }
@@ -694,11 +778,13 @@ impl GameState {
             hits: Vec::new(),
             events: Vec::new(),
             voice_log: Vec::new(),
+            sfx_log: Vec::new(),
             rng: Rng::new(seed),
             scores: vec![0; num_players],
             phase: Phase::Fight,
-            shake: 0.0,
+            shake: [0.0; MAX_PLAYERS],
             next_drop: 0,
+            rafts: Vec::new(),
             punch_cd: vec![0; num_players],
             kill_y: -6.0,
             min: Vec2::ZERO,
@@ -717,6 +803,13 @@ impl GameState {
         }
         for h in &lv.hazards {
             Self::add_spike_statics(&mut w, h);
+        }
+        // rafts: a box each, floated on the water every step (`float_rafts`)
+        self.rafts.clear();
+        for (i, rd) in lv.rafts.iter().enumerate() {
+            let y = rd.sea.1 - RAFT_DRAFT + rd.half.y;
+            let statik = w.add_static(Obb::new(Vec2::new(rd.x, y), rd.half, 0.0).with_friction(0.9));
+            self.rafts.push(Raft { def: *rd, statik, y, vy: 0.0, tilt: 0.0, spin: 0.0, phase: i as f32 * 1.7 });
         }
         self.lamps.clear();
         for (i, ld) in lv.lamps.iter().enumerate() {
@@ -799,7 +892,14 @@ impl GameState {
             for (k, &def) in RACK.iter().enumerate() {
                 self.spawn_loose_weapon(def, lv.weapon_spawns[k % lv.weapon_spawns.len()]);
             }
-        } else {
+        } else if lv.arms == crate::level::Arms::OneEach {
+            // one where each fighter starts
+            for id in 0..self.fighters.len() {
+                let def = DROPS[self.rng.next_u32() as usize % DROPS.len()];
+                let at = self.spawn_point(&lv, id);
+                self.spawn_loose_weapon(def, at + Vec2::new(0.6, -0.6));
+            }
+        } else if lv.arms == crate::level::Arms::Scattered {
             let n = (self.num_players + 3).min(lv.weapon_spawns.len());
             let mut used = Vec::new();
             while used.len() < n {
@@ -827,7 +927,7 @@ impl GameState {
         self.round += 1;
     }
 
-    fn spawn_weapon(&mut self, def: u8, pos: Vec2) {
+    pub(crate) fn spawn_weapon(&mut self, def: u8, pos: Vec2) {
         let idx = self.weapons.len();
         let angle = self.rng.range(-0.3, 0.3);
         let w = Weapon::spawn(&mut self.world, def, idx, pos, angle);
@@ -1066,6 +1166,12 @@ impl GameState {
                     self.world.segments[(w.seg_base + k as u32) as usize].radius = segs[segs.len() - 1 - k].radius;
                 }
                 let leg = matches!(root, fighter::S_THIGH_A | fighter::S_THIGH_B);
+                // (what acid and lava have done to it comes off with it: the
+                // least-eaten part is what's left to go)
+                let body = &self.fighters[fi];
+                w.eaten = parts.iter().map(|&p| body.eaten[p as usize]).min().unwrap_or(0);
+                w.melted = parts.iter().map(|&p| body.melted[p as usize]).min().unwrap_or(0);
+                w.fire = parts.iter().map(|&p| body.fire[p as usize]).max().unwrap_or(0);
                 w.limb = Some(match (parts.len(), leg) {
                     (2, false) => crate::weapon::LimbKind::Arm,
                     (2, true) => crate::weapon::LimbKind::Leg,
@@ -1337,7 +1443,8 @@ impl GameState {
                     for k in 0..fighter::BONES.len() as u32 {
                         self.world.segments[(vf.seg_base + k) as usize].ignore_group = fi as u16 + 1;
                     }
-                    self.shake = 1.2;
+                    self.shake_camera(fi, 1.2);
+                    self.shake_camera(v, 1.2);
                     self.events.push(Sfx::HitHeavy.at(centre).vol(1.2));
                     self.events.push(Sfx::SwingHeavy.at(centre).vol(1.5));
                 }
@@ -1627,11 +1734,28 @@ impl GameState {
         }
         let f = &self.fighters[fi];
         if f.grabbing && f.grab_static && f.pressed(JUMP) {
-            // pull up off a ledge, or leap off a rope (keeping the swing)
+            // pull up over a ledge in reach (the way you're pushing, or
+            // facing) and onto it; off a sheer wall, a hop up it; off a rope,
+            // a leap (keeping the swing)
             let on_rope = self.world.distances[f.tether as usize].enabled;
+            let toward = if f.held(RIGHT) != f.held(LEFT) { if f.held(RIGHT) { 1.0 } else { -1.0 } } else { f.facing };
+            let lip = if on_rope { None } else { self.ledge_ahead(fi, toward) };
             self.release_grab(fi);
             let ids = self.fighters[fi].particle_ids();
-            self.world.add_velocity(ids, Vec2::new(0.0, if on_rope { 6.5 } else { 9.5 }));
+            if let Some((edge, top)) = lip {
+                let v = self.haul_velocity(fi, edge, top, toward, CLIMB_LOSS);
+                for id in ids {
+                    self.world.particles[id as usize].vel = v;
+                }
+                let f = &mut self.fighters[fi];
+                // (no catching the wall again on the way up, and no cutting
+                // the climb short by letting go of jump)
+                f.grab_cd = CLIMB_FRAMES;
+                f.jump_cd = CLIMB_FRAMES;
+                f.facing = toward;
+            } else {
+                self.world.add_velocity(ids, Vec2::new(0.0, if on_rope { 6.5 } else { 9.5 }));
+            }
         }
         let f = &self.fighters[fi];
         if f.grabbing && f.held(CROUCH) && self.world.distances[f.tether as usize].enabled {
@@ -2021,6 +2145,35 @@ impl GameState {
         true
     }
 
+    /// Shakes fighter `fi`'s player's camera (nobody else's), up to
+    /// `SHAKE_MAX`.
+    fn shake_camera(&mut self, fi: usize, amount: f32) {
+        if let Some(k) = self.shake.get_mut(fi) {
+            *k = (*k + amount).min(SHAKE_MAX);
+        }
+    }
+
+    /// Breaks the bone of arm or leg part `part` (anything else: nothing): a
+    /// crack, a cry, and the limb goes limp; whatever the hand held, it lets go of.
+    fn break_bone(&mut self, fi: usize, part: u32, at: Vec2) {
+        let f = &self.fighters[fi];
+        if !(fighter::S_UPPER_A..=fighter::S_SHIN_B).contains(&part) || !f.has(part) || f.broken & fighter::bit(part) != 0 || f.limbs_gone & fighter::bit(part) != 0 {
+            return;
+        }
+        self.fighters[fi].broken |= fighter::bit(part);
+        if fighter::ARM_A_BITS & fighter::bit(part) != 0 {
+            self.release(fi, false);
+        }
+        if fighter::ARM_B_BITS & fighter::bit(part) != 0 {
+            self.release_grab(fi);
+        }
+        self.events.push(Sfx::HitBlunt.at(at).vol(1.3));
+        self.spawn_blood(at, Vec2::Y, 10, 3.0);
+        if self.fighters[fi].alive {
+            self.wince(fi);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// On the end of a tossed grapple, before it lands: untouchable.
     pub fn tossed(&self, fi: usize) -> bool {
@@ -2069,12 +2222,19 @@ impl GameState {
                 self.spawn_blood(point, dir, 16, 7.0);
             }
         }
+        // a hard enough blow (or slam) now and then breaks the bone it lands on
+        if !severed && kind == Kind::Blunt && (dmg > BREAK_DAMAGE || k > BREAK_KNOCK) && self.rng.f32() < BREAK_CHANCE {
+            self.break_bone(fi, part, point);
+        }
         let f = &self.fighters[fi];
         let lethal = was_alive && (f.health <= 0.0 || (severed && part == S_HEAD));
         if lethal {
             self.kill_fighter(fi);
         }
-        self.shake = (self.shake + dmg * 0.03).min(1.5);
+        self.shake_camera(fi, dmg * 0.03);
+        if let Some(a) = attacker {
+            self.shake_camera(a as usize, dmg * 0.015);
+        }
         self.hits.push(HitEvent { attacker, victim: fi as u8, point, damage: dmg, severed, lethal });
     }
 
@@ -2755,7 +2915,8 @@ impl GameState {
         self.fighters[v].choking = false;
         self.hits.push(HitEvent { attacker: Some(n.attacker), victim: n.victim, point: at, damage: 0.0, severed: false, lethal: true });
         self.finish_banner = Some((Finish::Hang, n.attacker, FINISH_BANNER));
-        self.shake = 0.8;
+        self.shake_camera(n.attacker as usize, 0.8);
+        self.shake_camera(v, 0.8);
         self.events.push(Sfx::Thud.at(at).vol(0.8));
         self.events.push(Sfx::ChokeEnd.at(at).line(0, n.victim));
     }
@@ -2896,7 +3057,8 @@ impl GameState {
             }
         }
         self.finish_banner = Some((x.mv, x.attacker, FINISH_BANNER));
-        self.shake = 1.5;
+        self.shake_camera(x.attacker as usize, 1.5);
+        self.shake_camera(x.victim as usize, 1.5);
         self.flash = 10;
         self.events.push(Sfx::Impale.at(chest).vol(1.8));
         self.spawn_blood(chest, dir, 30, 9.0);
@@ -2913,7 +3075,8 @@ impl GameState {
         self.force_skewer(wi, v, 0.95);
         self.wound(v, S_TORSO, chest, fighter::WoundKind::Stab, 0.05, Vec2::Y);
         self.finish_banner = Some((x.mv, x.attacker, FINISH_BANNER));
-        self.shake = 1.5;
+        self.shake_camera(x.attacker as usize, 1.5);
+        self.shake_camera(x.victim as usize, 1.5);
         self.flash = 10;
         self.events.push(Sfx::Impale.at(chest).vol(1.8));
         self.spawn_blood(chest, Vec2::Y, 28, 7.0);
@@ -2949,7 +3112,8 @@ impl GameState {
         self.weapons[wi].pinned = true;
         self.world.skewers[self.weapons[wi].skewer as usize].anchored = true;
         self.finish_banner = Some((x.mv, x.attacker, FINISH_BANNER));
-        self.shake = 1.5;
+        self.shake_camera(x.attacker as usize, 1.5);
+        self.shake_camera(x.victim as usize, 1.5);
         self.flash = 10;
         self.events.push(Sfx::Impale.at(chest).vol(1.8));
         self.events.push(Sfx::Embed.at(chest + axis * to_wall).vol(1.4));
@@ -2971,7 +3135,7 @@ impl GameState {
         let at = self.fighters[v].pos(&self.world, PELVIS);
         self.events.push(Sfx::HitHeavy.at(at).vol(1.6));
         self.events.push(Sfx::Thud.at(at).vol(1.4));
-        self.shake = 1.5;
+        self.shake_camera(v, 1.5);
     }
 
     /// The next limb a bare-handed finisher rips off (its elbow/knee), after
@@ -3109,11 +3273,13 @@ impl GameState {
             // the first one never kills
             self.fighters[v].health = self.fighters[v].health.max(alive.min(1.0));
             self.wince(v);
-            self.shake = (self.shake + 0.7).min(1.5);
+            self.shake_camera(x.attacker as usize, 0.7);
+            self.shake_camera(v, 0.7);
             return;
         }
         self.finish_banner = Some((x.mv, x.attacker, FINISH_BANNER));
-        self.shake = 1.5;
+        self.shake_camera(x.attacker as usize, 1.5);
+        self.shake_camera(x.victim as usize, 1.5);
         self.flash = 10;
         // flattened, then gone: nothing flies off, it bursts where it lies
         let fv = self.fighters[v].clone();
@@ -3168,7 +3334,8 @@ impl GameState {
             // one more limb gone (they're still alive for now)
             let from = self.fighters[a].pos(w, fighter::NECK);
             self.rip_limb(v, from);
-            self.shake = (self.shake + 0.6).min(1.5);
+            self.shake_camera(a, 0.6);
+            self.shake_camera(v, 0.6);
             self.wince(v);
             return;
         }
@@ -3192,7 +3359,8 @@ impl GameState {
             return;
         }
         self.finish_banner = Some((x.mv, x.attacker, FINISH_BANNER));
-        self.shake = 1.5;
+        self.shake_camera(x.attacker as usize, 1.5);
+        self.shake_camera(x.victim as usize, 1.5);
         self.flash = 10;
         let kill = |s: &mut Self, part: u32, at: Vec2, dir: Vec2, knock: f32, kind: Kind| {
             s.damage(v, part, 999.0, at, dir, knock, kind, att);
@@ -3804,7 +3972,7 @@ impl GameState {
         let vital = part == S_HEAD || (part == S_TORSO && s >= 0.5);
         if vital && down >= IMPALE_SPIKE_VITAL {
             self.spawn_blood(point, Vec2::Y, 16, 5.0);
-            self.shake = (self.shake + 0.8).min(1.5);
+            self.shake_camera(fi, 0.8);
             self.damage(fi, part, 999.0, point, Vec2::Y, 0.0, Kind::Spike, None);
         } else {
             self.damage(fi, part, SPIKE_IMPALE_DAMAGE + down * 2.0, point, Vec2::Y, 0.0, Kind::Spike, None);
@@ -3960,7 +4128,7 @@ impl GameState {
         }
         let mut gone = Vec::with_capacity(pairs.len());
         let mut burst: Option<Vec2> = None;
-        for (k, &(w, l)) in pairs.iter().enumerate() {
+        for &(w, l) in pairs.iter() {
             let at = self.fluid.drops[w].pos;
             let (lava_at, heat) = (self.fluid.drops[l].pos, 1.0 - self.fluid.drops[l].dye);
             // the lava's heat boils the water off (with less than a drop's
@@ -3984,10 +4152,6 @@ impl GameState {
             }
             gone.push(w);
             self.steam.add(at, crate::steam::STEAM_PER_DROP);
-            if k % 3 == 0 && self.sparks.len() < 320 {
-                let vel = Vec2::new(self.rng.range(-0.4, 0.4), self.rng.range(1.0, 2.0));
-                self.sparks.push(Spark { pos: at, vel, life: 50, max_life: 50, blood: false, tint: 0xe8e8e2, steam: true });
-            }
         }
         if self.frame % 16 == 0 {
             let at = self.fluid.drops[pairs[0].0].pos;
@@ -4043,15 +4207,228 @@ impl GameState {
             let vel = Vec2::new(self.rng.range(-3.0, 3.0), self.rng.range(1.5, 6.0));
             self.sparks.push(Spark { pos: at, vel, life: 26, max_life: 26, blood: false, tint: 0, steam: false });
         }
-        for _ in 0..10 {
-            if self.sparks.len() >= 320 {
-                break;
-            }
-            let vel = Vec2::new(self.rng.range(-1.2, 1.2), self.rng.range(1.0, 3.0));
-            self.sparks.push(Spark { pos: at, vel, life: 70, max_life: 70, blood: false, tint: 0xf0f0ea, steam: true });
-        }
         self.events.push(Sfx::HitHeavy.at(at).vol(1.5));
         self.events.push(Sfx::Splash.at(at).vol(1.4));
+    }
+
+    /// Acid and lava at work, part by part, on bodies (living or dead) and on
+    /// loose limbs: acid eats a part away for as long as it's touching it
+    /// until it's gone, an arm or leg dropping off
+    /// and the rest of it dissolving where it lies; lava melts the flesh off
+    /// down to the bone, and sets the part on fire. Fire burns on after
+    /// they're out (hurting the living, charring them), spreads along the
+    /// body, and goes out in water.
+    fn eat_and_burn(&mut self, dt: f32) {
+        use crate::liquid::{ACID_DROP, LAVA_DROP, WATER_DROP};
+        let full = fighter::ROT_FULL as f32;
+        let empty = self.fluid.drops.is_empty();
+        // (touching it at all, it's at work at full rate)
+        let gain = |time: f32, _amount: f32| (full * dt / time) as u32;
+        let mut sizzle: Vec<Vec2> = Vec::new();
+        for fi in 0..self.fighters.len() {
+            let f = &self.fighters[fi];
+            let on_fire = f.fire.iter().any(|&t| t > 0);
+            if empty && !on_fire {
+                continue;
+            }
+            let seg_base = f.seg_base;
+            let mut eat_through: Vec<u32> = Vec::new();
+            for part in 0..10u32 {
+                let f = &self.fighters[fi];
+                // (gone, or off and lying about as a limb of its own)
+                if !f.has(part) || f.limbs_gone & fighter::bit(part) != 0 || (part == S_HEAD && f.head_popped) {
+                    continue;
+                }
+                let sg = self.world.segments[(seg_base + part) as usize];
+                let (a, b) = (self.world.particles[sg.a as usize].pos, self.world.particles[sg.b as usize].pos);
+                let wet = if empty { [0.0; 3] } else { self.soak([a, b, (a + b) * 0.5]) };
+                let fm = &mut self.fighters[fi];
+                let k = part as usize;
+                if wet[ACID_DROP as usize] > ROT_FROM {
+                    let e = fm.eaten[k] as u32 + gain(ACID_EAT_TIME, wet[ACID_DROP as usize]);
+                    // (a torso is never all gone: there's always a ribcage left)
+                    let most = if part == S_TORSO { TORSO_MOST } else { fighter::ROT_FULL };
+                    fm.eaten[k] = e.min(most as u32) as u16;
+                    if fm.eaten[k] >= fighter::ROT_FULL {
+                        eat_through.push(part);
+                    }
+                }
+                if wet[LAVA_DROP as usize] > ROT_FROM {
+                    let m = fm.melted[k] as u32 + gain(LAVA_MELT_TIME, wet[LAVA_DROP as usize]);
+                    fm.melted[k] = m.min(fighter::ROT_FULL as u32) as u16;
+                    fm.fire[k] = FIRE_FRAMES;
+                } else if fm.fire[k] > 0 && wet[WATER_DROP as usize] > DOUSE {
+                    fm.fire[k] = 0;
+                    sizzle.push((a + b) * 0.5);
+                } else if fm.fire[k] > 0 {
+                    fm.fire[k] -= 1;
+                }
+            }
+            // fire spreads along the body, to the parts joined to a part
+            // that's well alight
+            for k in 0..10usize {
+                if self.fighters[fi].fire[k] <= FIRE_FRAMES / 3 {
+                    continue;
+                }
+                for n in fighter::part_neighbours(k as u32) {
+                    let f = &self.fighters[fi];
+                    let n = *n as usize;
+                    if f.fire[n] == 0 && f.has(n as u32) && f.limbs_gone & fighter::bit(n as u32) == 0 && self.rng.range(0.0, 1.0) < FIRE_SPREAD * dt {
+                        self.fighters[fi].fire[n] = FIRE_FRAMES * 2 / 3;
+                    }
+                }
+            }
+            // eaten right through: an arm or leg drops off (and goes on
+            // dissolving where it lies); a head is just gone
+            for part in eat_through {
+                if part == S_HEAD {
+                    let at = self.fighters[fi].pos(&self.world, fighter::HEAD);
+                    self.fighters[fi].head_popped = true;
+                    if self.fighters[fi].alive {
+                        self.damage(fi, S_HEAD, fighter::MAX_HEALTH * 2.0, at, Vec2::Y, 0.0, Kind::Blunt, None);
+                    }
+                } else if self.sever(fi, part) {
+                    let joint = fighter::sever_plan(part).map_or(PELVIS, |(j, _)| j);
+                    let at = self.fighters[fi].pos(&self.world, joint);
+                    self.events.push(Sfx::Sever.at(at).vol(0.5));
+                } else if self.fighters[fi].has(part) && fighter::sever_plan(part).is_some() {
+                    // (an upper arm or thigh whose lower half has already
+                    // come off: nothing to drop, it's just gone)
+                    let f = &self.fighters[fi];
+                    let (seg, dist) = ((f.seg_base + part) as usize, (f.dist_base + part - 1) as usize);
+                    let (joint, end) = (self.world.segments[seg].a, self.world.segments[seg].b);
+                    self.world.segments[seg].enabled = false;
+                    self.world.distances[dist].enabled = false;
+                    self.world.park_particle(end);
+                    let fm = &mut self.fighters[fi];
+                    fm.severed |= fighter::bit(part);
+                    fm.limbs_gone |= fighter::bit(part);
+                    fm.bleed = 220;
+                    fm.bleed_at = joint;
+                    if part == fighter::S_UPPER_B {
+                        self.release_grab(fi);
+                    }
+                }
+            }
+            // on fire: it hurts, it chars, and they scream
+            let f = &self.fighters[fi];
+            let lit = f.fire.iter().filter(|&&t| t > 0).count();
+            if lit > 0 {
+                let (alive, screaming) = (f.alive, f.burning);
+                let head = f.pos(&self.world, fighter::HEAD);
+                let fm = &mut self.fighters[fi];
+                fm.scorch = (fm.scorch + FIRE_CHAR * lit as f32 / 10.0 * dt).min(1.0);
+                if alive {
+                    fm.burning = true;
+                    if !screaming && (self.frame + fi as u32 * 7) % CHOKE_EVERY == 0 {
+                        self.events.push(Sfx::Burning.at(head).line(0, fi as u8));
+                    }
+                    if self.hazard_cd[fi] == 0 {
+                        self.hazard_cd[fi] = 8;
+                        self.damage(fi, S_TORSO, FIRE_DPS * lit as f32 * 8.0 / 60.0, head, Vec2::Y, 0.0, Kind::Blunt, None);
+                    }
+                }
+            }
+        }
+        // loose limbs: the same, the whole limb at once
+        for wi in 0..self.weapons.len() {
+            let w = &self.weapons[wi];
+            if !w.active || w.limb.is_none() || (empty && w.fire == 0) {
+                continue;
+            }
+            let (a, b) = (self.world.particles[w.particle(0) as usize].pos, self.world.particles[w.particle(w.n - 1) as usize].pos);
+            let wet = if empty { [0.0; 3] } else { self.soak([a, b, (a + b) * 0.5]) };
+            let w = &mut self.weapons[wi];
+            if wet[ACID_DROP as usize] > ROT_FROM {
+                w.eaten = (w.eaten as u32 + gain(ACID_EAT_TIME, wet[ACID_DROP as usize])).min(fighter::ROT_FULL as u32) as u16;
+            }
+            if wet[LAVA_DROP as usize] > ROT_FROM {
+                w.melted = (w.melted as u32 + gain(LAVA_MELT_TIME, wet[LAVA_DROP as usize])).min(fighter::ROT_FULL as u32) as u16;
+                w.fire = FIRE_FRAMES;
+            } else if w.fire > 0 && wet[WATER_DROP as usize] > DOUSE {
+                w.fire = 0;
+                sizzle.push((a + b) * 0.5);
+            } else {
+                w.fire = w.fire.saturating_sub(1);
+            }
+            if w.eaten >= fighter::ROT_FULL {
+                // (dropped first if someone's swinging it)
+                if let Some(h) = w.holder {
+                    self.release(h as usize, false);
+                }
+                let mut w = self.weapons[wi].clone();
+                w.park(&mut self.world);
+                self.weapons[wi] = w;
+            }
+        }
+        // put out: a hiss, and a wisp of steam
+        for at in sizzle {
+            self.events.push(Sfx::Splash.at(at).vol(0.4));
+            self.steam.add(at + Vec2::new(0.0, 0.3), DOUSE_STEAM);
+        }
+    }
+
+    /// Rafts ride the water: each settles to the water level just off its
+    /// ends (as waves and splashes move it), sits a little lower for each
+    /// fighter standing on it and tips toward where they stand, and bobs.
+    fn float_rafts(&mut self, dt: f32) {
+        for ri in 0..self.rafts.len() {
+            let r = self.rafts[ri];
+            let (x, half) = (r.def.x, r.def.half);
+            let side = half.x + RAFT_LOOK;
+            let (lw, rw) = (self.water_level(x - side, r.def.sea), self.water_level(x + side, r.def.sea));
+            let top = r.y + half.y;
+            let (mut load, mut moment) = (0.0f32, 0.0f32);
+            for f in &self.fighters {
+                let p = f.pos(&self.world, PELVIS);
+                if (p.x - x).abs() < half.x + 0.3 && p.y > top && p.y < top + 1.6 {
+                    load += 1.0;
+                    moment += (p.x - x).clamp(-half.x, half.x);
+                }
+            }
+            let bob = RAFT_BOB * dmath::sin(self.frame as f32 * DT * RAFT_BOB_RATE + r.phase);
+            let want_y = (lw + rw) * 0.5 - RAFT_DRAFT + half.y - load * RAFT_SINK + bob;
+            let want_tilt = ((rw - lw) / (2.0 * side) - moment * RAFT_TILT).clamp(-RAFT_MAX_TILT, RAFT_MAX_TILT);
+            let k = (RAFT_K * dt).min(1.0);
+            let damp = (RAFT_DAMP * dt).min(1.0);
+            let raft = &mut self.rafts[ri];
+            raft.vy += (want_y - raft.y) * RAFT_K * k - raft.vy * damp;
+            raft.y += raft.vy * dt;
+            raft.spin += (want_tilt - raft.tilt) * RAFT_K * k - raft.spin * damp;
+            raft.tilt = (raft.tilt + raft.spin * dt).clamp(-RAFT_MAX_TILT, RAFT_MAX_TILT);
+            let o = &mut self.world.statics[raft.statik as usize];
+            o.center = Vec2::new(x, raft.y);
+            o.rot = dmath::dir(raft.tilt);
+        }
+    }
+
+    /// The water's level at `x`, between `sea`'s bottom and a metre over its
+    /// still surface (its bottom if there's none there).
+    fn water_level(&self, x: f32, sea: (f32, f32)) -> f32 {
+        let (mut lo, mut hi) = (sea.0, sea.1 + 1.0);
+        for _ in 0..8 {
+            let mid = (lo + hi) * 0.5;
+            if self.fluid.sample(Vec2::new(x, mid)).amount[crate::liquid::WATER_DROP as usize] > WATER_EDGE {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// How much water, acid and live lava are around a body part (its ends
+    /// and middle; cooled lava doesn't count), 0..1 each.
+    fn soak(&self, pts: [Vec2; 3]) -> [f32; 3] {
+        use crate::liquid::{ACID_DROP, LAVA_DROP, WATER_DROP};
+        let mut a = [0.0f32; 3];
+        for p in pts {
+            let smp = self.fluid.sample(p);
+            a[WATER_DROP as usize] += smp.amount[WATER_DROP as usize];
+            a[ACID_DROP as usize] += smp.amount[ACID_DROP as usize];
+            a[LAVA_DROP as usize] += (smp.amount[LAVA_DROP as usize] - smp.dyed[LAVA_DROP as usize]).max(0.0);
+        }
+        a.map(|x| (x / 3.0 / SOAKED).min(1.0))
     }
 
     /// Steam: it rises, spreads and condenses; anyone breathing it in thick
@@ -4149,6 +4526,23 @@ impl GameState {
     /// `toward` (+1 right, -1 left): the first floor out of the liquid
     /// ahead of them, no higher than their hands reach over their head and
     /// above their waist (its edge x and its top).
+    /// The speed that hauls fighter `fi` up over the lip at (`edge`, `top`)
+    /// and onto it, going `toward` (+1 right): up past it with the feet clear
+    /// of it, and over it by the time they're at the top (v = sqrt(2 g h),
+    /// t = v / g), `loss` times faster up for whatever drags at them.
+    fn haul_velocity(&self, fi: usize, edge: f32, top: f32, toward: f32, loss: f32) -> Vec2 {
+        let g = -self.world.cfg.gravity.y;
+        let f = &self.fighters[fi];
+        let feet = f.pos(&self.world, fighter::FOOT_A).y.min(f.pos(&self.world, fighter::FOOT_B).y);
+        let rise = (top + HAUL_CLEAR - feet).max(0.0);
+        let vy = (2.0 * g * rise).sqrt() * loss;
+        // (however little there is to climb, they take HAUL_TIME getting
+        // over it, not an instant)
+        let t = (vy / g).max(HAUL_TIME);
+        let across = ((edge - f.pos(&self.world, PELVIS).x) * toward).max(0.0) + HAUL_ONTO;
+        Vec2::new(toward * across / t, vy)
+    }
+
     fn ledge_ahead(&self, fi: usize, toward: f32) -> Option<(f32, f32)> {
         let f = &self.fighters[fi];
         let (neck, pelvis) = (f.pos(&self.world, fighter::NECK), f.pos(&self.world, PELVIS));
@@ -4332,11 +4726,11 @@ impl GameState {
                 let f = &mut self.fighters[fi];
                 f.scorch = (f.scorch + liq.scorch * share * dt).min(1.0);
             }
-            // steam off whatever's cooking in it
-            if liq.steams && (self.frame + fi as u32 * 3) % 5 == 0 && self.sparks.len() < 320 {
-                let at = highest.unwrap_or(self.fighters[fi].pos(&self.world, PELVIS)) + Vec2::new(self.rng.range(-0.2, 0.2), 0.1);
-                let vel = Vec2::new(self.rng.range(-0.25, 0.25), self.rng.range(0.6, 1.1));
-                self.sparks.push(Spark { pos: at, vel, life: 55, max_life: 55, blood: false, tint: 0xd8d8d0, steam: true });
+            // steam off whatever's cooking in it (into the steam itself: a
+            // wisp, nowhere near enough to scald)
+            if liq.steams && (self.frame + fi as u32 * 3) % 5 == 0 {
+                let at = highest.unwrap_or(self.fighters[fi].pos(&self.world, PELVIS)) + Vec2::new(0.0, 0.3);
+                self.steam.add(at, COOK_STEAM);
             }
             // eaten away, the more of them in it the faster
             if liq.damage > 0.0 && self.fighters[fi].alive && self.hazard_cd[fi] == 0 {
@@ -4370,19 +4764,7 @@ impl GameState {
             let want = dir * SWIM_SPEED * liq.swim * f.swim_power();
             // (just leapt or hauled: the stroke doesn't fight it)
             let free = f.stroke == 0;
-            let haul_vel = haul.map(|(edge, top)| {
-                // up past the lip with the feet clear of it, and over it by
-                // the time they're at the top: v = sqrt(2 g h), t = v / g
-                let f = &self.fighters[fi];
-                let feet = f.pos(&self.world, fighter::FOOT_A).y.min(f.pos(&self.world, fighter::FOOT_B).y);
-                let rise = (top + HAUL_CLEAR - feet).max(0.0);
-                let vy = (2.0 * g * rise).sqrt() * HAUL_LOSS;
-                // (however little there is to climb, they take HAUL_TIME
-                // getting over it, not an instant)
-                let t = (vy / g).max(HAUL_TIME);
-                let across = ((edge - f.pos(&self.world, PELVIS).x) * toward).max(0.0) + HAUL_ONTO;
-                Vec2::new(toward * across / t, vy)
-            });
+            let haul_vel = haul.map(|(edge, top)| self.haul_velocity(fi, edge, top, toward, HAUL_LOSS));
             // (stroking steers the body as a whole: pulling each part toward
             // the same speed would hold them stiff, every turn and kick braked)
             let steer = (want - body) * (SWIM_STEER * dt).min(1.0);
@@ -4529,7 +4911,7 @@ impl GameState {
                                 self.wound(fi, part, at, fighter::WoundKind::Stab, 0.045, Vec2::Y);
                                 self.spawn_blood(at, Vec2::Y, 24, 5.0);
                                 self.events.push(Sfx::Impale.at(at).vol(1.3));
-                                self.shake = (self.shake + 0.8).min(1.5);
+                                self.shake_camera(fi, 0.8);
                                 self.damage(fi, part, 999.0, at, Vec2::Y, 0.0, Kind::Spike, None);
                             }
                             continue;
@@ -4847,7 +5229,10 @@ impl GameState {
             f.slam = 0.0;
             f.flying = 0;
             self.events.push(Sfx::Thud.at(at).vol(1.5));
-            self.shake = (self.shake + 0.7).min(1.5);
+            self.shake_camera(i, 0.7);
+            if let Some(b) = by {
+                self.shake_camera(b as usize, 0.35);
+            }
             if self.fighters[i].alive {
                 self.damage(i, S_TORSO, dmg, at, Vec2::NEG_Y, 0.0, Kind::Blunt, by);
             }
@@ -4864,7 +5249,7 @@ impl GameState {
             let by = Some(f.flung_by);
             self.fighters[i].flying = 0;
             self.events.push(Sfx::Thud.at(at).vol((lost / 10.0).min(1.6)));
-            self.shake = (self.shake + 0.4).min(1.5);
+            self.shake_camera(i, 0.4);
             if self.fighters[i].alive {
                 let dmg = (lost - SLAM_SPEED) * 2.2 + 5.0;
                 self.damage(i, S_TORSO, dmg, at, (v1 - v0).normalize_or(Vec2::Y), 0.0, Kind::Blunt, by);
@@ -4886,10 +5271,16 @@ impl GameState {
                 continue;
             }
             let at = f.pos(&self.world, PELVIS);
+            // (coming down really hard, now and then a leg goes)
+            if stopped >= FALL_DOWN_SPEED + BREAK_FALL_OVER && self.rng.f32() < BREAK_CHANCE {
+                let leg = [fighter::S_SHIN_A, fighter::S_SHIN_B, fighter::S_THIGH_A, fighter::S_THIGH_B][(self.rng.next_u32() % 4) as usize];
+                let at = self.fighters[i].pos(&self.world, fighter::BONES[leg as usize].1);
+                self.break_bone(i, leg, at);
+            }
             let frames = FALL_DOWN_FRAMES + ((stopped - FALL_DOWN_SPEED) * FALL_DOWN_MORE) as u16;
             self.fighters[i].knock_down(frames.min(FALL_DOWN_MAX));
             self.events.push(Sfx::Thud.at(at).vol((stopped / 15.0).min(1.6)));
-            self.shake = (self.shake + 0.3).min(1.5);
+            self.shake_camera(i, 0.3);
         }
     }
 
@@ -4899,7 +5290,12 @@ impl GameState {
         self.fighters[i]
             .particle_ids()
             .filter(|&id| self.world.particles[id as usize].on_ground())
-            .map(|id| self.fall.get(id as usize).copied().unwrap_or(0.0) + self.world.particles[id as usize].vel.y)
+            // (only falling speed taken off: a part shoved up off the floor
+            // hasn't landed any harder for it)
+            .map(|id| {
+                let fall = self.fall.get(id as usize).copied().unwrap_or(0.0);
+                fall.min(fall + self.world.particles[id as usize].vel.y)
+            })
             .fold(0.0f32, f32::max)
     }
 
@@ -4939,7 +5335,8 @@ impl GameState {
     /// them flying.
     fn kick_hit(&mut self, att: usize, vic: usize, vpart: u32, point: Vec2, impact: f32) {
         let f = &self.fighters[att];
-        let fwd = Vec2::new(f.facing, 0.0);
+        // (a sweep goes the way the legs face: see `Fighter::leg_facing`)
+        let fwd = Vec2::new(f.leg_facing, 0.0);
         let drop = f.kick_kind == fighter::KICK_DROP;
         self.punch_cd[att] = f.kick;
         if drop {
@@ -5126,13 +5523,18 @@ impl GameState {
             let raw = if fighting { given } else { 0 };
             let (b, aim) = input::decode(raw);
             let locked = self.clash.is_some_and(|c| c.side_of(i).is_some()) || self.in_finisher(i);
+            let victim = self.finishers.iter().any(|x| x.victim as usize == i);
             let f = &mut self.fighters[i];
             f.prev_raw = f.raw_buttons;
             f.raw_buttons = b;
             f.prev_buttons = f.buttons;
             // in a blade lock the keys belong to the duel, not the body
             f.buttons = if locked { walk[i] } else { b };
-            f.aim = aim;
+            // (being finished, your mouse doesn't turn you round either: you
+            // stay as you were caught)
+            if !victim {
+                f.aim = aim;
+            }
             self.punch_cd[i] = self.punch_cd[i].saturating_sub(1);
         }
         self.update_holds();
@@ -5274,6 +5676,7 @@ impl GameState {
         }
         self.keep_upright();
         self.update_trap();
+        self.float_rafts(DT * scale);
         self.update_liquids(DT * scale);
         self.fall = self.world.particles.iter().map(|p| -p.vel.y).collect();
         self.world.step(DT * scale);
@@ -5332,6 +5735,7 @@ impl GameState {
         self.fluid.keep_within(Vec2::new(self.min.x - 4.0, self.kill_y), Vec2::new(self.max.x + 4.0, self.max.y + 20.0));
         self.water_on_lava();
         self.update_steam(DT * scale);
+        self.eat_and_burn(DT * scale);
         self.carry_stuck();
         self.resolve_hits();
         self.slam_thrown(&flying);
@@ -5349,7 +5753,7 @@ impl GameState {
             let p = f.pos(&self.world, PELVIS);
             if f.alive && (p.y < self.kill_y || p.x < self.min.x - 4.0 || p.x > self.max.x + 4.0) {
                 self.kill_fighter(i);
-                self.shake = (self.shake + 0.4).min(1.5);
+                self.shake_camera(i, 0.4);
             }
             let f = &mut self.fighters[i];
             if f.bleed > 0 {
@@ -5367,8 +5771,9 @@ impl GameState {
         // weapon drops
         if fighting && !self.training && self.frame >= self.next_drop {
             self.next_drop = self.frame + DROP_INTERVAL;
-            if self.weapons.iter().filter(|w| w.active).count() < MAX_WEAPONS {
-                let lv = levels().swap_remove(self.level_index);
+            let lv = levels().swap_remove(self.level_index);
+            // (only where weapons lie about to start with)
+            if lv.arms == crate::level::Arms::Scattered && self.weapons.iter().filter(|w| w.active).count() < MAX_WEAPONS {
                 let n = lv.weapon_spawns.len();
                 let start = (self.rng.next_u32() as usize) % n;
                 let def = DROPS[self.rng.next_u32() as usize % DROPS.len()];
@@ -5383,7 +5788,9 @@ impl GameState {
                 }
             }
         }
-        self.shake *= 0.86;
+        for k in &mut self.shake {
+            *k *= 0.86;
+        }
         self.slowmo = self.slowmo.saturating_sub(1);
         self.flash = self.flash.saturating_sub(1);
 
@@ -5438,6 +5845,8 @@ impl RollbackGame for GameState {
         let said = self.frame;
         self.voice_log.extend(self.events.iter().filter(|e| e.kind.is_voice()).map(|e| (said, *e)));
         self.voice_log.retain(|(f, _)| f + VOICE_LOG_FRAMES > said);
+        self.sfx_log.extend(self.events.iter().filter(|e| !e.kind.is_voice()).map(|e| (said, *e)));
+        self.sfx_log.retain(|(f, _)| f + SFX_LOG_FRAMES > said);
     }
 
     fn checksum(&self) -> u64 {
@@ -5449,6 +5858,11 @@ impl RollbackGame for GameState {
         h.write_u32(self.teams as u32);
         h.write_u32(self.rng.0);
         h.write_u32(self.next_drop);
+        for r in &self.rafts {
+            for x in [r.y, r.vy, r.tilt, r.spin] {
+                h.write_f32(x);
+            }
+        }
         self.world.hash_into(|v| h.write_u32(v));
         for a in &self.world.aims {
             h.write_f32(a.target);
@@ -5475,6 +5889,7 @@ impl RollbackGame for GameState {
         for f in &self.fighters {
             h.write_f32(f.health);
             h.write_f32(f.facing);
+            h.write_f32(f.leg_facing);
             h.write_f32(f.phase);
             h.write_f32(f.hand_ang);
             h.write_f32(f.hand_reach);
@@ -5503,6 +5918,11 @@ impl RollbackGame for GameState {
             h.write_u8(f.impale_beat);
             h.write_u32(f.breath as u32 | (f.stroke as u32) << 16 | (f.swimming as u32) << 24 | (f.wet as u32) << 25);
             h.write_f32(f.scorch);
+            h.write_u32(f.broken as u32);
+            for k in 0..10 {
+                h.write_u32(f.eaten[k] as u32 | (f.melted[k] as u32) << 16);
+                h.write_u32(f.fire[k] as u32);
+            }
             h.write_u32(f.burning as u32);
             h.write_f32(f.surge);
             h.write_u32(f.dry as u32);
@@ -5598,7 +6018,9 @@ impl RollbackGame for GameState {
                 h.write_u8(winner.map_or(255, |w| w));
             }
         }
-        h.write_f32(self.shake);
+        for k in self.shake {
+            h.write_f32(k);
+        }
         h.finish()
     }
 }

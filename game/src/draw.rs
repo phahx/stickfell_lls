@@ -123,6 +123,212 @@ fn draw_steam(s: &GameState, frame: &mut Frame, _t: f32) {
     });
 }
 
+/// A broken bone: a jagged end poking out through the skin halfway along
+/// the part, and the blood round it.
+fn draw_break(frame: &mut Frame, a: Vec2, b: Vec2, facing: f32) {
+    let mid = a.lerp(b, 0.5);
+    let along = (b - a).normalize_or(Vec2::NEG_Y);
+    let out = Vec2::new(-along.y, along.x) * facing;
+    frame.circle(mid, 0.045, Color::hex(0x8a0d0d));
+    let tip = mid + out * 0.1 + along * 0.03;
+    frame.capsule(mid, tip, 0.018, Color::hex(BONE));
+    frame.capsule(tip, tip - along * 0.035 + out * 0.012, 0.012, Color::hex(BONE));
+}
+
+/// A raft's planks.
+const RAFT_WOOD: u32 = 0x7a5a3a;
+
+/// Bone, as lava or acid lay it bare: its colour, a limb bone's thickness,
+/// and a skull's size (of the head's).
+const BONE: u32 = 0xe6dccb;
+const BONE_R: f32 = 0.026;
+const SKULL: f32 = 0.78;
+
+/// How eaten away and how melted to the bone a part is, 0..1 each.
+fn rot_of(eaten: u16, melted: u16) -> (f32, f32) {
+    let full = fighter::ROT_FULL as f32;
+    (eaten as f32 / full, melted as f32 / full)
+}
+
+/// How much the bone shows through (0..1), as the flesh goes.
+fn bone_shows(e: f32, m: f32) -> f32 {
+    let x = ((e.max(m) - 0.45) / 0.4).clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
+/// How thick the flesh left on a part `r` thick is.
+fn flesh_left(r: f32, e: f32, m: f32) -> f32 {
+    r * (1.0 - 0.8 * e) * (1.0 - m)
+}
+
+/// Flesh coloured by what's at it: acid leaves it raw and yellow-green,
+/// lava charred black.
+fn rotted_colour(col: Color, e: f32, m: f32) -> Color {
+    col.lerp(Color::hex(0x8f9a3c), e * 0.65).lerp(Color::hex(0x2a120c), m * 0.8)
+}
+
+/// The outline round a part as acid and lava have left it.
+fn rotted_outline(r: f32, e: f32, m: f32) -> f32 {
+    let flesh = flesh_left(r, e, m);
+    if bone_shows(e, m) > 0.0 { flesh.max(BONE_R * 1.5) + 0.03 } else { flesh + 0.03 }
+}
+
+/// A part as acid and lava have left it: as much flesh as there's left,
+/// coloured by what's at it, and the bone showing through it, then bare (a
+/// torso's spine and ribs: `ribs` is the way the front faces).
+#[allow(clippy::too_many_arguments)]
+fn draw_rotted(frame: &mut Frame, a: Vec2, b: Vec2, r: f32, col: Color, e: f32, m: f32, ribs: Option<f32>) {
+    let flesh = flesh_left(r, e, m);
+    let skin = rotted_colour(col, e, m);
+    if flesh > 0.005 {
+        frame.capsule(a, b, flesh, skin);
+    }
+    draw_bone(frame, a, b, skin, bone_shows(e, m), ribs);
+}
+
+/// The bone in a part from `a` to `b`, showing `k` (0..1) through flesh
+/// coloured `skin` (a torso's spine and ribs: `ribs` is the way the front
+/// faces).
+fn draw_bone(frame: &mut Frame, a: Vec2, b: Vec2, skin: Color, k: f32, ribs: Option<f32>) {
+    if k <= 0.0 {
+        return;
+    }
+    let bone = skin.lerp(Color::hex(BONE), k);
+    match ribs {
+        Some(facing) => {
+            // the spine, and ribs curving off it to the front
+            let along = (b - a).normalize_or(Vec2::NEG_Y);
+            let across = Vec2::new(-along.y, along.x);
+            let front = if across.x * facing >= 0.0 { across } else { -across };
+            frame.capsule(a, b, BONE_R * 0.9, bone);
+            for i in 0..7 {
+                frame.circle(a.lerp(b, i as f32 / 6.0), BONE_R * 1.5, bone);
+            }
+            for i in 1..5 {
+                let p = a.lerp(b, i as f32 * 0.13);
+                let tip = p + front * 0.1 * k + along * 0.045;
+                frame.capsule(p, tip, BONE_R * 0.55, bone);
+            }
+        }
+        None => {
+            frame.capsule(a, b, BONE_R, bone);
+            if k > 0.4 {
+                // the knobbly ends
+                frame.circle(a, BONE_R * 1.55, bone);
+                frame.circle(b, BONE_R * 1.55, bone);
+            }
+        }
+    }
+}
+
+/// Fire on bodies and loose limbs: each burning part's heat splatted into a
+/// fine grid (reaching well up above it, a little round it), drawn as one
+/// licking volume (shaders/vapour.wgsl's `fs_flame`), and lighting what's
+/// round it.
+fn draw_flames(s: &GameState, frame: &mut Frame, t: f32) {
+    // (each source: a part's two ends and how fiercely it's burning; dying
+    // down over its last FLAME_FADE frames)
+    let level = |frames: u16| (frames as f32 / FLAME_FADE).min(1.0);
+    let w = &s.world;
+    let mut sources: Vec<(Vec2, Vec2, f32)> = Vec::new();
+    let mut glows: Vec<(Vec2, f32)> = Vec::new();
+    for f in &s.fighters {
+        let (mut sum, mut lit, mut heat) = (Vec2::ZERO, 0.0f32, 0.0f32);
+        for part in 0..10u32 {
+            let fire = f.fire[part as usize];
+            if fire == 0 || !f.has(part) || f.limbs_gone & fighter::bit(part) != 0 || (part == S_HEAD && f.head_popped) {
+                continue;
+            }
+            let sg = w.segments[(f.seg_base + part) as usize];
+            let (a, b) = (w.particles[sg.a as usize].pos, w.particles[sg.b as usize].pos);
+            // (no flames under the surface of whatever it's in)
+            if s.fluid.sample((a + b) * 0.5).total() > FLAME_DROWNED {
+                continue;
+            }
+            sources.push((a, b, level(fire)));
+            sum += (a + b) * 0.5;
+            lit += 1.0;
+            heat += level(fire);
+        }
+        if lit > 0.0 {
+            glows.push((sum / lit, heat));
+        }
+    }
+    for wpn in s.weapons.iter().filter(|x| x.active && x.limb.is_some() && x.fire > 0) {
+        for k in 0..wpn.nseg as u32 {
+            let sg = w.segments[(wpn.seg_base + k) as usize];
+            let (a, b) = (w.particles[sg.a as usize].pos, w.particles[sg.b as usize].pos);
+            sources.push((a, b, level(wpn.fire)));
+        }
+        let c = w.particles[wpn.particle(0) as usize].pos;
+        glows.push((c, level(wpn.fire) * 2.0));
+    }
+    if sources.is_empty() {
+        return;
+    }
+    // the grid: round them all, with room for the flames to rise
+    let (mut lo, mut hi) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
+    for &(a, b, _) in &sources {
+        lo = lo.min(a.min(b));
+        hi = hi.max(a.max(b));
+    }
+    lo -= Vec2::new(FLAME_WIDTH * 1.5, FLAME_WIDTH);
+    hi += Vec2::new(FLAME_WIDTH * 1.5, FLAME_WIDTH * FLAME_RISE + 0.1);
+    let mut cell = FLAME_CELL;
+    let cells = ((hi.x - lo.x) / cell).ceil() * ((hi.y - lo.y) / cell).ceil();
+    if cells > FLAME_MAX_CELLS {
+        cell *= (cells / FLAME_MAX_CELLS).sqrt();
+    }
+    let gw = ((hi.x - lo.x) / cell).ceil().max(1.0) as usize;
+    let gh = ((hi.y - lo.y) / cell).ceil().max(1.0) as usize;
+    let mut heat = vec![0.0f32; gw * gh];
+    for &(a, b, l) in &sources {
+        let x0 = (((a.x.min(b.x) - FLAME_WIDTH - lo.x) / cell).floor().max(0.0)) as usize;
+        let x1 = ((((a.x.max(b.x) + FLAME_WIDTH - lo.x) / cell).ceil()) as usize).min(gw);
+        let y0 = (((a.y.min(b.y) - FLAME_WIDTH - lo.y) / cell).floor().max(0.0)) as usize;
+        let y1 = ((((a.y.max(b.y) + FLAME_WIDTH * FLAME_RISE - lo.y) / cell).ceil()) as usize).min(gh);
+        let ab = b - a;
+        let len2 = ab.length_squared().max(1e-6);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let c = lo + Vec2::new((x as f32 + 0.5) * cell, (y as f32 + 0.5) * cell);
+                let q = a + ab * ((c - a).dot(ab) / len2).clamp(0.0, 1.0);
+                let mut d = c - q;
+                // (reaching far further up than down or out)
+                d.y = if d.y > 0.0 { d.y / FLAME_RISE } else { d.y * 1.5 };
+                let k = 1.0 - d.length() / FLAME_WIDTH;
+                if k > 0.0 {
+                    heat[y * gw + x] += l * k * k * 1.3;
+                }
+            }
+        }
+    }
+    for h in &mut heat {
+        *h = h.min(FLAME_MAX_HEAT);
+    }
+    frame.flames = Some(stickfell_render::VapourField { origin: lo, cell, w: gw as u32, h: gh as u32, thick: heat, density: 0.0, max_opacity: 0.0 });
+    // and the light it throws, flickering
+    for (i, (at, h)) in glows.into_iter().enumerate() {
+        let flick = 0.8 + 0.12 * (t * 13.0 + i as f32 * 1.7).sin() + 0.08 * (t * 29.0 + i as f32).sin();
+        let strength = (0.5 + 0.15 * h).min(1.6) * flick;
+        frame.light(Light::point(at + Vec2::new(0.0, 0.3), 3.0 + 0.25 * h, Color::hex(0xff8a30).scale(strength)).size(0.4));
+    }
+}
+
+/// Fire's look: its grid's cells (m), how wide flames are round a burning
+/// part and how much further they reach up, the most cells (a bigger grid
+/// gets coarser cells), and the frames over which a fire dies down.
+const FLAME_CELL: f32 = 0.05;
+const FLAME_WIDTH: f32 = 0.2;
+const FLAME_RISE: f32 = 3.2;
+const FLAME_MAX_CELLS: f32 = 90_000.0;
+const FLAME_FADE: f32 = 120.0;
+/// How much liquid round a burning part hides its flames (it's under).
+const FLAME_DROWNED: f32 = 0.15;
+/// How hot a flame's heart gets in the grid (`fs_flame` goes nearly white
+/// at 1.2).
+const FLAME_MAX_HEAT: f32 = 1.05;
+
 /// How dense steam looks (opacity 1 - e^(-this x thickness)), and the most
 /// opaque it gets (still see-through: fighters stay readable).
 const STEAM_DENSITY: f32 = 1.3;
@@ -392,7 +598,17 @@ impl SkinPart {
 /// hand or foot (0) to the torn end.
 fn draw_skinned_limb(frame: &mut Frame, skin: &Skin, world: &World, w: &Weapon, tint: Color) {
     let pt = |i: u8| world.particles[w.particle(i) as usize].pos;
-    let r = |k: u32| world.segments[(w.seg_base + k) as usize].radius;
+    let (e, m) = rot_of(w.eaten, w.melted);
+    let r = |k: u32| flesh_left(world.segments[(w.seg_base + k) as usize].radius, e, m);
+    let tint = rotted_colour(tint, e, m);
+    let bone = bone_shows(e, m);
+    for k in 0..w.nseg as u32 {
+        let sg = world.segments[(w.seg_base + k) as usize];
+        draw_bone(frame, world.particles[sg.a as usize].pos, world.particles[sg.b as usize].pos, tint, bone, None);
+    }
+    if r(0) < 0.005 {
+        return;
+    }
     let kind = w.limb.unwrap_or(match w.def {
         crate::weapon::LEG => LimbKind::Leg,
         crate::weapon::ARM => LimbKind::Arm,
@@ -431,15 +647,22 @@ fn draw_skinned(frame: &mut Frame, skin: &Skin, w: &World, f: &Fighter, col: Col
     let shown = |part: u32| f.limbs_gone & fighter::bit(part) == 0;
     // (radii come from the hitboxes, which the lab may have resized)
     let head_r = w.segments[(f.seg_base + S_HEAD) as usize].radius;
+    let rot = |part: u32| rot_of(f.eaten[part as usize], f.melted[part as usize]);
+    let (he, hm) = rot(S_HEAD);
+    // (the head's flesh shrinks back onto the skull)
+    let head_flesh = 1.0 - 0.45 * he - 0.3 * hm + 0.135 * he * hm;
+    let skull_k = bone_shows(he, hm);
     if skin.outline {
         for (part, _) in order {
             if shown(part) {
                 let (a, b) = seg(part);
                 let r = w.segments[(f.seg_base + part) as usize].radius;
-                frame.capsule(a, b, r + 0.03, outline);
+                let (e, m) = rot(part);
+                frame.capsule(a, b, rotted_outline(r, e, m), outline);
             }
         }
-        frame.circle(f.pos(w, HEAD), head_r + 0.03, outline);
+        let skull = if skull_k > 0.0 { SKULL } else { 0.0 };
+        frame.circle(f.pos(w, HEAD), head_r * head_flesh.max(skull) + 0.03, outline);
     }
     for (part, tex) in order {
         if !shown(part) {
@@ -453,9 +676,20 @@ fn draw_skinned(frame: &mut Frame, skin: &Skin, w: &World, f: &Fighter, col: Col
                 frame.circle(a.lerp(b, k as f32 / 6.0), 0.055, Color::hex(0xd8ccb8));
             }
         } else {
+            // what acid and lava leave of it: thinner flesh, coloured by
+            // what's at it, over the bone coming through
             let r = w.segments[(f.seg_base + part) as usize].radius;
-            tex.span(frame, a, b, r, skin.art_width, col);
+            let (e, m) = rot(part);
+            let flesh = flesh_left(r, e, m);
+            let tint = rotted_colour(col, e, m);
+            if flesh > 0.005 {
+                tex.span(frame, a, b, flesh, skin.art_width, tint);
+            }
+            draw_bone(frame, a, b, tint, bone_shows(e, m), (part == S_TORSO).then_some(f.facing));
             draw_part_wounds(frame, w, f, part, now);
+            if f.broken & fighter::bit(part) != 0 {
+                draw_break(frame, a, b, f.facing);
+            }
             if !f.has(part) && fighter::sever_plan(part).is_some_and(|(_, ps)| ps[0] == part) {
                 frame.circle(a, r * 0.9, Color::hex(0x8a0d0d));
             }
@@ -472,7 +706,13 @@ fn draw_skinned(frame: &mut Frame, skin: &Skin, w: &World, f: &Fighter, col: Col
     // flattened by a stomp from above: squeezed top to bottom, spread sideways
     let across = Vec2::new(-down.y, down.x);
     let (sx, sy) = (squash_scale(across, f.head_squash), squash_scale(down, f.head_squash));
-    skin.head.place(frame, head, down, k * sx, k * sy, col);
+    let tint = rotted_colour(col, he, hm);
+    if skull_k < 1.0 {
+        skin.head.place(frame, head, down, k * sx * head_flesh, k * sy * head_flesh, tint);
+    }
+    if skull_k > 0.0 {
+        frame.circle(head, head_r * SKULL, tint.lerp(Color::hex(BONE), skull_k));
+    }
     draw_part_wounds(frame, w, f, S_HEAD, now);
 }
 
@@ -793,8 +1033,9 @@ fn draw_weapon(frame: &mut Frame, s: &GameState, w: &Weapon, skin: Option<&Skin>
         if w.owner > 0 {
             // a severed limb: its owner's colour, outlined like a body
             let base = Color::hex(fighter_color(s, (w.owner - 1) as usize)).lerp(Color::hex(0x555555), 0.35);
-            frame.capsule(a, b, sg.r + 0.03, Color::hex(0x0d0e12));
-            frame.capsule(a, b, sg.r, base);
+            let (e, m) = rot_of(w.eaten, w.melted);
+            frame.capsule(a, b, rotted_outline(sg.r, e, m), Color::hex(0x0d0e12));
+            draw_rotted(frame, a, b, sg.r, base, e, m, None);
             frame.occluder(Occluder::Segment { a, b });
             continue;
         }
@@ -1024,7 +1265,9 @@ pub fn static_scene(lv: &LevelDef) -> Arc<StaticScene> {
 
 pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, cam_center: Vec2, hud: &Hud) {
     let t = frame.time;
-    let shake = Vec2::new((t * 91.0).sin(), (t * 77.0).cos()) * s.shake * 0.12;
+    // (only the local player's own camera shakes; watching, none)
+    let felt = hud.local.and_then(|i| s.shake.get(i)).copied().unwrap_or(0.0);
+    let shake = Vec2::new((t * 91.0).sin(), (t * 77.0).cos()) * felt * 0.12;
     let height = if hud.zoom > 0.0 { hud.zoom } else { CAMERA_HEIGHT };
     frame.camera = Camera2D { center: cam_center + shake, height };
     let skin_arc = if hud.capsules { None } else { Some(hud.skin.clone().unwrap_or_else(crate::character::skin)) };
@@ -1090,7 +1333,18 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
         if crate::level::is_spike(o.tag) {
             continue;
         }
-        if !art {
+        if s.rafts.iter().any(|r| r.statik as usize == i) {
+            // a raft: planks lashed across
+            let wood = Color::hex(RAFT_WOOD);
+            frame.rect(o.center, o.half + Vec2::splat(0.03), o.rot, 0.05, Color::hex(0x2a1d12));
+            frame.rect(o.center, o.half, o.rot, 0.04, wood);
+            let c = o.corners();
+            for k in 1..6 {
+                let f = k as f32 / 6.0;
+                frame.capsule(c[0].lerp(c[1], f), c[3].lerp(c[2], f), 0.012, wood.lerp(Color::BLACK, 0.35));
+            }
+            frame.capsule(c[3], c[2], 0.03, wood.lerp(Color::WHITE, 0.2));
+        } else if !art {
             let color = Color::hex(lv.boxes.get(i).map_or(0x3a3f4b, |b| b.color));
             frame.rect(o.center, o.half, o.rot, 0.04, color);
             let c = o.corners();
@@ -1102,6 +1356,7 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
     draw_liquids(s, frame, t);
     draw_trap(s, frame);
     draw_steam(s, frame, t);
+    draw_flames(s, frame, t);
 
     // hazards
     for h in &s.hazards {
@@ -1248,14 +1503,18 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
                         continue;
                     }
                     let r = if part == S_TORSO { 0.1 } else { LIMB_R };
+                    let (e, m) = rot_of(f.eaten[part as usize], f.melted[part as usize]);
                     if pass == 0 {
-                        frame.capsule(a, b, r + 0.03, outline);
+                        frame.capsule(a, b, rotted_outline(r, e, m), outline);
                     } else {
-                        frame.capsule(a, b, r, col);
+                        draw_rotted(frame, a, b, r, col, e, m, (part == S_TORSO).then_some(f.facing));
                         if !f.has(part) && fighter::sever_plan(part).is_some_and(|(_, ps)| ps[0] == part) {
                             frame.circle(a, r * 0.9, blood);
                         }
                         draw_part_wounds(frame, w, f, part, s.frame);
+                        if f.broken & fighter::bit(part) != 0 {
+                            draw_break(frame, a, b, f.facing);
+                        }
                     }
                     frame.occluder(Occluder::Segment { a, b });
                 }
@@ -1275,6 +1534,8 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
         // (faces and the rest are sized to the head: 1 on the original HEAD_R)
         let head_r = w.segments[(f.seg_base + S_HEAD) as usize].radius;
         let hk = head_r / HEAD_R;
+        let (head_e, head_m) = rot_of(f.eaten[S_HEAD as usize], f.melted[S_HEAD as usize]);
+        let skull_k = bone_shows(head_e, head_m);
         if skin.is_none() && !f.head_popped {
             if f.head_squash > 0.0 {
                 // flattened: a squat rounded slab instead of a ball
@@ -1282,8 +1543,18 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
                 frame.rect(head, half + Vec2::splat(0.03), Vec2::X, half.y + 0.03, outline);
                 frame.rect(head, half, Vec2::X, half.y, col);
             } else {
-                frame.circle(head, head_r + 0.03, outline);
-                frame.circle(head, head_r, col);
+                // what acid and lava leave of it: less and less flesh over
+                // a skull coming through
+                let flesh = head_r * (1.0 - 0.45 * head_e) * (1.0 - 0.3 * head_m);
+                let skull = head_r * SKULL;
+                let skin_col = rotted_colour(col, head_e, head_m);
+                frame.circle(head, flesh.max(if skull_k > 0.0 { skull } else { 0.0 }) + 0.03, outline);
+                if skull_k < 1.0 {
+                    frame.circle(head, flesh, skin_col);
+                }
+                if skull_k > 0.0 {
+                    frame.circle(head, skull, skin_col.lerp(Color::hex(BONE), skull_k));
+                }
             }
             draw_part_wounds(frame, w, f, S_HEAD, s.frame);
         }
@@ -1298,6 +1569,13 @@ pub fn draw_game(s: &GameState, lv: &LevelDef, frame: &mut Frame, screen: Vec2, 
         let faces = skin.is_none_or(|k| k.faces);
         if f.head_popped {
             // (nothing left to have a face)
+        } else if skull_k > 0.55 && f.head_squash == 0.0 {
+            // a skull's empty sockets, nose and teeth
+            let dark = Color::hex(0x1a0f0c);
+            frame.circle(eye, 0.05 * hk, dark);
+            frame.circle(head + (side * 0.15 - look * 0.03) * hk, 0.022 * hk, dark);
+            let jaw = head + (side * 0.08 - look * 0.12) * hk;
+            frame.capsule(jaw - side * 0.05 * hk, jaw + side * 0.05 * hk, 0.012 * hk, dark);
         } else if !faces {
             // (a skin without faces: the art's head is left bare)
         } else if f.alive && f.has(S_HEAD) {

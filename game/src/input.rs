@@ -29,6 +29,8 @@ pub const THROW: u16 = 128;
 pub const ALT: u16 = 256;
 /// F: finish off someone who's down and badly hurt.
 pub const FINISH: u16 = 512;
+/// W: only the blade lock's "W" (jumping is Space or the up arrow).
+pub const UP: u16 = 1024;
 
 pub const AIM_UNIT: f32 = 0.02;
 /// Aim is exact out to this far (metres): arm's reach and a good way past.
@@ -83,8 +85,11 @@ pub fn read_local(input: &Input, aim: Vec2) -> u32 {
     if any(&[KeyCode::KeyD, KeyCode::ArrowRight]) {
         b |= RIGHT;
     }
-    if any(&[KeyCode::KeyW, KeyCode::Space, KeyCode::ArrowUp]) {
+    if any(&[KeyCode::Space, KeyCode::ArrowUp]) {
         b |= JUMP;
+    }
+    if input.down(KeyCode::KeyW) {
+        b |= UP;
     }
     if any(&[KeyCode::KeyS, KeyCode::ControlLeft, KeyCode::ArrowDown]) {
         b |= CROUCH;

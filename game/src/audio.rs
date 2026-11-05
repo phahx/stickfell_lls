@@ -13,7 +13,9 @@ use stickfell_physics::Vec2;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::sfx::{Sfx, SfxEvent};
 use crate::voice;
@@ -198,10 +200,135 @@ impl VoiceCtl {
 /// full scale) to hand the speakers. It always has an endless silence
 /// playing: an empty mixer reports itself finished, and the speakers would
 /// drop it before the first sound ever came.
+#[cfg(test)]
 fn limited_bus(channels: rodio::ChannelCount, rate: rodio::SampleRate) -> (rodio::mixer::Mixer, Safety<impl Source>) {
+    limited_bus_watched(channels, rate, Arc::new(Watch::default()))
+}
+
+/// The same, metered on its way into the limiter and out of it (see `Watch`).
+fn limited_bus_watched(channels: rodio::ChannelCount, rate: rodio::SampleRate, watch: Arc<Watch>) -> (rodio::mixer::Mixer, Safety<impl Source>) {
     let (bus, mixed) = rodio::mixer::mixer(channels, rate);
     bus.add(rodio::source::Zero::new(channels, rate));
-    (bus, Safety(Guard(mixed).limit(rodio::source::LimitSettings::dynamic_content())))
+    let block = (rate.get() as usize / 100 * channels.get() as usize).max(1);
+    let into = Meter::new(Guard(mixed), watch.clone(), 0, block);
+    (bus, Safety(Meter::new(into.limit(rodio::source::LimitSettings::dynamic_content()), watch, 1, block)))
+}
+
+/// What the mix sounded like lately, 10 ms at a time (RMS and peak,
+/// linear), going into the limiter and coming out of it: kept by the audio
+/// thread, read by the game (`Audio::watch`) to catch the sound cutting out.
+#[derive(Default)]
+pub struct Watch {
+    blocks: [Mutex<VecDeque<(f32, f32)>>; 2],
+    /// Blocks gone out so far: the audio's own clock (in tests the mix runs
+    /// far faster than real time; in the game it runs a buffer ahead).
+    count: std::sync::atomic::AtomicU64,
+}
+
+/// A sound this loud at its loudest (its gain x the clip's peak: -40
+/// dBFS, 20 dB over the -60 the watch calls silence) not coming out counts
+/// as the sound cutting out.
+const CUT_GAIN: f32 = 0.01;
+
+/// Blocks (10 ms) after a sound should be heard before its not being heard
+/// counts.
+const CUT_GRACE: u64 = 6;
+
+/// Where a clip counts as starting to sound (linear: about -26 dBFS).
+const ONSET_LEVEL: f32 = 0.05;
+
+/// The sounds in `log` (the newest state's last few frames) not among those
+/// `heard` already (the same kind, near the same frame and place: a re-run
+/// frame can shift one a touch), which are added to `heard`.
+pub fn fresh_sounds(heard: &mut Vec<(u32, SfxEvent)>, log: &[(u32, SfxEvent)]) -> Vec<SfxEvent> {
+    let newest = log.iter().map(|(f, _)| *f).max().unwrap_or(0);
+    // (a new match: its frames start over)
+    if heard.iter().any(|(f, _)| *f > newest + HEARD_KEEP_FRAMES) {
+        heard.clear();
+    }
+    let mut fresh = Vec::new();
+    for (f, e) in log.iter().filter(|(_, e)| !e.kind.is_voice()) {
+        let known = heard.iter().any(|(hf, h)| h.kind == e.kind && hf.abs_diff(*f) <= HEARD_SAME_FRAMES && (h.pos - e.pos).length() <= HEARD_SAME_PLACE);
+        if !known {
+            fresh.push(*e);
+        }
+        // (remembered as it is now, so a re-run's shifted copy is still known)
+        if !heard.iter().any(|(hf, h)| hf == f && h.kind == e.kind && h.pos == e.pos) {
+            heard.push((*f, *e));
+        }
+    }
+    heard.retain(|(f, _)| f + HEARD_KEEP_FRAMES > newest);
+    fresh
+}
+
+/// Online, a sound counts as one already heard if it's the same kind within
+/// this many frames and this far (m) of it (a re-run frame can shift it a
+/// touch), and heard sounds are remembered this many frames.
+const HEARD_SAME_FRAMES: u32 = 3;
+const HEARD_SAME_PLACE: f32 = 1.0;
+const HEARD_KEEP_FRAMES: u32 = 40;
+
+/// Blocks of 10 ms the watch keeps (5 s).
+const WATCH_BLOCKS: usize = 500;
+
+/// Passes samples straight through, measuring them for the `Watch`.
+struct Meter<S: Source> {
+    inner: S,
+    watch: Arc<Watch>,
+    stage: usize,
+    block: usize,
+    n: usize,
+    sum: f32,
+    peak: f32,
+}
+
+impl<S: Source> Meter<S> {
+    fn new(inner: S, watch: Arc<Watch>, stage: usize, block: usize) -> Self {
+        Self { inner, watch, stage, block, n: 0, sum: 0.0, peak: 0.0 }
+    }
+}
+
+impl<S: Source> Iterator for Meter<S> {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        let v = self.inner.next();
+        let x = v.unwrap_or(0.0);
+        if x.is_finite() {
+            self.sum += x * x;
+            self.peak = self.peak.max(x.abs());
+        }
+        self.n += 1;
+        if self.n >= self.block {
+            let rms = (self.sum / self.n as f32).sqrt();
+            // (never holding the audio thread up: a block missed is fine)
+            if let Ok(mut q) = self.watch.blocks[self.stage].try_lock() {
+                if q.len() >= WATCH_BLOCKS {
+                    q.pop_front();
+                }
+                q.push_back((rms, self.peak));
+            }
+            if self.stage == 1 {
+                self.watch.count.fetch_add(1, Ordering::Relaxed);
+            }
+            (self.n, self.sum, self.peak) = (0, 0.0, 0.0);
+        }
+        v
+    }
+}
+
+impl<S: Source> Source for Meter<S> {
+    fn current_span_len(&self) -> Option<usize> {
+        self.inner.current_span_len()
+    }
+    fn channels(&self) -> rodio::ChannelCount {
+        self.inner.channels()
+    }
+    fn sample_rate(&self) -> rodio::SampleRate {
+        self.inner.sample_rate()
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
 }
 
 /// Ahead of the limiter: a sample that isn't a number becomes silence, and
@@ -856,7 +983,15 @@ pub struct Audio {
     this_frame: [u8; ALL.len()],
     /// The loops (see `surroundings`).
     beds: Beds,
+    /// Online: the sounds heard lately, by frame (see `play_new`).
+    heard: Vec<(u32, SfxEvent)>,
     pub volume: f32,
+    /// The mix as it went out lately, the sounds started lately (when, what,
+    /// how loud), the output's format, and when a report was last written.
+    watch: Arc<Watch>,
+    started: VecDeque<(u64, Sfx, f32)>,
+    format: (u16, u32),
+    reported: Option<Instant>,
 }
 
 impl Audio {
@@ -872,17 +1007,26 @@ impl Audio {
     pub fn open(sounds: Sounds) -> Option<Self> {
         let mut sink = DeviceSinkBuilder::open_default_sink().map_err(|e| eprintln!("[audio] no output: {e}")).ok()?;
         sink.log_on_drop(false);
-        let (bus, mixed) = limited_bus(sink.config().channel_count(), sink.config().sample_rate());
+        let watch = Arc::new(Watch::default());
+        let (ch, rate) = (sink.config().channel_count(), sink.config().sample_rate());
+        let (bus, mixed) = limited_bus_watched(ch, rate, watch.clone());
         sink.mixer().add(mixed);
-        Some(Self::on(Some(sink), bus, sounds))
+        let mut a = Self::on(Some(sink), bus, sounds);
+        a.watch = watch;
+        a.format = (ch.get(), rate.get());
+        Some(a)
     }
 
     /// No speakers: the mix comes out of the returned source (tests listen
     /// to it).
     #[cfg(test)]
     fn offline(sounds: Sounds, rate: u32) -> (Self, Safety<impl Source>) {
-        let (bus, mixed) = limited_bus(NonZero::new(2).unwrap(), NonZero::new(rate).unwrap());
-        (Self::on(None, bus, sounds), mixed)
+        let watch = Arc::new(Watch::default());
+        let (bus, mixed) = limited_bus_watched(NonZero::new(2).unwrap(), NonZero::new(rate).unwrap(), watch.clone());
+        let mut a = Self::on(None, bus, sounds);
+        a.watch = watch;
+        a.format = (2, rate);
+        (a, mixed)
     }
 
     /// Playing into `bus`: the loops started (silent until wanted).
@@ -902,7 +1046,7 @@ impl Audio {
         for (i, ctl) in beds.swim.iter().enumerate() {
             start(bed_clips.swim, i as f32 * 0.25, ctl);
         }
-        Self { _sink: sink, bus, clips, voices, seed: 0x9E37_79B9, this_frame: [0; ALL.len()], beds, volume: MASTER_VOLUME }
+        Self { _sink: sink, bus, clips, voices, seed: 0x9E37_79B9, this_frame: [0; ALL.len()], beds, heard: Vec::new(), volume: MASTER_VOLUME, watch: Arc::new(Watch::default()), started: VecDeque::new(), format: (0, 0), reported: None }
     }
 
     fn rand(&mut self) -> u32 {
@@ -972,6 +1116,70 @@ impl Audio {
         }
     }
 
+    /// Watches for the sound cutting out: a sound started a moment ago that
+    /// should be heard isn't (the mix has stayed silent all the while, 100
+    /// ms or more), or `asked` (F9: the player heard it). Either way the last few seconds go in a report: what the
+    /// mix sounded like going into the limiter and coming out, and what was
+    /// played, so what's doing it can be seen. Returns where it was written.
+    pub fn watch(&mut self, asked: bool) -> Option<std::path::PathBuf> {
+        let r = self.report(asked)?;
+        let dir = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Stickfell");
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join("audio-report.txt");
+        // (a few reports at most: the oldest go when it passes 1 MB)
+        let old = std::fs::read_to_string(&path).unwrap_or_default();
+        let old = if old.len() > 1_000_000 { old[old.len() - 500_000..].to_string() } else { old };
+        std::fs::write(&path, old + &r + "\n").ok()?;
+        eprintln!("[audio] report written");
+        Some(path)
+    }
+
+    /// The report `watch` writes, if it's time for one.
+    fn report(&mut self, asked: bool) -> Option<String> {
+        let out: Vec<(f32, f32)> = self.watch.blocks[1].lock().map(|q| q.iter().copied().collect()).unwrap_or_default();
+        let quiet = |b: &(f32, f32)| b.0 < 1e-3; // under -60 dBFS
+        let silent_run = out.iter().rev().take_while(|b| quiet(b)).count();
+        // (silent since then, and something loud enough started after it,
+        // long enough ago that it should be coming out by now)
+        let now = self.watch.count.load(Ordering::Relaxed);
+        let silent_from = now.saturating_sub(silent_run as u64);
+        let cut = silent_run >= 10 && self.started.iter().any(|&(at, _, level)| level >= CUT_GAIN && at >= silent_from && at + CUT_GRACE <= now);
+        let recently = self.reported.is_some_and(|t| t.elapsed() < Duration::from_secs(10));
+        if !(asked || (cut && !recently)) {
+            return None;
+        }
+        self.reported = Some(Instant::now());
+        let into: Vec<(f32, f32)> = self.watch.blocks[0].lock().map(|q| q.iter().copied().collect()).unwrap_or_default();
+        let db = |x: f32| 20.0 * x.max(1e-6).log10();
+        let mut r = String::new();
+        let build = option_env!("STICKFELL_BUILD").filter(|b| !b.is_empty()).unwrap_or("PC build");
+        r += &format!("=== Stickfell audio report ({build}): {}\n", if asked { "F9 pressed (sound heard cutting out)" } else { "the mix went silent" });
+        r += &format!("output: {} channels, {} Hz; volume {:.2}\n", self.format.0, self.format.1, self.volume);
+        r += "the last 3 s, 10 ms a line, oldest first: into the limiter RMS/peak -> out of it RMS/peak (dBFS)\n";
+        let k = out.len().min(into.len()).min(300);
+        for i in 0..k {
+            let (a, b) = (into[into.len() - k + i], out[out.len() - k + i]);
+            r += &format!("{:5.2}s  {:6.1} {:6.1}  ->  {:6.1} {:6.1}\n", (k - i) as f32 / 100.0, db(a.0), db(a.1), db(b.0), db(b.1));
+        }
+        r += "sounds started in the last 5 s (seconds since they should have been heard, kind, loudest level):\n";
+        for (at, kind, level) in &self.started {
+            let ago = (now as f32 - *at as f32) / 100.0;
+            r += &format!("{ago:5.2}s  {kind:?}  {level:.2}\n");
+        }
+        Some(r)
+    }
+
+    /// Online: plays the sounds in `log` (the newest state's last few frames)
+    /// not heard yet, steering the voices as `play_frame` does. A frame
+    /// re-run by a rollback can have sounds its first run didn't (someone's
+    /// gunshot, once their click arrives): those play now, a moment late,
+    /// rather than never; ones already heard (the same kind, near the same
+    /// frame and place, as a re-run gives them) don't play twice.
+    pub fn play_new(&mut self, log: &[(u32, SfxEvent)], listener: Vec2, speakers: &[Speaker]) {
+        let fresh = fresh_sounds(&mut self.heard, log);
+        self.play_frame(&fresh, listener, speakers);
+    }
+
     /// Says the logged voice lines from frames up to `through` (final for
     /// everyone) that haven't been heard yet, in the order they were said.
     pub fn speak(&mut self, log: &[(u32, SfxEvent)], through: u32, listener: Vec2) {
@@ -1016,9 +1224,19 @@ impl Audio {
         let pan = (d.x / 14.0).clamp(-1.0, 1.0);
         let left = gain * (1.0 - pan.max(0.0) * 0.7);
         let right = gain * (1.0 + pan.min(0.0) * 0.7);
-        let clip = &self.clips[idx][pick];
+        let clip = self.clips[idx][pick];
         let src = StaticSamplesBuffer::new(clip.channels, clip.rate, clip.data).speed(pitch);
         self.bus.add(ChannelVolume::new(src, vec![left, right]));
+        // (for the watch: when it should be heard from, past any quiet
+        // lead-in the clip has, and how loud it gets)
+        let now = self.watch.count.load(Ordering::Relaxed);
+        while self.started.front().is_some_and(|(at, _, _)| at + WATCH_BLOCKS as u64 <= now) {
+            self.started.pop_front();
+        }
+        let ch = clip.channels.get() as usize;
+        let onset = clip.data.iter().position(|v| v.abs() > ONSET_LEVEL).map_or(0.0, |i| (i / ch) as f32 / clip.rate.get() as f32 / pitch);
+        let peak = clip.data.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        self.started.push_back((now + (onset * 100.0).ceil() as u64, e.kind, gain * peak));
     }
 
     /// A voice line. The announcer is heard by everyone at full volume, dead
@@ -1619,6 +1837,242 @@ mod analyse {
                     i += 1;
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod gun_cut_tests {
+    use super::*;
+
+    /// Dev tool: each sound's clips (channels, rate, length, peak), and a
+    /// steady tone through the real mixer and limiter with one of each
+    /// sound fired into it: how far the tone dips, and for how long.
+    #[test]
+    #[ignore]
+    fn measure_what_each_sound_does_to_the_mix() {
+        let sounds = Sounds::decode();
+        for (i, kind) in ALL.iter().enumerate() {
+            for c in sounds.clips[i].iter().take(2) {
+                let peak = c.data.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                eprintln!("{kind:?}: {} ch, {} Hz, {:.2} s, peak {peak:.2}", c.channels.get(), c.rate.get(), c.seconds());
+            }
+        }
+        let rate = NonZero::new(48_000u32).unwrap();
+        let ch = NonZero::new(2).unwrap();
+        for kind in [Sfx::Shot, Sfx::PistolShot, Sfx::HitHeavy, Sfx::Clash, Sfx::Swing] {
+            let idx = ALL.iter().position(|k| *k == kind).unwrap();
+            let (bus, mut out) = limited_bus(ch, rate);
+            let tone: &'static [f32] = Box::leak((0..48_000 * 6).map(|i| (i as f32 * 0.05).sin() * 0.2).collect::<Vec<_>>().into_boxed_slice());
+            bus.add(ChannelVolume::new(StaticSamplesBuffer::new(NonZero::new(1).unwrap(), rate, tone), vec![1.0, 1.0]));
+            let mut rows = Vec::new();
+            let (mut lowest, mut low_for) = (f32::MAX, 0);
+            for k in 0..60 {
+                if k == 10 {
+                    let c = sounds.clips[idx][0];
+                    let g = (MASTER_VOLUME * loudness(kind)).min(1.0);
+                    bus.add(ChannelVolume::new(StaticSamplesBuffer::new(c.channels, c.rate, c.data).speed(1.0), vec![g, g]));
+                }
+                // 50 ms at a time
+                let n = 4800;
+                let rms = ((0..n).map(|_| out.next().unwrap().powi(2)).sum::<f32>() / n as f32).sqrt();
+                let db = 20.0 * rms.max(1e-9).log10();
+                if k > 10 {
+                    lowest = lowest.min(db);
+                    if db < -30.0 {
+                        low_for += 1;
+                    }
+                }
+                rows.push(format!("{db:.0}"));
+            }
+            eprintln!("{kind:?} fired at 0.5 s into a -17 dBFS tone: lowest {lowest:.1} dBFS, {low_for} x 50 ms under -30 | {}", rows.join(" "));
+        }
+    }
+}
+
+#[cfg(test)]
+mod ricochet_cost_tests {
+    use super::*;
+
+    /// Dev tool: how long mixing each sound takes against real time, at its
+    /// own pitch and at the odd pitches `play` gives everything but guns.
+    #[test]
+    #[ignore]
+    fn measure_mix_cost_by_sound() {
+        let sounds = Sounds::decode();
+        let rate = NonZero::new(48_000u32).unwrap();
+        let ch = NonZero::new(2).unwrap();
+        for kind in [Sfx::Ricochet, Sfx::BulletHit, Sfx::Shot, Sfx::HitHeavy, Sfx::Splash] {
+            let idx = ALL.iter().position(|k| *k == kind).unwrap();
+            for pitch in [1.0f32, 0.973, 1.051] {
+                let (bus, mut out) = limited_bus(ch, rate);
+                for _ in 0..3 {
+                    let c = sounds.clips[idx][0];
+                    bus.add(ChannelVolume::new(StaticSamplesBuffer::new(c.channels, c.rate, c.data).speed(pitch), vec![0.3, 0.3]));
+                }
+                let t = std::time::Instant::now();
+                let n = 48_000 * 2; // a second
+                let mut x = 0.0f32;
+                for _ in 0..n {
+                    x += out.next().unwrap();
+                }
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("{kind:?} x3 at pitch {pitch}: 1 s of mix took {ms:.1} ms ({x:.1})");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod gunfight_tests {
+    use super::*;
+    use stickfell_net::RollbackGame;
+
+    /// Dev tool: a fighter in the practice yard emptying a gun at a dummy,
+    /// every sound the game makes going through the real audio (as the game
+    /// plays it each frame), with a steady tone in the mix as a reference:
+    /// does anything go quiet, and when.
+    #[test]
+    #[ignore]
+    fn measure_gunfight_through_the_game() {
+        for gun in ["REVOLVER", "PISTOL"] {
+            let rate = 48_000u32;
+            let per = rate as usize * 2 / 60;
+            let (mut a, mut out) = Audio::offline(Sounds::decode(), rate);
+            let tone: &'static [f32] = Box::leak((0..48_000 * 12).map(|i| (i as f32 * 0.05).sin() * 0.1).collect::<Vec<_>>().into_boxed_slice());
+            a.bus.add(ChannelVolume::new(StaticSamplesBuffer::new(NonZero::new(1).unwrap(), NonZero::new(rate).unwrap(), tone), vec![1.0, 1.0]));
+            let mut g = crate::sim::GameState::new(4, crate::level::TRAINING, 7);
+            for _ in 0..30 {
+                g.step(&[0, 0, 0, 0]);
+            }
+            let def = crate::weapon::WEAPONS.iter().position(|w| w.name == gun).unwrap() as u8;
+            let hand = g.fighters[0].pos(&g.world, crate::fighter::HAND_A);
+            g.spawn_weapon(def, hand + Vec2::new(0.1, 0.0));
+            let mut rows = Vec::new();
+            let (mut sum, mut n, mut quiet) = (0.0f32, 0usize, 0u32);
+            let (mut peak, mut hot, mut full) = (0.0f32, 0u32, 0u32);
+            let mut kinds = std::collections::BTreeMap::<String, u32>::new();
+            for k in 0..60 * 8u32 {
+                let b = if k == 2 { crate::input::PICKUP } else if k > 20 && k % 20 == 0 { crate::input::ATTACK } else { 0 };
+                g.step(&[crate::input::encode(b, Vec2::new(2.0, 0.1)), 0, 0, 0]);
+                let cam = g.fighters[0].pos(&g.world, crate::fighter::PELVIS);
+                for e in &g.events {
+                    *kinds.entry(format!("{:?}", e.kind)).or_default() += 1;
+                }
+                a.play_frame(&g.events, cam, &crate::speakers(&g));
+                a.surroundings(&crate::surroundings(&g, 0, cam), cam);
+                let mut s2 = 0.0f32;
+                for _ in 0..per {
+                    let v = out.next().unwrap_or(0.0);
+                    s2 += v * v;
+                    peak = peak.max(v.abs());
+                    if v.abs() >= 0.891 {
+                        hot += 1;
+                    }
+                    if v.abs() >= 0.999 {
+                        full += 1;
+                    }
+                }
+                let db = 20.0 * (s2 / per as f32).sqrt().max(1e-9).log10();
+                if db < -35.0 {
+                    quiet += 1;
+                }
+                sum += s2;
+                n += per;
+                if k % 30 == 29 {
+                    rows.push(format!("{:.0}", 20.0 * (sum / n as f32).sqrt().max(1e-9).log10()));
+                    (sum, n) = (0.0, 0);
+                }
+            }
+            eprintln!("{gun}: mix every 0.5 s (a -23 dBFS tone under it all), dBFS: {}; frames under -35 dBFS: {quiet}; holding {:?}, ammo left {:?}", rows.join(" "), g.fighters[0].weapon, g.fighters[0].weapon.map(|w| g.weapons[w as usize].ammo));
+            eprintln!("  events: {kinds:?}");
+            eprintln!("  peak out {:.2} dBFS; samples at -1 dBFS or over: {hot}; at full scale: {full}", 20.0 * peak.max(1e-9).log10());
+        }
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+
+    /// A sound playing, then the mix going silent mid-way: the watch catches
+    /// it (once), and F9 always gets a report; steady sound doesn't.
+    #[test]
+    fn the_watch_catches_the_sound_cutting_out() {
+        let rate = 48_000u32;
+        let (mut a, mut out) = Audio::offline(Sounds::decode(), rate);
+        let tone: &'static [f32] = Box::leak((0..48_000).map(|i| (i as f32 * 0.05).sin() * 0.3).collect::<Vec<_>>().into_boxed_slice());
+        a.bus.add(ChannelVolume::new(StaticSamplesBuffer::new(NonZero::new(1).unwrap(), NonZero::new(rate).unwrap(), tone), vec![1.0, 1.0]));
+        a.play(SfxEvent { kind: Sfx::Shot, pos: Vec2::new(1.0, 0.0), volume: 1.0, variant: 0, speaker: 0 }, Vec2::ZERO);
+        let mut pull = |a: &mut Audio, secs: f32| {
+            let mut caught = None;
+            for _ in 0..(secs * 60.0) as usize {
+                for _ in 0..rate as usize * 2 / 60 {
+                    out.next();
+                }
+                if let Some(r) = a.report(false) {
+                    caught = Some(r);
+                }
+            }
+            caught
+        };
+        assert!(pull(&mut a, 0.9).is_none(), "sounding: nothing to report");
+        // the tone ends at 1 s: silence, which is fine (things end)
+        assert!(pull(&mut a, 0.6).is_none(), "the mix going quiet by itself isn't a fault");
+        // a shot that should be heard, played into a mix that's lost its
+        // output (as if cut off): caught
+        a.watch.blocks[1].lock().unwrap().iter_mut().for_each(|b| *b = (0.0, 0.0));
+        let now = a.watch.count.load(Ordering::Relaxed);
+        a.started.push_back((now - 20, Sfx::Shot, 0.5));
+        let r = a.report(false).expect("a shot not coming out is caught");
+        eprintln!("{}", r.lines().take(3).collect::<Vec<_>>().join("\n"));
+        assert!(r.contains("Shot"), "and says what played");
+        assert!(a.report(false).is_none(), "once, not over and over");
+        assert!(a.report(true).is_some(), "F9 always gets one");
+    }
+}
+
+#[cfg(test)]
+mod watch_false_alarm_tests {
+    use super::*;
+    use stickfell_net::RollbackGame;
+
+    /// Emptying both guns at a dummy and the quiet after, through the real
+    /// audio: the mix goes quiet between sounds again and again, and the
+    /// watch never mistakes that for the sound cutting out.
+    #[test]
+    fn a_normal_fight_never_sets_the_watch_off() {
+        for gun in ["REVOLVER", "PISTOL"] {
+            let rate = 48_000u32;
+            let per = rate as usize * 2 / 60;
+            let (mut a, mut out) = Audio::offline(Sounds::decode(), rate);
+            let mut g = crate::sim::GameState::new(4, crate::level::TRAINING, 7);
+            for _ in 0..30 {
+                g.step(&[0, 0, 0, 0]);
+            }
+            let def = crate::weapon::WEAPONS.iter().position(|w| w.name == gun).unwrap() as u8;
+            let hand = g.fighters[0].pos(&g.world, crate::fighter::HAND_A);
+            g.spawn_weapon(def, hand + Vec2::new(0.1, 0.0));
+            let mut reports = 0;
+            for k in 0..60 * 8u32 {
+                let b = if k == 2 { crate::input::PICKUP } else if k > 20 && k % 20 == 0 { crate::input::ATTACK } else { 0 };
+                g.step(&[crate::input::encode(b, Vec2::new(2.0, 0.1)), 0, 0, 0]);
+                let cam = g.fighters[0].pos(&g.world, crate::fighter::PELVIS);
+                a.play_frame(&g.events, cam, &crate::speakers(&g));
+                for _ in 0..per {
+                    out.next();
+                }
+                if let Some(r) = a.report(false) {
+                    reports += 1;
+                    let lines: Vec<&str> = r.lines().collect();
+                    eprintln!("{}", lines[..3].join("
+"));
+                    eprintln!("{}", lines[lines.len().saturating_sub(40)..].join("
+"));
+                }
+            }
+            eprintln!("{gun}: {reports} reports over 8 s");
+            assert_eq!(reports, 0, "{gun}");
         }
     }
 }

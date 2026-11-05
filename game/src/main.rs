@@ -63,7 +63,6 @@ enum Action {
     Quit,
     Practice,
     /// Practice on the level built from the art kit.
-    ArtTest,
     /// Answer to the "are you sure?" prompt.
     ConfirmYes,
     ConfirmNo,
@@ -143,6 +142,21 @@ impl Perf {
 /// The network link a match plays over (it goes with the session to the
 /// sim thread).
 type Link = Box<dyn Transport + Send>;
+
+/// Whether the lobby's AI button works (off for now: AI fighters need more
+/// work; `--ai` and the tests still use them).
+const AI_IN_LOBBIES: bool = false;
+
+/// Nobody on the other end: a host alone in the room with AI fighters plays
+/// the match right here (the relay only starts rooms of two or more).
+struct Alone;
+
+impl Transport for Alone {
+    fn send_to(&mut self, _player: usize, _data: &[u8]) {}
+    fn recv(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+}
 type Session = P2PSession<GameState, Link>;
 
 struct Match {
@@ -198,7 +212,9 @@ impl Match {
                 }
                 stepped = Some(t0.elapsed().as_micros() as u64);
             }
-            let n = s.game().num_players;
+            // (the players on the other end: the AI fighters after them are
+            // played in the sim, nobody's connection)
+            let n = s.game().humans;
             NetReport {
                 game,
                 stepped,
@@ -233,10 +249,10 @@ impl Match {
                 self.prev = draw::snapshot(&self.game);
                 self.game = g;
                 self.arrived = std::time::Instant::now();
-                // only the newest frame's sounds: frames re-run by a
-                // rollback already made their noise the first time
+                // the sounds of the last few frames not heard yet: a frame
+                // re-run by a rollback can have new ones (someone's shot)
                 if let Some(a) = audio {
-                    a.play_frame(&self.game.events, self.cam, &speakers(&self.game));
+                    a.play_new(&self.game.sfx_log, self.cam, &speakers(&self.game));
                     a.surroundings(&surroundings(&self.game, self.local, self.cam), self.cam);
                 }
             }
@@ -286,8 +302,10 @@ impl Room {
 
     /// Whether the host can start: enough players for the mode, and
     /// everyone has the settings.
+    /// Two or more in the room, or one with AI fighters to play against.
     fn can_start(&self, players: usize) -> bool {
-        players >= 2 && self.sync.rules.problem(players).is_none() && self.sync.everyone_has_them(players)
+        let enough = players >= 2 || (players == 1 && self.sync.rules.bots(1) > 0);
+        enough && self.sync.rules.problem(players).is_none() && self.sync.everyone_has_them(players)
     }
 }
 
@@ -463,7 +481,6 @@ impl App {
         match a {
             Action::Quit => self.quit = true,
             Action::Practice => self.screen = Screen::Practice(Box::new(Practice::new(level::TRAINING))),
-            Action::ArtTest => self.screen = Screen::Practice(Box::new(Practice::new(level::ART_TEST))),
             Action::ConfirmYes => match self.confirm.take() {
                 Some(Confirm::Quit) => self.quit = true,
                 Some(Confirm::LeaveMatch) => self.screen = menu(None),
@@ -498,8 +515,23 @@ impl App {
                 }
             }
             Action::Start => {
+                let mut alone = None;
                 if let Screen::Lobby(r) = &mut self.screen {
-                    r.client.start();
+                    let players = match r.client.state() {
+                        LobbyState::InRoom { players, .. } => *players,
+                        _ => 0,
+                    };
+                    if players == 1 && r.can_start(1) {
+                        r.client.leave();
+                        alone = Some(r.sync.rules);
+                    } else {
+                        r.client.start();
+                    }
+                }
+                if let Some(rules) = alone {
+                    // (any seed: nobody else has to agree on it)
+                    let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.subsec_nanos() ^ d.as_secs() as u32);
+                    self.start_match(Box::new(Alone), 1, 0, seed, 0, rules);
                 }
             }
             Action::CycleMode | Action::CycleAi => {
@@ -568,6 +600,11 @@ impl Game for App {
         if self.loading.is_some() {
             return;
         }
+        // (the sound cutting out: F9 when it's heard, or caught by itself,
+        // writes what the mix was doing to %LOCALAPPDATA%\Stickfell\audio-report.txt)
+        if let Some(a) = &mut self.audio {
+            a.watch(input.pressed(KeyCode::F9));
+        }
         if input.pressed(KeyCode::KeyM) {
             self.muted = !self.muted;
             if let Some(a) = &mut self.audio {
@@ -623,6 +660,7 @@ impl Game for App {
                     action = Some(Action::Leave);
                 }
                 let state = room.client.poll().clone();
+                let mut go = false;
                 if let LobbyState::InRoom { code, players, .. } = &state {
                     if !self.announced {
                         eprintln!("[stickfell] room code {code}");
@@ -635,9 +673,13 @@ impl Game for App {
                             room.sync.set(r);
                         }
                         if self.autostart.is_some_and(|n| *players >= n) && room.can_start(*players) {
-                            room.client.start();
+                            go = true;
                         }
                     }
+                }
+                if go {
+                    self.do_action(Action::Start);
+                    return;
                 }
                 match state {
                     LobbyState::Started { num_players, slot, seed } => {
@@ -697,7 +739,7 @@ impl Game for App {
                 }
                 let prompt_open = self.confirm.is_some();
                 m.take(&mut self.audio);
-                let n = m.game.num_players;
+                let n = m.game.humans;
                 let gone = &m.net.disconnected;
                 let everyone_left = n > 1 && gone.len() == n && (0..n).filter(|&p| p != m.local).all(|p| gone[p]);
                 if everyone_left && m.ended.is_none() {
@@ -827,8 +869,7 @@ impl Game for App {
                     self.button(frame, cx, y0, bw, "Host game", Action::Host, k, true);
                     self.button(frame, cx, y0 + 58.0 * k, bw, "Join game", Action::Join, k, true);
                     self.button(frame, cx, y0 + 116.0 * k, bw, "Practice", Action::Practice, k, true);
-                    self.button(frame, cx, y0 + 174.0 * k, bw, "Art test level", Action::ArtTest, k, true);
-                    self.button(frame, cx, y0 + 232.0 * k, bw, "Quit", Action::Quit, k, true);
+                    self.button(frame, cx, y0 + 174.0 * k, bw, "Quit", Action::Quit, k, true);
                 }
                 if let Some(e) = error {
                     text_c(frame, screen, y0 - 44.0 * k, 2.2 * k, e, Color::hex(0xff6060));
@@ -863,11 +904,12 @@ impl Game for App {
                     if r.client.is_host() {
                         let mode = format!("Mode: {}", rules.mode());
                         self.button(frame, cx, y0 + 166.0 * k, bw, &mode, Action::CycleMode, k, true);
-                        self.button(frame, cx, y0 + 216.0 * k, bw, &rules.ai_label(players), Action::CycleAi, k, true);
+                        // (AI fighters are off in lobbies for now: `AI_IN_LOBBIES`)
+                        self.button(frame, cx, y0 + 216.0 * k, bw, &rules.ai_label(players), Action::CycleAi, k, AI_IN_LOBBIES);
                         let ready = r.can_start(players);
                         self.button(frame, cx, y0 + 272.0 * k, bw, "Start match", Action::Start, k, ready);
-                        let note = if players < 2 {
-                            Some("Share the code - you need 2 or more players".to_string())
+                        let note = if players < 2 && rules.bots(1) == 0 {
+                            Some(if AI_IN_LOBBIES { "Share the code, or turn on AI to play alone" } else { "Share the code - you need 2 or more players" }.to_string())
                         } else if let Some(p) = rules.problem(players) {
                             Some(p)
                         } else if !ready {
@@ -1514,5 +1556,124 @@ mod lobby_shots {
         assert!(room_of(&h).can_start(2), "and the host can start");
         stop.store(true, Ordering::Relaxed);
         th.join().unwrap();
+    }
+
+    /// Two players start a match through a relay with `rules`: how long
+    /// until both are past "connecting" and playing (or what it's stuck on).
+    fn start_online(rules: lobby::Rules) -> Result<f32, String> {
+        let mut server = stickfell_net::RelayServer::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap().to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let th = std::thread::spawn(move || {
+            while !stop2.load(Ordering::Relaxed) {
+                server.poll();
+            }
+        });
+        let mut host = LobbyClient::host(&addr, 8).unwrap();
+        let code = loop {
+            if let LobbyState::InRoom { code, .. } = host.poll() {
+                break code.clone();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let mut guest = LobbyClient::join(&addr, &code).unwrap();
+        while !matches!(guest.poll(), LobbyState::InRoom { players: 2, .. }) {
+            host.poll();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut h = App::new(Screen::Lobby(Box::new(Room::new(host))), addr.clone());
+        let mut g = App::new(Screen::Lobby(Box::new(Room::new(guest))), addr.clone());
+        let input = Input::default();
+        let started = std::time::Instant::now();
+        let mut asked = false;
+        let mut result = Err("timed out".to_string());
+        while started.elapsed() < std::time::Duration::from_secs(12) {
+            h.tick(&input);
+            g.tick(&input);
+            if !asked {
+                if let Screen::Lobby(r) = &mut h.screen {
+                    r.sync.set(rules);
+                    if r.can_start(2) {
+                        h.do_action(Action::Start);
+                        asked = true;
+                    }
+                }
+            }
+            let playing = |a: &App| matches!(&a.screen, Screen::Match(m) if !m.net.syncing && m.net.frame > 30);
+            if playing(&h) && playing(&g) {
+                result = Ok(started.elapsed().as_secs_f32());
+                break;
+            }
+            let what = |a: &App| match &a.screen {
+                Screen::Lobby(_) => "lobby".to_string(),
+                Screen::Match(m) => format!("match (syncing {}, frame {})", m.net.syncing, m.net.frame),
+                Screen::Menu { error, .. } => format!("menu {error:?}"),
+                _ => "other".to_string(),
+            };
+            result = Err(format!("host: {}, guest: {}", what(&h), what(&g)));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        stop.store(true, Ordering::Relaxed);
+        th.join().unwrap();
+        result
+    }
+
+    /// A host alone in the room: with AI fighters on, Start plays the match
+    /// against them right away; without, there's no starting.
+    #[test]
+    fn a_host_alone_can_start_against_ai_fighters() {
+        let mut server = stickfell_net::RelayServer::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap().to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let th = std::thread::spawn(move || {
+            while !stop2.load(Ordering::Relaxed) {
+                server.poll();
+            }
+        });
+        let mut host = LobbyClient::host(&addr, 8).unwrap();
+        while !matches!(host.poll(), LobbyState::InRoom { .. }) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut h = App::new(Screen::Lobby(Box::new(Room::new(host))), addr.clone());
+        let input = Input::default();
+        for _ in 0..80 {
+            h.tick(&input);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!room_of(&h).can_start(1), "alone with no AI: nothing to play");
+        h.do_action(Action::CycleAi);
+        h.do_action(Action::CycleAi);
+        let started = std::time::Instant::now();
+        let mut playing = None;
+        while started.elapsed() < std::time::Duration::from_secs(8) {
+            h.tick(&input);
+            if let Screen::Lobby(r) = &h.screen {
+                if r.can_start(1) {
+                    h.do_action(Action::Start);
+                }
+            }
+            if let Screen::Match(m) = &h.screen {
+                if !m.net.syncing && m.net.frame > 60 {
+                    playing = Some((started.elapsed().as_secs_f32(), m.game.fighters.len(), m.game.humans));
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        stop.store(true, Ordering::Relaxed);
+        th.join().unwrap();
+        eprintln!("alone with 2 AI: playing after {playing:?} (seconds, fighters, humans)");
+        assert!(playing.is_some_and(|(_, f, h)| f == 3 && h == 1), "{playing:?}");
+    }
+
+    #[test]
+    fn matches_with_ai_fighters_get_going_online() {
+        for rules in [lobby::Rules::default(), lobby::Rules { teams: 0, ai: 2 }, lobby::Rules { teams: 2, ai: 1 }] {
+            let r = start_online(rules);
+            eprintln!("{rules:?}: {r:?}");
+            assert!(r.is_ok(), "{rules:?}: {r:?}");
+        }
     }
 }

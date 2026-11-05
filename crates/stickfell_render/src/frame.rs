@@ -266,6 +266,11 @@ pub struct Frame {
     pub fluid_looks: [LiquidLook; 3],
     /// Vapour to draw over the scene this frame (steam), if any.
     pub vapour: Option<VapourField>,
+    /// Fire to draw over the scene this frame: how hot it is in each cell
+    /// (about 1 in a flame's heart), drawn as one licking, glowing volume
+    /// (shaders/vapour.wgsl's `fs_flame`; `density` and `max_opacity` are
+    /// unused).
+    pub flames: Option<VapourField>,
     pub(crate) lights: Vec<Light>,
     pub(crate) occluders: Vec<Occluder>,
     /// The image sprites come from. It's uploaded when a different one is
@@ -298,6 +303,7 @@ impl Frame {
             fluid: Vec::new(),
             fluid_looks: [LiquidLook::default(); 3],
             vapour: None,
+            flames: None,
             lights: Vec::new(),
             occluders: Vec::new(),
             sprite_atlas: None,
@@ -311,6 +317,7 @@ impl Frame {
         self.ui.clear();
         self.fluid.clear();
         self.vapour = None;
+        self.flames = None;
         self.lights.clear();
         self.occluders.clear();
     }

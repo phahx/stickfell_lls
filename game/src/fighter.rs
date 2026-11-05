@@ -40,6 +40,10 @@ pub const S_SHIN_A: u32 = 7;
 pub const S_THIGH_B: u32 = 8;
 pub const S_SHIN_B: u32 = 9;
 
+/// What `Fighter::eaten` and `melted` count up to (the part's all gone, or
+/// all bone).
+pub const ROT_FULL: u16 = 60000;
+
 /// Bones as (from, to) particle slots, in part order.
 pub const BONES: [(u32, u32); 10] = [
     (HEAD, HEAD),
@@ -201,6 +205,11 @@ pub const JOINTS: [Joint; 7] = [
     Joint { p: [PELVIS, NECK, HEAD], parts: [S_TORSO, S_HEAD], range: (-0.7, 0.7), mirrors: false },
 ];
 
+/// How far past a mirrored joint limit a joint can be and still be pulled
+/// straight back to it (radians): further over than this after a turn, it's
+/// left on the old side (see `Fighter::update_joints`), not a bump past it.
+const TURN_GIVE: f32 = 0.3;
+
 pub const fn bit(part: u32) -> u16 {
     1 << part
 }
@@ -220,6 +229,23 @@ pub fn decode_tag(tag: u32) -> Option<(usize, u32)> {
 
 /// For a severable part: the joint particle slot where it comes off, and the
 /// parts that come off with it.
+/// The parts joined to `part` (fire spreads along them).
+pub fn part_neighbours(part: u32) -> &'static [u32] {
+    match part {
+        S_HEAD => &[S_TORSO],
+        S_TORSO => &[S_HEAD, S_UPPER_A, S_UPPER_B, S_THIGH_A, S_THIGH_B],
+        S_UPPER_A => &[S_TORSO, S_FORE_A],
+        S_FORE_A => &[S_UPPER_A],
+        S_UPPER_B => &[S_TORSO, S_FORE_B],
+        S_FORE_B => &[S_UPPER_B],
+        S_THIGH_A => &[S_TORSO, S_SHIN_A],
+        S_SHIN_A => &[S_THIGH_A],
+        S_THIGH_B => &[S_TORSO, S_SHIN_B],
+        S_SHIN_B => &[S_THIGH_B],
+        _ => &[],
+    }
+}
+
 pub fn sever_plan(part: u32) -> Option<(u32, &'static [u32])> {
     match part {
         S_UPPER_A => Some((NECK, &[S_UPPER_A, S_FORE_A])),
@@ -438,7 +464,17 @@ pub struct Fighter {
     /// In any liquid last frame (for splashing going in).
     pub wet: bool,
     pub scorch: f32,
-    /// In acid or lava this frame (alive): screaming.
+    /// Per body part (in part order), out of `ROT_FULL`: how far acid has
+    /// eaten it away (at full it's gone), and how far lava has melted it
+    /// down to the bone (at full, bare bone).
+    pub eaten: [u16; 10],
+    pub melted: [u16; 10],
+    /// Arm and leg bones broken (bits by part): the limb hangs limp, no use
+    /// for holding, grabbing or standing on.
+    pub broken: u16,
+    /// Per body part, frames it has left on fire.
+    pub fire: [u16; 10],
+    /// In acid or lava this frame, or on fire (alive): screaming.
     pub burning: bool,
     /// How hard the liquid is shoving them (sideways and down), as a share of
     /// their weight, averaged over the last moment (`sim::SURGE_EASE`).
@@ -485,6 +521,8 @@ pub struct Fighter {
     pub health: f32,
     pub alive: bool,
     pub facing: f32,
+    /// The way the legs face: `facing`, except squatting (see `control`).
+    pub leg_facing: f32,
     pub phase: f32,
     pub grounded: bool,
     pub coyote: u8,
@@ -525,11 +563,11 @@ impl Fighter {
     }
 
     pub fn arm_a_ok(&self) -> bool {
-        self.severed & ARM_A_BITS == 0
+        (self.severed | self.broken) & ARM_A_BITS == 0
     }
 
     pub fn arm_b_ok(&self) -> bool {
-        self.severed & ARM_B_BITS == 0
+        (self.severed | self.broken) & ARM_B_BITS == 0
     }
 
     /// What they've left to swim with: 1 with all four limbs, each whole arm
@@ -545,8 +583,10 @@ impl Fighter {
         ((self.swim_limbs() - 0.5) / 0.5).clamp(0.0, 1.0)
     }
 
+    /// Legs whole and working (not cut off, not broken).
     pub fn legs_left(&self) -> u32 {
-        (self.severed & LEG_A_BITS == 0) as u32 + (self.severed & LEG_B_BITS == 0) as u32
+        let gone = self.severed | self.broken;
+        (gone & LEG_A_BITS == 0) as u32 + (gone & LEG_B_BITS == 0) as u32
     }
 
     pub fn pressed(&self, b: u16) -> bool {
@@ -769,6 +809,10 @@ impl Fighter {
             swim_phase: 0.0,
             wet: false,
             scorch: 0.0,
+            eaten: [0; 10],
+            melted: [0; 10],
+            broken: 0,
+            fire: [0; 10],
             burning: false,
             surge: 0.0,
             dry: 0,
@@ -792,6 +836,7 @@ impl Fighter {
             health: MAX_HEALTH,
             alive: true,
             facing,
+            leg_facing: facing,
             phase: 0.0,
             grounded: false,
             coyote: 0,
@@ -813,6 +858,11 @@ impl Fighter {
     }
 
     fn muscle(&self, w: &mut World, m: u32, target: f32, compliance: f32) {
+        // (a broken arm or leg just hangs)
+        if (S_UPPER_A..=S_SHIN_B).contains(&m) && self.broken & bit(m) != 0 {
+            self.relax(w, m);
+            return;
+        }
         let a = &mut w.aims[(self.aim_base + m) as usize];
         a.target = target;
         a.compliance = compliance;
@@ -910,13 +960,34 @@ impl Fighter {
         }
     }
 
-    /// Points each joint limit the way the fighter faces, and switches off
-    /// any whose body parts have been cut off (or all of them, if not `on`).
+    /// Points each joint limit the way the fighter faces (the legs' the way
+    /// the legs face), and switches off any whose body parts have been cut
+    /// off (or all of them, if not `on`).
+    ///
+    /// Turning round mirrors the limits, and a joint bent well over to the
+    /// old side (a squatting knee, a folded elbow) would then be yanked
+    /// across in one step, flinging the whole body: so a joint still on the
+    /// old side keeps the limit open as far as it is, closing in as the
+    /// muscles bring it round.
     pub fn update_joints(&self, w: &mut World, on: bool) {
         for (k, j) in JOINTS.iter().enumerate() {
-            let b = &mut w.bends[(self.bend_base + k as u32) as usize];
+            let legs = j.p.contains(&KNEE_A) || j.p.contains(&KNEE_B);
+            let facing = if legs { self.leg_facing } else { self.facing };
             let (lo, hi) = j.range;
-            (b.min, b.max) = if j.mirrors && self.facing < 0.0 { (-hi, -lo) } else { (lo, hi) };
+            let (mut min, mut max) = if j.mirrors && facing < 0.0 { (-hi, -lo) } else { (lo, hi) };
+            if j.mirrors {
+                let (other_min, other_max) = (-max, -min);
+                let pb = w.particles[self.p(j.p[1]) as usize].pos;
+                let u = w.particles[self.p(j.p[0]) as usize].pos - pb;
+                let v = w.particles[self.p(j.p[2]) as usize].pos - pb;
+                let bend = dmath::atan2(-u.perp_dot(v), -u.dot(v));
+                let leftover = (other_min..=other_max).contains(&bend) && (bend < min - TURN_GIVE || bend > max + TURN_GIVE);
+                if leftover {
+                    (min, max) = (min.min(bend), max.max(bend));
+                }
+            }
+            let b = &mut w.bends[(self.bend_base + k as u32) as usize];
+            (b.min, b.max) = (min, max);
             let torso_whole = !(self.spine_out && j.parts.contains(&S_TORSO));
             b.enabled = on && torso_whole && j.parts.iter().all(|&p| self.has(p));
         }
@@ -1160,6 +1231,20 @@ impl Fighter {
         }
         let sliding = self.slide > 0;
         let crouch = self.held(CROUCH) && self.grounded;
+        // Legs folded in a squat can't turn round: seen side on, getting the
+        // knees from in front to behind means straightening the legs down
+        // through the floor, which threw you metres into the air. So
+        // squatting, the legs keep facing the way they were (the body and
+        // arms still turn to the mouse) and turn round once you stand or
+        // leave the ground; a slide's legs go the way it slides, and a sweep
+        // finishes the way it started.
+        let low_kick = self.kick > 0 && self.kick_kind == KICK_LOW;
+        if sliding {
+            self.leg_facing = if vel.x >= 0.0 { 1.0 } else { -1.0 };
+        } else if !crouch && !low_kick {
+            self.leg_facing = f;
+        }
+        let lf = self.leg_facing;
         // ---- swimming: the keys say which way (jump up, crouch down) ----
         let swim_dir = self.swim_dir();
         let stroking = swim_dir != Vec2::ZERO;
@@ -1362,7 +1447,7 @@ impl Fighter {
             self.kick -= 1;
             if self.kick_kind == KICK_LOW && self.kick == KICK_LOW_FRAMES - 5 && self.grounded {
                 // step into the kick
-                w.add_velocity(self.particle_ids(), Vec2::new(f * KICK_LUNGE, 0.0));
+                w.add_velocity(self.particle_ids(), Vec2::new(lf * KICK_LUNGE, 0.0));
             }
             // a dropkick always ends flat on your back
             let landed = self.kick_kind == KICK_DROP && self.grounded && self.kick_t().is_some_and(|t| t > 0.3);
@@ -1390,14 +1475,14 @@ impl Fighter {
         let lean = if sliding {
             slide_dir * 0.35 // lean back into the slide
         } else {
-            let l = (-vel.x * 0.035).clamp(-0.35, 0.35) - if crouch { f * 0.75 } else { 0.0 } - if stabbing { f * 0.5 } else { 0.0 };
+            let l = (-vel.x * 0.035).clamp(-0.35, 0.35) - if crouch { lf * 0.75 } else { 0.0 } - if stabbing { f * 0.5 } else { 0.0 };
             // (never so far over that it counts as falling)
             l.clamp(-1.0, 1.0)
         };
         // kicking leans back away from the leg
         let lean = match (self.kick > 0, self.kick_kind) {
             (true, KICK_DROP) => f * 1.0,
-            (true, _) => lean + f * 0.45,
+            (true, _) => lean + lf * 0.45,
             _ => lean,
         };
         // diving for a grab: head first, reaching out
@@ -1431,13 +1516,13 @@ impl Fighter {
             (down + f * (0.4 + k), 0.9, down - f * (0.2 + k), 0.6)
         } else if crouch && moving {
             // a quick low scuttle
-            (down + f * (1.3 + 0.3 * s), 2.5 + 0.2 * c, down + f * (1.3 - 0.3 * s), 2.5 - 0.2 * c)
+            (down + lf * (1.3 + 0.3 * s), 2.5 + 0.2 * c, down + lf * (1.3 - 0.3 * s), 2.5 - 0.2 * c)
         } else if crouch {
-            (down + f * 1.45, 2.7, down + f * 1.05, 2.5)
+            (down + lf * 1.45, 2.7, down + lf * 1.05, 2.5)
         } else if moving {
-            (down + f * 0.6 * s, 0.25 + 0.75 * (-c).max(0.0), down - f * 0.6 * s, 0.25 + 0.75 * c.max(0.0))
+            (down + lf * 0.6 * s, 0.25 + 0.75 * (-c).max(0.0), down - lf * 0.6 * s, 0.25 + 0.75 * c.max(0.0))
         } else {
-            (down + f * 0.2, 0.12, down - f * 0.14, 0.08)
+            (down + lf * 0.2, 0.12, down - lf * 0.14, 0.08)
         };
         let (thigh_a, bend_a, thigh_b, bend_b) = if swim_pose && stroking {
             // a flutter kick, trailing out behind the body as it lies now
@@ -1463,8 +1548,8 @@ impl Fighter {
             (Some(_), KICK_DROP) => (down + f * 1.55, 0.05, down + f * 1.35, 0.15),
             // a sweep from the squat: leg tucked, then scythed out straight
             // along the floor at ankle height
-            (Some(t), _) if t < 0.25 => (down + f * 0.7, 2.0, thigh_b, bend_b),
-            (Some(t), _) if t < 0.8 => (down + f * 1.42, 0.0, thigh_b, bend_b),
+            (Some(t), _) if t < 0.25 => (down + lf * 0.7, 2.0, thigh_b, bend_b),
+            (Some(t), _) if t < 0.8 => (down + lf * 1.42, 0.0, thigh_b, bend_b),
             _ => (thigh_a, bend_a, thigh_b, bend_b),
         };
         // a stomp: the front leg posed by the finisher
@@ -1497,7 +1582,7 @@ impl Fighter {
                 self.muscle(w, thigh, ang + leg_tilt, leg_c);
             }
             if self.has(shin) {
-                self.muscle(w, shin, ang + leg_tilt - f * bend, leg_c);
+                self.muscle(w, shin, ang + leg_tilt - lf * bend, leg_c);
             }
             if self.kick > 0 || (stomp.is_some() && thigh == S_THIGH_A) {
                 // a kick snaps out far faster than a step, a stomp faster still

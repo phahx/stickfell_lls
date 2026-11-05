@@ -121,12 +121,12 @@ chimney on the left, then swing across to the yellow platform.
   around, grab a ledge to hang, or grab a rope or lamp chain to swing on it
   (A/D pumps the swing, S slides down, jump lets go).
 * Four arenas with a follow camera: Foundry, Rooftops, The Keep (with a
-  spiked moat) and Brickworks (built from the HD level kit). Last one
-  standing takes the round.
+  spiked moat) and the Gauntlet (up to eight players, every hazard). Last
+  one standing takes the round.
 
 | | |
 |---|---|
-| move / jump / crouch (slide when running) | A D / W or Space / S |
+| move / jump / crouch (slide when running) | A D / Space / S |
 | aim weapon arm | mouse |
 | swing (spear: stab) | left click |
 | stab (impales) | right click |
@@ -138,7 +138,7 @@ chimney on the left, then swing across to the yellow platform.
 | finish someone (skull over them) | F |
 | reset the practice yard | R |
 | mute | M |
-| help overlay / leave match | F1 / Esc (asks first) |
+| leave match | Esc (asks first) |
 
 **Hosting online**
 
